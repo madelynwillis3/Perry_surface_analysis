@@ -1,0 +1,633 @@
+---
+title: "test5"
+format: html
+---
+
+```{r}
+# --- Load package ---
+library(blockCV)
+library(sf)
+library(dplyr)
+
+# --- Spatial blocking function ---
+generate_spatial_bootstrap_block <- function(sf_data,
+                                             n_boot = 50,
+                                             train_frac = 0.7,
+                                             theRange = 50,     # in meters; adjust based on variogram range
+                                             n_folds = 5,       # number of spatial blocks
+                                             seed = 123) {
+  set.seed(seed)
+
+  # Run blockCV spatial blocking to assign folds based on variogram range
+  sb <- spatialBlock(speciesData = sf_data,
+                     theRange = theRange,       # block size = variogram range
+                     k = n_folds,               # number of folds (blocks)
+                     selection = "random",      # random assignment of folds
+                     showBlocks = FALSE,
+                     progress = FALSE)
+
+  # Extract fold assignments
+  sf_data$fold <- sb$foldID
+
+  # --- Build list of bootstrapped train/test splits ---
+  boot_list <- vector("list", n_boot)
+  for (i in seq_len(n_boot)) {
+    # randomly pick some folds for training (e.g., 70%)
+    n_train_folds <- ceiling(train_frac * n_folds)
+    train_folds <- sample(unique(sf_data$fold), n_train_folds)
+
+    df <- sf_data %>%
+      mutate(set = ifelse(fold %in% train_folds, "train", "test"))
+
+    boot_list[[i]] <- df
+  }
+
+  return(boot_list)
+}
+
+
+# --- Safe R² function ---
+safe_cor2 <- function(x, y){
+  if(length(x)==0 || length(y)==0) return(NA)
+  if(all(is.na(x)) || all(is.na(y))) return(NA)
+  cor(x, y, use="complete.obs")^2
+}
+  #uses correlation with complete.obs to avoid NA issues... but I am not sure if this is the best way to handle it.
+
+# --- Generate bootstraps ---
+# Estimate an average variogram range first if you have it
+# e.g., from your variogram fits:
+# mean_range <- mean(fit_variograms$range, na.rm = TRUE)
+# Otherwise start with 50 m as a field-scale approximation
+
+boot_SP <- generate_spatial_bootstrap_block(soil_sf_SP,
+                                            n_boot = 50,
+                                            train_frac = 0.7,
+                                            theRange = 50,
+                                            n_folds = 5)
+
+boot_C  <- generate_spatial_bootstrap_block(soil_sf_C,
+                                            n_boot = 50,
+                                            train_frac = 0.7,
+                                            theRange = 50,
+                                            n_folds = 5)
+
+
+# --- Random Forest function ---
+run_RF <- function(boot_list, covariates, soil_vars){
+  results <- list()
+  for(var in soil_vars){
+    boot_results <- map(boot_list, function(df){
+      train_df <- st_drop_geometry(df %>% filter(set=="train")) %>% select(all_of(c(covariates,var))) %>% na.omit()
+      test_df  <- st_drop_geometry(df %>% filter(set=="test")) %>% select(all_of(c(covariates,var))) %>% na.omit()
+      if(nrow(train_df) < 5 | nrow(test_df) < 5) return(list(RMSE=NA,R2=NA))
+      rf_model <- randomForest(x = train_df[,covariates], y = train_df[[var]], ntree = 500)
+      pred <- predict(rf_model, newdata = test_df[,covariates])
+      list(model = rf_model, pred = pred,
+           RMSE = sqrt(mean((pred - test_df[[var]])^2)),
+           R2 = safe_cor2(pred, test_df[[var]]))
+    })
+    results[[var]] <- boot_results
+  }
+  return(results)
+}
+
+# --- Ordinary Kriging function with fallback ---
+# --- Ordinary Kriging function with fallback (always returns R² even if only nugget) ---
+run_OK_safe <- function(boot_list, soil_vars) {
+  results <- list()
+
+  for (var in soil_vars) {
+    boot_results <- map(boot_list, function(df) {
+      train_sf <- df %>% filter(set == "train")
+      test_sf  <- df %>% filter(set == "test")
+
+      train_vals <- train_sf[[var]]
+      test_vals  <- test_sf[[var]]
+
+      # --- skip if too few usable data points ---
+      if (all(is.na(train_vals)) || length(unique(train_vals)) <= 1) {
+        pred <- rep(mean(train_vals, na.rm = TRUE), nrow(test_sf))
+        rmse <- sqrt(mean((pred - test_vals)^2, na.rm = TRUE))
+        r2   <- ifelse(var(pred, na.rm = TRUE) > 0 && var(test_vals, na.rm = TRUE) > 0,
+                       suppressWarnings(cor(pred, test_vals, use = "complete.obs")^2),
+                       0)
+        return(list(pred = pred, RMSE = rmse, R2 = r2))
+      }
+
+      # --- variogram and model fit (fallback to nugget if needed) ---
+      vgm_model <- tryCatch({
+        v_emp <- variogram(as.formula(paste(var, "~ 1")), train_sf)
+        fit.variogram(v_emp, vgm(psill = var(train_vals, na.rm = TRUE),
+                                 model = "Exp",
+                                 nugget = 0.1,
+                                 range = max(v_emp$dist, na.rm = TRUE)/3))
+      }, error = function(e) NULL)
+
+      if (is.null(vgm_model)) {
+        vgm_model <- vgm(psill = var(train_vals, na.rm = TRUE),
+                         model = "Nug", nugget = 0.1)
+      }
+
+      # --- try kriging prediction ---
+      ok_pred <- tryCatch({
+        krige(as.formula(paste(var, "~ 1")), train_sf, test_sf, model = vgm_model)
+      }, error = function(e) NULL)
+
+      # --- fallback if krige fails ---
+      pred <- if (!is.null(ok_pred) && "var1.pred" %in% names(ok_pred)) {
+        ok_pred$var1.pred
+      } else {
+        rep(mean(train_vals, na.rm = TRUE), nrow(test_sf))
+      }
+
+      # --- safe metrics (handles no complete pairs) ---
+      rmse <- sqrt(mean((pred - test_vals)^2, na.rm = TRUE))
+      r2 <- tryCatch({
+        if (var(pred, na.rm = TRUE) == 0 || var(test_vals, na.rm = TRUE) == 0) 0
+        else cor(pred, test_vals, use = "complete.obs")^2
+      }, error = function(e) 0)
+
+      list(pred = pred, RMSE = rmse, R2 = r2)
+    })
+    results[[var]] <- boot_results
+  }
+  return(results)
+}
+
+
+# --- Regression Kriging function with fallback ---
+run_RK_safe <- function(boot_list, covariates, soil_vars){
+  results <- list()
+  for(var in soil_vars){
+    boot_results <- map(boot_list, function(df){
+      train_sf <- df %>% filter(set=="train")
+      test_sf  <- df %>% filter(set=="test")
+      
+      # Remove rows with NA in predictors or target
+      train_df <- st_drop_geometry(train_sf) %>% select(all_of(c(covariates,var))) %>% na.omit()
+      test_df  <- st_drop_geometry(test_sf) %>% select(all_of(c(covariates,var))) %>% na.omit()
+      
+      # Skip if too few points
+      if(nrow(train_df)<5 | nrow(test_df)<5) return(list(RMSE=NA,R2=NA))
+      
+      # Match sf objects to filtered rows
+      train_sf <- train_sf[rownames(train_df), ]
+      test_sf  <- test_sf[rownames(test_df), ]
+      
+      # Trend model (RF)
+      rf_model <- randomForest(x=train_df[,covariates], y=train_df[[var]], ntree=500)
+      trend_train <- predict(rf_model, newdata=train_df[,covariates])
+      trend_test  <- predict(rf_model, newdata=test_df[,covariates])
+      
+      # Residuals
+      residuals_train <- train_df[[var]] - trend_train
+      
+      # Make a new sf object with only the filtered residuals
+      train_res_sf <- train_sf %>% mutate(residuals=residuals_train)
+      
+      # Variogram for residuals
+      vgm_model <- tryCatch(
+        variogram(residuals~1, train_res_sf) %>%
+          fit.variogram(vgm(psill=var(residuals_train, na.rm=TRUE), model="Exp", nugget=0.1, range=100)),
+        error=function(e) NULL
+      )
+      if(is.null(vgm_model)) vgm_model <- vgm(psill=var(residuals_train, na.rm=TRUE), model="Exp", nugget=0.1, range=100)
+      
+      # Krige residuals
+      rk_pred <- tryCatch(
+        krige(residuals~1, train_res_sf, test_sf, model=vgm_model),
+        error=function(e) NULL
+      )
+      # fallback if krige fails or lengths mismatch
+      if(is.null(rk_pred) || length(rk_pred$var1.pred)!=nrow(test_sf)){
+        rk_pred <- data.frame(var1.pred=rep(0,nrow(test_sf)))
+      }
+      
+      # Combine trend + residuals
+      final_pred <- trend_test + rk_pred$var1.pred
+      rmse <- sqrt(mean((final_pred - test_df[[var]])^2, na.rm=TRUE))
+      r2   <- safe_cor2(final_pred, test_df[[var]])
+      
+      list(RMSE=rmse, R2=r2)
+    })
+    results[[var]] <- boot_results
+  }
+  return(results)
+}
+
+```
+
+```{r}
+# --- Separate datasets for CN and other nutrients ---
+
+# 1️⃣ Split soil variable lists
+soil_vars_CN <- c("c","n")
+soil_vars_main <- setdiff(soil_vars, soil_vars_CN)
+
+# 2️⃣ Drop NAs only for C and N before converting to sf
+soil_SP_CN <- soil_SP_full %>% filter(!is.na(c), !is.na(n))
+soil_C_CN  <- soil_C_full  %>% filter(!is.na(c), !is.na(n))
+
+soil_sf_SP_CN <- st_as_sf(soil_SP_CN, coords = c("x","y"), crs = 4326) %>% st_transform(32617)
+soil_sf_C_CN  <- st_as_sf(soil_C_CN,  coords = c("x","y"), crs = 4326) %>% st_transform(32617)
+
+# 3️⃣ Keep the original sf objects for the rest of the nutrients
+soil_sf_SP_main <- soil_sf_SP
+soil_sf_C_main  <- soil_sf_C
+
+# --- Generate bootstraps separately for CN and main nutrients (same settings) ---
+boot_SP_CN <- generate_spatial_bootstrap_block(soil_sf_SP_CN,
+                                               n_boot = 50, train_frac = 0.7,
+                                               theRange = 50, n_folds = 5)
+boot_C_CN  <- generate_spatial_bootstrap_block(soil_sf_C_CN,
+                                               n_boot = 50, train_frac = 0.7,
+                                               theRange = 50, n_folds = 5)
+
+boot_SP_main <- generate_spatial_bootstrap_block(soil_sf_SP_main,
+                                                 n_boot = 50, train_frac = 0.7,
+                                                 theRange = 50, n_folds = 5)
+boot_C_main  <- generate_spatial_bootstrap_block(soil_sf_C_main,
+                                                 n_boot = 50, train_frac = 0.7,
+                                                 theRange = 50, n_folds = 5)
+
+# --- Run Random Forest, OK, RK separately ---
+RF_SP_main <- run_RF(boot_SP_main, covariates, soil_vars_main)
+RF_C_main  <- run_RF(boot_C_main,  covariates, soil_vars_main)
+OK_SP_main <- run_OK_safe(boot_SP_main, soil_vars_main)
+OK_C_main  <- run_OK_safe(boot_C_main,  soil_vars_main)
+RK_SP_main <- run_RK_safe(boot_SP_main, covariates, soil_vars_main)
+RK_C_main  <- run_RK_safe(boot_C_main,  covariates, soil_vars_main)
+
+RF_SP_CN <- run_RF(boot_SP_CN, covariates, soil_vars_CN)
+RF_C_CN  <- run_RF(boot_C_CN,  covariates, soil_vars_CN)
+OK_SP_CN <- run_OK_safe(boot_SP_CN, soil_vars_CN)
+OK_C_CN  <- run_OK_safe(boot_C_CN,  soil_vars_CN)
+RK_SP_CN <- run_RK_safe(boot_SP_CN, covariates, soil_vars_CN)
+RK_C_CN  <- run_RK_safe(boot_C_CN,  covariates, soil_vars_CN)
+
+# --- Extract metrics for each set ---
+rf_metrics_main <- bind_rows(extract_metrics(RF_SP_main, "Single Point"),
+                             extract_metrics(RF_C_main,  "Composite"))
+ok_metrics_main <- bind_rows(extract_metrics(OK_SP_main, "Single Point"),
+                             extract_metrics(OK_C_main,  "Composite"))
+rk_metrics_main <- bind_rows(extract_metrics(RK_SP_main, "Single Point"),
+                             extract_metrics(RK_C_main,  "Composite"))
+
+rf_metrics_CN <- bind_rows(extract_metrics(RF_SP_CN, "Single Point"),
+                           extract_metrics(RF_C_CN,  "Composite"))
+ok_metrics_CN <- bind_rows(extract_metrics(OK_SP_CN, "Single Point"),
+                           extract_metrics(OK_C_CN,  "Composite"))
+rk_metrics_CN <- bind_rows(extract_metrics(RK_SP_CN, "Single Point"),
+                           extract_metrics(RK_C_CN,  "Composite"))
+
+# --- Combine main and CN results ---
+rf_metrics_all <- bind_rows(rf_metrics_main, rf_metrics_CN)
+ok_metrics_all <- bind_rows(ok_metrics_main, ok_metrics_CN)
+rk_metrics_all <- bind_rows(rk_metrics_main, rk_metrics_CN)
+
+# --- Continue with your combined_metrics section ---
+combined_metrics <- bind_rows(
+  rf_metrics_all %>% mutate(method="RF"),
+  ok_metrics_all %>% mutate(method="OK"),
+  rk_metrics_all %>% mutate(method="RK")
+) %>%
+  pivot_longer(cols=c(RMSE,R2), names_to="metric", values_to="value")
+
+```
+```{r}
+
+
+# Consistent colors for methods
+method_colors <- c(RF = "#92D050", OK = "#0F9ED5", RK = "#884E71")
+
+# Factor levels to control ordering
+filtered_metrics_RMSE <- filtered_metrics_RMSE %>%
+  mutate(
+    method  = factor(method, levels = c("RF","OK","RK")),
+    dataset = factor(dataset, levels = c("Single Point","Composite"))
+  )
+
+# If you don't have `filtered_metrics_R2` yet, build it from your combined_metrics
+filtered_metrics_R2 <- combined_metrics %>%
+  filter(metric == "R2", !variable %in% c("lbc_1","lb_ceq")) %>%
+  mutate(
+    variable = recode(variable, "p_h_2"="pH","ca"="Ca","k"="K","mg"="Mg","mn"="Mn","p"="P","zn"="Zn","c"="C","n"="N"),
+    method   = factor(method, levels = c("RF","OK","RK")),
+    dataset  = factor(dataset, levels = c("Single Point","Composite"))
+  )
+
+# RMSE plot
+p_rmse <- ggplot(filtered_metrics_RMSE, aes(x = dataset, y = value)) +
+  geom_violin(aes(fill = method),
+              position = position_dodge(width = 0.85),
+              width = 0.8, trim = FALSE, alpha = 0.6) +
+  # Box outlines fully colored by method (fill = NA so outlines/whiskers show)
+  geom_boxplot(aes(color = method, group = interaction(dataset, method)),
+               position = position_dodge(width = 0.85),
+               width = 0.14, outlier.shape = NA, fill = NA, size = 0.7) +
+  # Mean marker
+  stat_summary(aes(color = method),
+               fun = mean, geom = "point",
+               position = position_dodge(width = 0.85),
+               size = 2.5, shape = 18) +
+  facet_wrap(~ variable, ncol = 3, scales = "free_y") +
+  scale_fill_manual(values = method_colors, name = "Method") +
+  scale_color_manual(values = method_colors, name = "Method") +
+  labs(title = "RMSE by nutrient, method, and dataset",
+       x = "Dataset", y = "RMSE") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top",
+        strip.text = element_text(face = "bold"))
+print(p_rmse)
+
+# R2 plot
+p_r2 <- ggplot(filtered_metrics_R2, aes(x = dataset, y = value)) +
+  geom_violin(aes(fill = method),
+              position = position_dodge(width = 0.85),
+              width = 0.8, trim = FALSE, alpha = 0.6) +
+  geom_boxplot(aes(color = method, group = interaction(dataset, method)),
+               position = position_dodge(width = 0.85),
+               width = 0.14, outlier.shape = NA, fill = NA, size = 0.7) +
+  stat_summary(aes(color = method),
+               fun = mean, geom = "point",
+               position = position_dodge(width = 0.85),
+               size = 2.5, shape = 18) +
+  facet_wrap(~ variable, ncol = 3, scales = "free_y") +
+  scale_fill_manual(values = method_colors, name = "Method") +
+  scale_color_manual(values = method_colors, name = "Method") +
+  labs(title = "R² by nutrient, method, and dataset",
+       x = "Dataset", y = "R²") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top",
+        strip.text = element_text(face = "bold"))
+print(p_r2)
+library(patchwork)
+
+make_panel <- function(df_one_metric, nut_label, ylab = "RMSE/R²") {
+  ggplot(df_one_metric, aes(x = dataset, y = value)) +
+    geom_violin(aes(fill = method),
+                position = position_dodge(width = 0.85),
+                width = 0.8, trim = FALSE, alpha = 0.6) +
+    geom_boxplot(aes(color = method, group = interaction(dataset, method)),
+                 position = position_dodge(width = 0.85),
+                 width = 0.14, outlier.shape = NA, fill = NA, size = 0.7) +
+    stat_summary(aes(color = method),
+                 fun = mean, geom = "point",
+                 position = position_dodge(width = 0.85),
+                 size = 2.5, shape = 18) +
+    scale_fill_manual(values = method_colors, name = "Method") +
+    scale_color_manual(values = method_colors, name = "Method") +
+    labs(title = nut_label, x = "Dataset", y = ylab) +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "none",
+          plot.title = element_text(face = "bold", hjust = 0.5))
+}
+
+# Build per-nutrient panels for RMSE
+vars_rmse <- levels(factor(filtered_metrics_RMSE$variable))
+panels_rmse <- lapply(vars_rmse, function(v) {
+  dfv <- filtered_metrics_RMSE %>% filter(variable == v)
+  make_panel(dfv, v, ylab = "RMSE")
+})
+
+# If last row has a single panel (e.g., total facets %% 3 == 1), center it by adding spacers
+ncol <- 3
+rem <- length(panels_rmse) %% ncol
+if (rem == 1) {
+  # add one spacer before and one after the last panel to center it
+  panels_rmse <- append(panels_rmse, list(plot_spacer()), after = length(panels_rmse) - 1)
+  panels_rmse <- append(panels_rmse, list(plot_spacer()))
+} else if (rem == 2) {
+  # add one spacer after to visually center two panels (optional)
+  panels_rmse <- append(panels_rmse, list(plot_spacer()))
+}
+
+p_rmse_centered <- wrap_plots(panels_rmse, ncol = ncol, guides = "collect") &
+  theme(legend.position = "top")
+p_rmse_centered
+# If you want a shared legend, add it manually from one base plot; for brevity we keep legends off here.
+
+# Build per-nutrient panels for R2
+vars_r2 <- levels(factor(filtered_metrics_R2$variable))
+panels_r2 <- lapply(vars_r2, function(v) {
+  dfv <- filtered_metrics_R2 %>% filter(variable == v)
+  make_panel(dfv, v, ylab = "R²")
+})
+rem2 <- length(panels_r2) %% ncol
+if (rem2 == 1) {
+  panels_r2 <- append(panels_r2, list(plot_spacer()), after = length(panels_r2) - 1)
+  panels_r2 <- append(panels_r2, list(plot_spacer()))
+} else if (rem2 == 2) {
+  panels_r2 <- append(panels_r2, list(plot_spacer()))
+}
+p_r2_centered <- wrap_plots(panels_r2, ncol = ncol, guides = "collect") &
+  theme(legend.position = "top")
+p_r2_centered
+```
+
+
+```{r}
+# --- Custom colors and method order ---
+method_colors <- c(OK = "#0F9ED5", RF = "#92D050", RK = "#884E71")
+
+# --- Prepare metrics ---
+filtered_metrics_RMSE <- combined_metrics %>%
+  filter(metric == "RMSE", !variable %in% c("lbc_1","lb_ceq")) %>%
+  mutate(
+    variable = recode(variable,
+                      "p_h_2"="pH","ca"="Ca","k"="K","mg"="Mg",
+                      "mn"="Mn","p"="P","zn"="Zn","c"="C","n"="N"),
+    method   = factor(method, levels = c("OK","RF","RK")),
+    dataset  = factor(dataset, levels = c("Single Point","Composite"))
+  )
+
+filtered_metrics_R2 <- combined_metrics %>%
+  filter(metric == "R2", !variable %in% c("lbc_1","lb_ceq")) %>%
+  mutate(
+    variable = recode(variable,
+                      "p_h_2"="pH","ca"="Ca","k"="K","mg"="Mg",
+                      "mn"="Mn","p"="P","zn"="Zn","c"="C","n"="N"),
+    method   = factor(method, levels = c("OK","RF","RK")),
+    dataset  = factor(dataset, levels = c("Single Point","Composite"))
+  )
+
+# --- Reorder variable panels so C and N appear together ---
+var_order <- c("pH","Ca","K","Mg","Mn","P","Zn","C","N")
+filtered_metrics_RMSE$variable <- factor(filtered_metrics_RMSE$variable, levels = var_order)
+filtered_metrics_R2$variable   <- factor(filtered_metrics_R2$variable,   levels = var_order)
+
+# --- Function to make each nutrient panel ---
+make_panel <- function(df_one_metric, nut_label, ylab = "RMSE / R²") {
+  ggplot(df_one_metric, aes(x = dataset, y = value)) +
+    # --- light background tint for each side ---
+    annotate("rect", xmin = 0.5, xmax = 1.5, ymin = -Inf, ymax = Inf,
+             fill = "#DCECF8", alpha = 0.5) +   # blue for Single Point
+    annotate("rect", xmin = 1.5, xmax = 2.5, ymin = -Inf, ymax = Inf,
+             fill = "#FDEBD0", alpha = 0.5) +   # orange for Composite
+    # --- main plotting layers ---
+    geom_violin(aes(fill = method),
+                position = position_dodge(width = 0.85),
+                width = 0.8, trim = FALSE, alpha = 0.6) +
+    geom_boxplot(aes(color = method, group = interaction(dataset, method)),
+                 position = position_dodge(width = 0.85),
+                 width = 0.14, outlier.shape = NA, fill = NA, size = 0.7) +
+    stat_summary(aes(color = method),
+                 fun = mean, geom = "point",
+                 position = position_dodge(width = 0.85),
+                 size = 2.5, shape = 18) +
+    # --- scales and appearance ---
+    scale_fill_manual(values = method_colors, name = "Method") +
+    scale_color_manual(values = method_colors, name = "Method") +
+    labs(title = nut_label, x = NULL, y = ylab) +
+    theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "none",
+      panel.grid.major = element_line(color = "grey85", linewidth = 0.4),
+      panel.grid.minor = element_blank(),
+      axis.title.x = element_blank(),
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    )
+}
+
+
+
+# --- Assemble panels for each metric ---
+library(patchwork)
+
+make_metric_panels <- function(df_metric, ylab) {
+  panels <- lapply(var_order, function(v) {
+    dfv <- df_metric %>% filter(variable == v)
+    make_panel(dfv, v, ylab = ylab)
+  })
+  wrap_plots(panels, ncol = 3, guides = "collect") &
+    theme(
+      legend.position = "right",
+      legend.title = element_text(face = "bold"),
+      legend.text  = element_text(size = 11)
+    )
+}
+
+# --- Final figures ---
+p_rmse_centered <- make_metric_panels(filtered_metrics_RMSE, ylab = "RMSE") +
+  plot_annotation(title = "RMSE by Nutrient and Method",
+                  theme = theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5)))
+
+p_r2_centered <- make_metric_panels(filtered_metrics_R2, ylab = "R²") +
+  plot_annotation(title = "R² by Nutrient and Method",
+                  theme = theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5)))
+
+# --- Display both ---
+p_rmse_centered
+p_r2_centered
+
+
+#save plots 16:9 ratio... high res:
+ ggsave("../outputs/figures/RMSE_by_Nutrient_and_Method_n50_spatial_splits_with_CN.png", p_rmse_centered, width=16, height=9, dpi=300)
+ ggsave("../outputs/figures/R2_by_Nutrient_and_Method_n50_spatial_splits_with_CN.png",   p_r2_centered,   width=16, height=9, dpi=300)
+```
+```{r}
+library(dplyr)
+library(rstatix)  # convenient wrappers for nonparametric tests
+
+# keep only valid nutrients
+metrics_for_tests <- combined_metrics %>%
+  filter(!variable %in% c("lbc_1", "lb_ceq"))
+
+# --- 1️⃣ Compare methods within each nutrient & dataset (Kruskal–Wallis + posthoc) ---
+kw_results <- metrics_for_tests %>%
+  group_by(metric, variable, dataset) %>%
+  kruskal_test(value ~ method)
+
+kw_posthoc <- metrics_for_tests %>%
+  group_by(metric, variable, dataset) %>%
+  pairwise_wilcox_test(value ~ method, p.adjust.method = "BH")
+
+# --- 2️⃣ Compare datasets within each nutrient & method (Wilcoxon rank-sum) ---
+dataset_wilcox <- metrics_for_tests %>%
+  group_by(metric, variable, method) %>%
+  wilcox_test(value ~ dataset, paired = FALSE, p.adjust.method = "BH")
+
+# --- optional summaries ---
+kw_results <- kw_results %>%
+  mutate(sig = case_when(p < 0.001 ~ "***",
+                         p < 0.01  ~ "**",
+                         p < 0.05  ~ "*",
+                         TRUE ~ "ns"))
+
+dataset_wilcox <- dataset_wilcox %>%
+  mutate(sig = case_when(p < 0.001 ~ "***",
+                         p < 0.01  ~ "**",
+                         p < 0.05  ~ "*",
+                         TRUE ~ "ns"))
+
+# --- Print or save results ---
+kw_results %>% arrange(metric, variable, dataset)
+kw_posthoc %>% arrange(metric, variable, dataset, group1)
+dataset_wilcox %>% arrange(metric, variable, method)
+
+# save as csv if you’d like
+write.csv(kw_results, "../outputs/significance/Kruskal_results.csv", row.names = FALSE)
+write.csv(kw_posthoc, "../outputs/significance/KW_posthoc_results.csv", row.names = FALSE)
+write.csv(dataset_wilcox, "../outputs/significance/Wilcoxon_dataset_results.csv", row.names = FALSE)
+
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggtext)
+
+# --- Compute mean R² per nutrient × method × dataset ---
+r2_summary <- combined_metrics %>%
+  filter(metric == "R2", !variable %in% c("lbc_1","lb_ceq")) %>%
+  mutate(
+    variable = recode(variable,
+                      "p_h_2"="pH","ca"="Ca","k"="K","mg"="Mg",
+                      "mn"="Mn","p"="P","zn"="Zn","c"="C","n"="N"),
+    method = factor(method, levels = c("OK", "RF", "RK")),
+    dataset = factor(dataset, levels = c("Single Point","Composite"))
+  ) %>%
+  group_by(variable, method, dataset) %>%
+  summarise(mean_R2 = mean(value, na.rm = TRUE), .groups = "drop")
+
+# --- Add significance stars from Wilcoxon results ---
+sig_summary <- read.csv("../outputs/significance/Wilcoxon_dataset_results.csv") %>%
+  filter(metric == "R2") %>%
+  mutate(sig_label = case_when(
+    p < 0.001 ~ "***",
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    TRUE ~ ""
+  )) %>%
+  select(variable, method, sig_label)
+
+r2_summary <- left_join(r2_summary, sig_summary, by = c("variable","method"))
+
+# --- Heatmap Plot ---
+ggplot(r2_summary, aes(x = dataset, y = variable, fill = mean_R2)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(mean_R2, 2)), size = 3.5, fontface = "bold", color = "black") +
+  geom_text(aes(label = sig_label),
+            x = 2.2,  # position to the right of Composite column
+            color = "black", size = 5, fontface = "bold") +
+  scale_fill_gradient2(low = "yellow", mid = "orange", high = "red",
+                       midpoint = 0.2, name = expression(R^2)) +
+  facet_wrap(~method, ncol = 3) +
+  labs(
+    title = "Mean R² by Method, Dataset, and Nutrient",
+    subtitle = "Stars denote significant Single Point vs Composite differences (Wilcoxon tests)",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+
+```
+

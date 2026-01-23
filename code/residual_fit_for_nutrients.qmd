@@ -1,0 +1,987 @@
+---
+title: "residual_fit_for_nutrients"
+format: html
+---
+
+```{r, warning=FALSE}
+library(sf); library(sp); library(randomForest); library(gstat)
+library(dplyr); library(purrr); library(tibble); library(ggplot2)
+
+# --- Load data ---
+covariate_stack <- rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
+soil_covariate_data_scaled_SP <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_SP.csv")
+soil_covariate_data_scaled_C  <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_C.csv")
+soil_vars <- c("lbc_1", "lb_ceq", "p_h_2", "ca", "k", "mg", "mn", "p", "zn")
+covariates <- setdiff(names(soil_covariate_data_scaled_SP), c("x","y",soil_vars))
+
+# --- Convert to sf and transform to UTM ---
+soil_sf_SP <- st_as_sf(soil_covariate_data_scaled_SP, coords = c("x","y"), crs = 4326) %>% st_transform(32617)
+soil_sf_C  <- st_as_sf(soil_covariate_data_scaled_C, coords = c("x","y"), crs = 4326) %>% st_transform(32617)
+
+# Plot RF residual variograms for SP and C (one row per nutrient, SP left, C right)
+required_pkgs <- c("sf","sp","randomForest","gstat","dplyr","purrr","tibble","ggplot2","gridExtra")
+new <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
+if(length(new)) install.packages(new, dependencies = TRUE)
+library(sf); library(sp); library(randomForest); library(gstat)
+library(dplyr); library(purrr); library(tibble); library(ggplot2); library(gridExtra)
+
+candidate_models <- c("Exp","Sph","Gau","Mat")
+min_points_for_vario <- 8
+rf_ntree <- 500   # change if you want more trees
+
+# helper: fit candidate variograms and return best (by SSE)
+fit_variogram_best <- function(spdf, value_col, candidate_models=c("Exp","Sph","Gau","Mat")){
+  out <- list(emp = NULL, best_fit = NULL, model = NA_character_, range = NA_real_, sill = NA_real_, nugget = NA_real_, sse = NA_real_, n_pairs = NA_integer_, line_df = NULL)
+  fmla <- as.formula(paste(value_col, "~ 1"))
+  v_emp <- tryCatch(variogram(fmla, data = spdf), error = function(e) NULL)
+  if(is.null(v_emp) || nrow(v_emp)==0) return(out)
+  out$emp <- v_emp
+  out$n_pairs <- sum(v_emp$np, na.rm = TRUE)
+  samp_var <- tryCatch(var(spdf[[value_col]], na.rm = TRUE), error = function(e) NA_real_)
+  maxdist <- max(v_emp$dist, na.rm = TRUE)
+  best_sse <- Inf; best_fit <- NULL; best_name <- NA_character_; best_line <- NULL
+  for(m in candidate_models){
+    init_vgm <- tryCatch({
+      if(m=="Mat") vgm(psill = max(1e-6, samp_var*0.8), model = "Mat", range = maxdist/3, kappa = 0.5)
+      else vgm(psill = max(1e-6, samp_var*0.8), model = m, range = maxdist/3)
+    }, error = function(e) vgm(model = m))
+    fit_try <- tryCatch(fit.variogram(v_emp, model = init_vgm), error = function(e) NULL)
+    if(is.null(fit_try)) next
+    theo <- tryCatch(variogramLine(fit_try, dist_vector = v_emp$dist), error = function(e) NULL)
+    if(is.null(theo)) next
+    theo_gamma <- approx(x = theo$dist, y = theo$gamma, xout = v_emp$dist, rule = 2)$y
+    sse <- sum((v_emp$gamma - theo_gamma)^2, na.rm = TRUE)
+    if(is.finite(sse) && sse < best_sse){
+      best_sse <- sse; best_fit <- fit_try; best_name <- m
+      best_line <- data.frame(dist = theo$dist, gamma = theo$gamma)
+    }
+  }
+  if(!is.null(best_fit)){
+    out$best_fit <- best_fit
+    out$model <- best_name
+    fit_df <- tryCatch(as.data.frame(best_fit), error = function(e) NULL)
+    if(!is.null(fit_df) && nrow(fit_df) >= 1){
+      nug_rows <- which(tolower(fit_df$model) %in% c("nug","nugget"))
+      out$nugget <- if(length(nug_rows)>0) as.numeric(fit_df$psill[nug_rows[1]]) else 0
+      struct_rows <- which(!(tolower(fit_df$model) %in% c("nug","nugget")))
+      if(length(struct_rows)>0){
+        out$sill <- as.numeric(fit_df$psill[struct_rows[1]])
+        out$range <- as.numeric(fit_df$range[struct_rows[1]])
+      } else {
+        out$sill <- 0; out$range <- NA_real_
+      }
+    }
+    out$sse <- best_sse
+    out$line_df <- best_line
+  }
+  out
+}
+
+# loop nutrients and plot
+for(nut in soil_vars){
+  plots_pair <- list()
+  for(ds_name in c("SP","C")){
+    soil_sf <- if(ds_name=="SP") soil_sf_SP else soil_sf_C
+    # prepare data: only rows with complete covariates + target
+    df_full <- soil_sf %>% st_drop_geometry() %>% select(all_of(c(covariates, nut)))
+    keep <- stats::complete.cases(df_full)
+    df_use <- df_full[keep, , drop = FALSE]
+    n_pts <- nrow(df_use)
+    if(n_pts < 3){
+      p <- ggplot() + annotate("text", x=0.5, y=0.5, label = paste("Too few points for", ds_name, nut, "\n(n=", n_pts,")"), size=5) + theme_void()
+      plots_pair[[ds_name]] <- p
+      next
+    }
+    # fit RF
+    rf_mod <- tryCatch(randomForest::randomForest(x = df_use[, covariates, drop=FALSE], y = df_use[[nut]], ntree = rf_ntree), error = function(e) NULL)
+    if(is.null(rf_mod)){
+      p <- ggplot() + annotate("text", x=0.5, y=0.5, label = paste("RF failed:", ds_name, nut), size=5) + theme_void()
+      plots_pair[[ds_name]] <- p
+      next
+    }
+    pred_oob <- tryCatch(rf_mod$predicted, error = function(e) NULL)
+    pred_fitted <- tryCatch(predict(rf_mod, newdata = df_use[, covariates, drop = FALSE]), error = function(e) NULL)
+    used_pred <- if(!is.null(pred_oob) && length(pred_oob)==n_pts) pred_oob else pred_fitted
+    resid <- df_use[[nut]] - used_pred
+
+    # create sf of residuals using original coords
+    coords <- st_coordinates(soil_sf)[keep, , drop = FALSE]
+    resid_sf <- st_as_sf(tibble::tibble(obs = df_use[[nut]], predicted = used_pred, residual = resid, x = coords[,1], y = coords[,2]), coords = c("x","y"), crs = st_crs(soil_sf))
+
+    # prepare Spatial object for variogram
+    sp_res <- tryCatch(as(resid_sf %>% rename(resid_col = residual), "Spatial"), error = function(e) NULL)
+    if(is.null(sp_res) || sum(!is.na(sp_res$resid_col)) < min_points_for_vario){
+      p <- ggplot() + annotate("text", x=0.5, y=0.5, label = paste("Not enough points for variogram:", ds_name, nut, "\n(n=", n_pts,")"), size=4) + theme_void()
+      plots_pair[[ds_name]] <- p
+      next
+    }
+
+    vf <- fit_variogram_best(sp_res, "resid_col", candidate_models = candidate_models)
+    v_emp <- vf$emp
+    # if no fit, show empirical semivariances only
+    if(is.null(v_emp) || nrow(v_emp)==0){
+      p <- ggplot() + annotate("text", x=0.5, y=0.5, label = paste("Empirical variogram failed:", ds_name, nut), size=4) + theme_void()
+      plots_pair[[ds_name]] <- p
+      next
+    }
+    v_emp_df <- as.data.frame(v_emp)
+    p <- ggplot(v_emp_df, aes(x = dist, y = gamma)) +
+      geom_point(size = 2) +
+      geom_errorbar(aes(ymin=gamma - (sqrt(gamma)/2), ymax = gamma + (sqrt(gamma)/2)), width = 0, alpha=0.2) + # visual hint (not rigorous)
+      labs(title = paste0(nut, " — ", ds_name), x = "Distance (m)", y = "Semivariance") +
+      theme_minimal()
+    if(!is.null(vf$line_df) && nrow(vf$line_df) > 1){
+      p <- p + geom_line(data = vf$line_df, aes(x = dist, y = gamma), color = "red", size = 1)
+      p <- p + annotate("text", x = Inf, y = Inf, label = paste0("model=", vf$model, "\nrange=", round(vf$range,1), "\nsill=", round(vf$sill,2), "\nnugget=", round(vf$nugget,2)), hjust = 1.05, vjust = 1.05, size = 3)
+    } else {
+      p <- p + annotate("text", x = Inf, y = Inf, label = "no theoretical fit", hjust = 1.05, vjust = 1.05, size = 3)
+    }
+    plots_pair[[ds_name]] <- p
+  } # end datasets loop
+
+  # arrange SP (left) and C (right) side-by-side and print
+  grid.arrange(plots_pair[["SP"]], plots_pair[["C"]], ncol = 2)
+  # pause between plots so user can inspect if running interactively
+  if(interactive()) readline(prompt = "Press <enter> to continue to next nutrient...")
+} # end nutrients loop
+
+#save all plots:
+
+```
+```{r}
+#fit variogram on carbon data:
+#sp:
+#read csv
+  SP_with_soil_CN <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_SP_with_CN.csv")
+  C_with_soil_CN  <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_C_with_CN.csv")
+#convert to sf and transform to UTM
+  soil_sf_SP_CN <- st_as_sf(SP_with_soil_CN, coords = c("x","y"), crs = 4326) %>% st_transform(32617)
+  soil_sf_C_CN  <- st_as_sf(C_with_soil_CN, coords = c("x","y"), crs = 4326) %>% st_transform(32617)
+#select covariates and nutrients
+  soil_vars_CN <- c("lbc_1", "lb_ceq", "p_h_2", "ca", "k", "mg", "mn", "p", "zn","c","n")
+  covariates_CN <- setdiff(names(SP_with_soil_CN), c("x","y",soil_vars_CN))
+#variogram fitting per nutrient:
+for(nut in c("c","n")){
+  plots_pair <- list()
+  for(ds_name in c("SP","C")){
+    soil_sf <- if(ds_name=="SP") soil_sf_SP_CN else soil_sf_C_CN
+    # prepare data: only rows with complete covariates + target
+    df_full <- soil_sf %>% st_drop_geometry() %>% select(all_of(c(covariates_CN, nut)))
+    keep <- stats::complete.cases(df_full)
+    df_use <- df_full[keep, , drop = FALSE]
+    n_pts <- nrow(df_use)
+    if(n_pts < 3){
+      p <- ggplot() + annotate("text", x=0.5, y=0.5, label = paste("Too few points for", ds_name, nut, "\n(n=", n_pts,")"), size=5) + theme_void()
+      plots_pair[[ds_name]] <- p
+      next
+    }
+    # fit RF
+    rf_mod <- tryCatch(randomForest::randomForest(x = df_use[, covariates_CN, drop=FALSE], y = df_use[[nut]], ntree = rf_ntree), error = function(e) NULL)
+    if(is.null(rf_mod)){
+      p <- ggplot() + annotate("text", x=0.5, y=0.5, label = paste("RF failed:", ds_name, nut), size=5) + theme_void()
+      plots_pair[[ds_name]] <- p
+      next
+    }
+    pred_oob <- tryCatch(rf_mod$predicted, error = function(e) NULL)
+    pred_fitted <- tryCatch(predict(rf_mod, newdata = df_use[, covariates_CN, drop = FALSE]), error = function(e) NULL)
+    used_pred <- if(!is.null(pred_oob) && length(pred_oob)==n_pts) pred_oob else pred_fitted
+    resid <- df_use[[nut]] - used_pred
+
+    # create sf of residuals using original coords
+    coords <- st_coordinates(soil_sf)[keep, , drop = FALSE]
+    resid_sf <- st_as_sf(tibble::tibble(obs = df_use[[nut]], predicted = used_pred, residual = resid, x = coords[,1], y = coords[,2]), coords = c("x","y"), crs = st_crs(soil_sf))
+
+    # prepare Spatial object for variogram
+    sp_res <- tryCatch(as(resid_sf %>% rename(resid_col = residual), "Spatial"), error = function(e) NULL)
+    if(is.null(sp_res) || sum(!is.na(sp_res$resid_col)) < min_points_for_vario){
+      p <- ggplot() + annotate("text", x=0.5, y=0.5, label = paste("Not enough points for variogram:", ds_name, nut, "\n(n=", n_pts,")"), size=4) + theme_void()
+      plots_pair[[ds_name]] <- p
+      next
+    }
+    vf <- fit_variogram_best(sp_res, "resid_col", candidate_models = candidate_models)
+    v_emp <- vf$emp
+    # if no fit, show empirical semivariances only
+    if(is.null(v_emp) || nrow(v_emp)==0){
+      p <- ggplot() + annotate("text", x=0.5, y=0.5, label = paste("Empirical variogram failed:", ds_name, nut), size=4) + theme_void()
+      plots_pair[[ds_name]] <- p
+      next
+    }
+    v_emp_df <- as.data.frame(v_emp)
+    p <- ggplot(v_emp_df, aes(x = dist, y = gamma)) +
+      geom_point(size = 2) +
+      geom_errorbar(aes(ymin=gamma - (sqrt(gamma)/2), ymax = gamma + (sqrt(gamma)/2)), width = 0, alpha=0.2) + # visual hint (not rigorous)
+      labs(title = paste0(nut, " — ", ds_name), x = "Distance (m)", y = "Semivariance") +
+      theme_minimal()
+    if(!is.null(vf$line_df) && nrow(vf$line_df) > 1){
+      p <- p + geom_line(data = vf$line_df, aes(x = dist, y = gamma), color = "red", size = 1)
+      p <- p + annotate("text", x = Inf, y = Inf, label = paste0("model=", vf$model, "\nrange=", round(vf$range,1), "\nsill=", round(vf$sill,2), "\nnugget=", round(vf$nugget,2)), hjust = 1.05, vjust = 1.05, size = 3)
+    } else {
+      p <- p + annotate("text", x = Inf, y = Inf, label = "no theoretical fit", hjust = 1.05, vjust = 1.05, size = 3)
+    }
+    plots_pair[[ds_name]] <- p
+  } # end datasets loop
+  # arrange SP (left) and C (right) side-by-side and print
+  grid.arrange(plots_pair[["SP"]], plots_pair[["C"]], ncol = 2)
+  # pause between plots so user can inspect if running interactively
+  if(interactive()) readline(prompt = "Press <enter> to continue to next nutrient...")
+} # end nutrients loop
+  
+```
+
+
+```{r}
+#variogram plots except I am prompted to set the fit for each nutrient
+#fit:
+
+```
+
+```{r}
+library(sf)
+library(gstat)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+
+# --- Load data ---
+
+SP_with_soil_CN <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_SP_with_CN.csv")
+C_with_soil_CN  <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_C_with_CN.csv")
+
+# Convert to sf (UTM 17N)
+
+soil_sf_SP_CN <- st_as_sf(SP_with_soil_CN, coords = c("x","y"), crs = 4326) %>% st_transform(32617)
+soil_sf_C_CN  <- st_as_sf(C_with_soil_CN,  coords = c("x","y"), crs = 4326) %>% st_transform(32617)
+
+# Define nutrients to process
+
+soil_vars_CN <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn","c","n")
+candidate_models <- c("Exp","Sph","Gau","Mat")
+
+# --- Helper: robust variogram fit ---
+
+fit_variogram_best <- function(spdf, value_col, candidate_models){
+out <- list(emp = NULL, best_fit = NULL, model = NA_character_,
+range = NA_real_, sill = NA_real_, nugget = NA_real_, line_df = NULL)
+fmla <- as.formula(paste(value_col, "~ 1"))
+v_emp <- tryCatch(variogram(fmla, data = spdf), error = function(e) NULL)
+if(is.null(v_emp) || nrow(v_emp) == 0) return(out)
+
+var_val <- var(spdf[[value_col]], na.rm = TRUE)
+maxdist <- max(v_emp$dist, na.rm = TRUE)
+best_sse <- Inf
+
+for(m in candidate_models){
+init_vgm <- tryCatch({
+if(m == "Mat") vgm(model = m, range = maxdist/3, psill = var_val*0.5, nugget = var_val*0.1, kappa = 0.5)
+else vgm(model = m, range = maxdist/3, psill = var_val*0.5, nugget = var_val*0.1)
+}, error = function(e) vgm(model = m))
+
+
+fit_try <- tryCatch(
+  fit.variogram(v_emp, model = init_vgm, fit.sill = TRUE, fit.range = TRUE, fit.method = 7),
+  error = function(e) NULL
+)
+
+if(is.null(fit_try)) next
+
+# skip nonsensical fits
+ps <- as.data.frame(fit_try)
+if(any(ps$range <= 0 | ps$psill < 0, na.rm = TRUE)) next
+
+theo <- tryCatch(variogramLine(fit_try, dist_vector = v_emp$dist), error = function(e) NULL)
+if(is.null(theo)) next
+
+sse <- sum((v_emp$gamma - theo$gamma)^2, na.rm = TRUE)
+if(sse < best_sse){
+  best_sse <- sse
+  out$best_fit <- fit_try
+  out$model <- m
+  out$line_df <- theo
+}
+
+
+}
+
+if(!is.null(out$best_fit)){
+ps <- as.data.frame(out$best_fit)
+out$nugget <- if("Nug" %in% ps$model) ps$psill[ps$model=="Nug"] else 0
+struct <- ps[ps$model != "Nug",]
+if(nrow(struct)>0){
+out$sill <- struct$psill[1]; out$range <- struct$range[1]
+}
+out$emp <- v_emp
+}
+out
+}
+
+# --- Loop and plot ---
+
+for(nut in soil_vars_CN){
+plots <- list()
+for(ds_name in c("SP","C")){
+soil_sf <- if(ds_name=="SP") soil_sf_SP_CN else soil_sf_C_CN
+if(!nut %in% names(soil_sf)){
+plots[[ds_name]] <- ggplot() +
+annotate("text", x=0.5, y=0.5, label=paste("Missing", nut, "in", ds_name), size=5) + theme_void()
+next
+}
+
+spdf <- as(soil_sf[,nut], "Spatial")
+names(spdf@data) <- "value"
+vf <- fit_variogram_best(spdf, "value", candidate_models)
+v_emp <- vf$emp
+
+if(is.null(v_emp)){
+  plots[[ds_name]] <- ggplot() +
+    annotate("text", x=0.5, y=0.5, label=paste("No variogram:", nut, ds_name), size=4) + theme_void()
+  next
+}
+
+p <- ggplot(as.data.frame(v_emp), aes(x=dist, y=gamma)) +
+  geom_point(size=2) +
+  labs(title=paste(nut, "—", ds_name), x="Distance (m)", y="Semivariance") +
+  theme_minimal()
+
+if(!is.null(vf$line_df)){
+  p <- p + geom_line(data=vf$line_df, aes(x=dist, y=gamma), color="red", size=1) +
+    annotate("text", x=Inf, y=Inf, label=paste0("Model=", vf$model,
+                                                "\nRange=", round(vf$range,1),
+                                                "\nSill=", round(vf$sill,2),
+                                                "\nNugget=", round(vf$nugget,2)),
+             hjust=1.1, vjust=1.1, size=3)
+} else {
+  p <- p + annotate("text", x=Inf, y=Inf, label="No valid fit", hjust=1.1, vjust=1.1, size=3)
+}
+plots[[ds_name]] <- p
+
+
+}
+grid.arrange(plots$SP, plots$C, ncol=2)
+if(interactive()) readline(prompt="Press <Enter> for next nutrient...")
+}
+```
+
+```{r}
+
+library(sf); library(sp); library(randomForest); library(gstat)
+library(dplyr); library(purrr); library(tibble); library(ggplot2); library(gridExtra)
+library(terra)
+
+#--- Load data ---
+
+covariate_stack <- rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
+soil_covariate_data_scaled_SP_CN <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_SP_with_CN.csv")
+soil_covariate_data_scaled_C_CN <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_C_with_CN.csv")
+
+#--- Define soil and covariate variables ---
+
+soil_vars_CN <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn","c","n")
+covariates_CN <- setdiff(names(soil_covariate_data_scaled_SP_CN), c("x","y",soil_vars_CN))
+
+#--- Convert to sf and project to UTM ---
+
+soil_sf_SP_CN <- st_as_sf(soil_covariate_data_scaled_SP_CN, coords=c("x","y"), crs=4326) %>% st_transform(32617)
+soil_sf_C_CN <- st_as_sf(soil_covariate_data_scaled_C_CN, coords=c("x","y"), crs=4326) %>% st_transform(32617)
+
+#--- Parameters ---
+
+candidate_models <- c("Exp","Sph","Gau","Mat")
+min_points_for_vario <- 8
+rf_ntree <- 500
+
+#--- Helper: fit candidate variograms and return best (by SSE) ---
+
+fit_variogram_best <- function(spdf, value_col, candidate_models=c("Exp","Sph","Gau","Mat")){
+out <- list(emp = NULL, best_fit = NULL, model = NA_character_, range = NA_real_, sill = NA_real_, nugget = NA_real_, sse = NA_real_, line_df = NULL)
+fmla <- as.formula(paste(value_col, "~ 1"))
+v_emp <- tryCatch(variogram(fmla, data = spdf), error=function(e) NULL)
+if(is.null(v_emp) || nrow(v_emp)==0) return(out)
+samp_var <- var(spdf[[value_col]], na.rm=TRUE)
+maxdist <- max(v_emp$dist, na.rm=TRUE)
+best_sse <- Inf
+for(m in candidate_models){
+init_vgm <- tryCatch({
+if(m=="Mat") vgm(psill=max(1e-6, samp_var0.8), model="Mat", range=maxdist/3, kappa=0.5)
+else vgm(psill=max(1e-6, samp_var0.8), model=m, range=maxdist/3)
+}, error=function(e) vgm(model=m))
+fit_try <- tryCatch(fit.variogram(v_emp, model=init_vgm), error=function(e) NULL)
+if(is.null(fit_try)) next
+ps <- as.data.frame(fit_try)
+if(any(ps$range<=0 | ps$psill<0, na.rm=TRUE)) next
+theo <- tryCatch(variogramLine(fit_try, dist_vector=v_emp$dist), error=function(e) NULL)
+if(is.null(theo)) next
+sse <- sum((v_emp$gamma - theo$gamma)^2, na.rm=TRUE)
+if(sse < best_sse){
+best_sse <- sse
+out$best_fit <- fit_try
+out$model <- m
+out$line_df <- data.frame(dist=theo$dist, gamma=theo$gamma)
+}
+}
+if(!is.null(out$best_fit)){
+fit_df <- as.data.frame(out$best_fit)
+nug_rows <- which(tolower(fit_df$model) %in% c("nug","nugget"))
+out$nugget <- if(length(nug_rows)>0) as.numeric(fit_df$psill[nug_rows[1]]) else 0
+struct_rows <- which(!(tolower(fit_df$model) %in% c("nug","nugget")))
+if(length(struct_rows)>0){
+out$sill <- as.numeric(fit_df$psill[struct_rows[1]])
+out$range <- as.numeric(fit_df$range[struct_rows[1]])
+}
+out$sse <- best_sse
+out$emp <- v_emp
+}
+out
+}
+
+#--- Loop through nutrients ---
+
+for(nut in soil_vars_CN){
+plots_pair <- list()
+for(ds_name in c("SP","C")){
+soil_sf <- if(ds_name=="SP") soil_sf_SP_CN else soil_sf_C_CN
+df_full <- soil_sf %>% st_drop_geometry() %>% select(all_of(c(covariates_CN, nut)))
+keep <- complete.cases(df_full)
+df_use <- df_full[keep, , drop=FALSE]
+n_pts <- nrow(df_use)
+if(n_pts < 3){
+p <- ggplot() + annotate("text", x=0.5, y=0.5, label=paste("Too few points for", ds_name, nut), size=5) + theme_void()
+plots_pair[[ds_name]] <- p
+next
+}
+
+# --- Fit random forest ---
+rf_mod <- tryCatch(randomForest(x=df_use[,covariates_CN,drop=FALSE], y=df_use[[nut]], ntree=rf_ntree), error=function(e) NULL)
+if(is.null(rf_mod)){
+  p <- ggplot() + annotate("text", x=0.5, y=0.5, label=paste("RF failed:", ds_name, nut), size=5) + theme_void()
+  plots_pair[[ds_name]] <- p
+  next
+}
+
+# --- Residuals ---
+pred_oob <- tryCatch(rf_mod$predicted, error=function(e) NULL)
+pred_fitted <- tryCatch(predict(rf_mod, newdata=df_use[,covariates_CN,drop=FALSE]), error=function(e) NULL)
+used_pred <- if(!is.null(pred_oob) && length(pred_oob)==n_pts) pred_oob else pred_fitted
+resid <- df_use[[nut]] - used_pred
+
+coords <- st_coordinates(soil_sf)[keep, , drop=FALSE]
+resid_sf <- st_as_sf(tibble(obs=df_use[[nut]], predicted=used_pred, residual=resid, x=coords[,1], y=coords[,2]), coords=c("x","y"), crs=st_crs(soil_sf))
+sp_res <- tryCatch(as(resid_sf %>% rename(resid_col=residual), "Spatial"), error=function(e) NULL)
+if(is.null(sp_res) || sum(!is.na(sp_res$resid_col)) < min_points_for_vario){
+  p <- ggplot() + annotate("text", x=0.5, y=0.5, label=paste("Not enough points for variogram:", ds_name, nut, "\n(n=", n_pts,")"), size=4) + theme_void()
+  plots_pair[[ds_name]] <- p
+  next
+}
+
+vf <- fit_variogram_best(sp_res, "resid_col", candidate_models)
+v_emp <- vf$emp
+if(is.null(v_emp) || nrow(v_emp)==0){
+  p <- ggplot() + annotate("text", x=0.5, y=0.5, label=paste("Empirical variogram failed:", ds_name, nut), size=4) + theme_void()
+  plots_pair[[ds_name]] <- p
+  next
+}
+
+v_emp_df <- as.data.frame(v_emp)
+p <- ggplot(v_emp_df, aes(x=dist, y=gamma)) +
+  geom_point(size=2) +
+  geom_errorbar(aes(ymin=gamma - (sqrt(gamma)/2), ymax=gamma + (sqrt(gamma)/2)), width=0, alpha=0.2) +
+  labs(title=paste0(nut," — ",ds_name), x="Distance (m)", y="Semivariance") +
+  theme_minimal()
+
+if(!is.null(vf$line_df) && nrow(vf$line_df)>1){
+  p <- p + geom_line(data=vf$line_df, aes(x=dist, y=gamma), color="red", size=1) +
+    annotate("text", x=Inf, y=Inf, label=paste0("model=",vf$model,"\nrange=",round(vf$range,1),"\nsill=",round(vf$sill,2),"\nnugget=",round(vf$nugget,2)), hjust=1.05, vjust=1.05, size=3)
+} else {
+  p <- p + annotate("text", x=Inf, y=Inf, label="no theoretical fit", hjust=1.05, vjust=1.05, size=3)
+}
+plots_pair[[ds_name]] <- p
+
+}
+
+#--- Display side-by-side ---
+
+grid.arrange(plots_pair$SP, plots_pair$C, ncol=2)
+if(interactive()) readline(prompt="Press to continue to next nutrient...")
+}
+
+
+```
+```{r}
+#RESIDUAL
+# --- Load libraries ---
+
+
+library(sf); library(sp); library(randomForest); library(gstat)
+library(dplyr); library(tidyr); library(purrr); library(tibble)
+library(ggplot2); library(gridExtra); library(terra)
+
+# --- Load data ---
+
+covariate_stack <- rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
+SP_with_soil_CN <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_SP_with_CN.csv")
+C_with_soil_CN  <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_C_with_CN.csv")
+
+# --- Define variables ---
+
+soil_vars <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn","c","n")
+covariates <- setdiff(names(SP_with_soil_CN), c("x","y",soil_vars))
+
+# --- Convert to sf ---
+
+soil_sf_SP <- st_as_sf(SP_with_soil_CN, coords=c("x","y"), crs=4326) %>% st_transform(32617)
+soil_sf_C  <- st_as_sf(C_with_soil_CN,  coords=c("x","y"), crs=4326) %>% st_transform(32617)
+
+# --- Detect and remove multi-nutrient outliers ---
+
+SP_vals <- SP_with_soil_CN %>% select(x,y,all_of(soil_vars)) %>% mutate(dataset="SP")
+C_vals  <- C_with_soil_CN  %>% select(x,y,all_of(soil_vars)) %>% mutate(dataset="Composite")
+
+soil_long <- bind_rows(SP_vals, C_vals) %>%
+pivot_longer(all_of(soil_vars), names_to="variable", values_to="value") %>%
+pivot_wider(names_from=dataset, values_from=value) %>%
+drop_na(SP, Composite)
+
+soil_outliers <- soil_long %>%
+group_by(variable) %>%
+mutate(z = abs(scale(SP - Composite))) %>%
+ungroup() %>%
+mutate(outlier = z > 2)
+
+multi_outliers <- soil_outliers %>%
+group_by(x, y) %>%
+summarise(n_outlier = sum(outlier, na.rm=TRUE)) %>%
+filter(n_outlier >= 3)
+
+cat("Removed", nrow(multi_outliers), "multi-nutrient outlier points.\n")
+
+# --- Filter sf data to remove multi-outlier points ---
+
+remove_pts <- multi_outliers %>% select(x,y)
+soil_sf_SP <- soil_sf_SP %>%
+mutate(x = st_coordinates(.)[,1],
+y = st_coordinates(.)[,2]) %>%
+anti_join(remove_pts, by=c("x","y")) %>%
+select(-x,-y)
+
+soil_sf_C <- soil_sf_C %>%
+mutate(x = st_coordinates(.)[,1],
+y = st_coordinates(.)[,2]) %>%
+anti_join(remove_pts, by=c("x","y")) %>%
+select(-x,-y)
+
+cat("Remaining SP:", nrow(soil_sf_SP), "points | C:", nrow(soil_sf_C), "points\n")
+
+# --- Parameters ---
+
+candidate_models <- c("Exp","Sph","Gau","Mat")
+min_points_for_vario <- 8
+rf_ntree <- 500
+
+# --- Helper: fit candidate variograms ---
+
+fit_variogram_best <- function(spdf, value_col, candidate_models=c("Exp","Sph","Gau","Mat")){
+out <- list(emp=NULL, best_fit=NULL, model=NA_character_, range=NA_real_,
+sill=NA_real_, nugget=NA_real_, sse=NA_real_, line_df=NULL)
+fmla <- as.formula(paste(value_col, "~ 1"))
+v_emp <- tryCatch(variogram(fmla, data=spdf), error=function(e) NULL)
+if(is.null(v_emp)||nrow(v_emp)==0) return(out)
+samp_var <- var(spdf[[value_col]], na.rm=TRUE)
+maxdist <- max(v_emp$dist, na.rm=TRUE)
+best_sse <- Inf
+for(m in candidate_models){
+init_vgm <- tryCatch({
+if(m=="Mat") vgm(psill=max(1e-6,samp_var*0.8),model="Mat",range=maxdist/3,kappa=0.5)
+else vgm(psill=max(1e-6,samp_var*0.8),model=m,range=maxdist/3)
+}, error=function(e) vgm(model=m))
+fit_try <- tryCatch(fit.variogram(v_emp, model=init_vgm), error=function(e) NULL)
+if(is.null(fit_try)) next
+ps <- as.data.frame(fit_try)
+if(any(ps$range<=0 | ps$psill<0, na.rm=TRUE)) next
+theo <- tryCatch(variogramLine(fit_try, dist_vector=v_emp$dist), error=function(e) NULL)
+if(is.null(theo)) next
+sse <- sum((v_emp$gamma - theo$gamma)^2, na.rm=TRUE)
+if(sse < best_sse){
+best_sse <- sse
+out$best_fit <- fit_try
+out$model <- m
+out$line_df <- data.frame(dist=theo$dist, gamma=theo$gamma)
+}
+}
+if(!is.null(out$best_fit)){
+fit_df <- as.data.frame(out$best_fit)
+nug_rows <- which(tolower(fit_df$model) %in% c("nug","nugget"))
+out$nugget <- if(length(nug_rows)>0) as.numeric(fit_df$psill[nug_rows[1]]) else 0
+struct_rows <- which(!(tolower(fit_df$model) %in% c("nug","nugget")))
+if(length(struct_rows)>0){
+out$sill <- as.numeric(fit_df$psill[struct_rows[1]])
+out$range <- as.numeric(fit_df$range[struct_rows[1]])
+}
+out$sse <- best_sse
+out$emp <- v_emp
+}
+out
+}
+
+# --- Main loop: RF residuals + variogram fits ---
+
+for(nut in soil_vars){
+plots_pair <- list()
+for(ds_name in c("SP","C")){
+soil_sf <- if(ds_name=="SP") soil_sf_SP else soil_sf_C
+df_full <- soil_sf %>% st_drop_geometry() %>% select(all_of(c(covariates, nut)))
+keep <- complete.cases(df_full)
+df_use <- df_full[keep,]
+n_pts <- nrow(df_use)
+if(n_pts < 3){
+plots_pair[[ds_name]] <- ggplot() +
+annotate("text", x=0.5, y=0.5,
+label=paste("Too few points for", ds_name, nut, "\n(n=", n_pts,")"),
+size=5) + theme_void()
+next
+}
+
+
+# --- Fit random forest ---
+rf_mod <- tryCatch(randomForest(x=df_use[,covariates,drop=FALSE], y=df_use[[nut]], ntree=rf_ntree), error=function(e) NULL)
+if(is.null(rf_mod)){
+  plots_pair[[ds_name]] <- ggplot() +
+    annotate("text", x=0.5, y=0.5, label=paste("RF failed:", ds_name, nut), size=5) + theme_void()
+  next
+}
+
+# --- Residuals ---
+pred_oob <- tryCatch(rf_mod$predicted, error=function(e) NULL)
+pred_fitted <- tryCatch(predict(rf_mod, newdata=df_use[,covariates,drop=FALSE]), error=function(e) NULL)
+used_pred <- if(!is.null(pred_oob)&&length(pred_oob)==n_pts) pred_oob else pred_fitted
+resid <- df_use[[nut]] - used_pred
+
+coords <- st_coordinates(soil_sf)[keep,]
+resid_sf <- st_as_sf(tibble(obs=df_use[[nut]], predicted=used_pred, residual=resid,
+                            x=coords[,1], y=coords[,2]),
+                     coords=c("x","y"), crs=st_crs(soil_sf))
+sp_res <- tryCatch(as(resid_sf %>% rename(resid_col=residual),"Spatial"), error=function(e) NULL)
+if(is.null(sp_res)||sum(!is.na(sp_res$resid_col))<min_points_for_vario){
+  plots_pair[[ds_name]] <- ggplot() +
+    annotate("text",x=0.5,y=0.5,
+             label=paste("Not enough points for variogram:", ds_name, nut, "\n(n=", n_pts,")"),
+             size=4) + theme_void()
+  next
+}
+
+vf <- fit_variogram_best(sp_res,"resid_col",candidate_models)
+v_emp <- vf$emp
+if(is.null(v_emp)||nrow(v_emp)==0){
+  plots_pair[[ds_name]] <- ggplot() +
+    annotate("text",x=0.5,y=0.5,label=paste("Empirical variogram failed:", ds_name, nut),size=4) + theme_void()
+  next
+}
+
+v_emp_df <- as.data.frame(v_emp)
+p <- ggplot(v_emp_df,aes(x=dist,y=gamma)) +
+  geom_point(size=2) +
+  geom_errorbar(aes(ymin=gamma - (sqrt(gamma)/2), ymax=gamma + (sqrt(gamma)/2)),
+                width=0, alpha=0.2) +
+  labs(title=paste0(nut," — ",ds_name),
+       x="Distance (m)", y="Semivariance") +
+  theme_minimal()
+
+if(!is.null(vf$line_df)&&nrow(vf$line_df)>1){
+  p <- p + geom_line(data=vf$line_df,aes(x=dist,y=gamma),color="red",size=1) +
+    annotate("text",x=Inf,y=Inf,
+             label=paste0("model=",vf$model,
+                          "\nrange=",round(vf$range,1),
+                          "\nsill=",round(vf$sill,2),
+                          "\nnugget=",round(vf$nugget,2)),
+             hjust=1.05,vjust=1.05,size=3)
+} else {
+  p <- p + annotate("text",x=Inf,y=Inf,label="no theoretical fit",hjust=1.05,vjust=1.05,size=3)
+}
+plots_pair[[ds_name]] <- p
+
+
+}
+
+# --- Display side-by-side ---
+
+grid.arrange(plots_pair$SP, plots_pair$C, ncol=2)
+if(interactive()) readline(prompt="Press <Enter> for next nutrient...")
+}
+
+```
+```{r}
+#variogram fitting for raw data:
+# ============================================================
+# RAW VARIOGRAMS FOR ALL NUTRIENTS (INCLUDING C & N)
+# ============================================================
+
+library(sf); library(sp); library(gstat)
+library(dplyr); library(tibble)
+library(ggplot2); library(gridExtra)
+
+candidate_models <- c("Exp","Sph","Gau","Mat")
+min_points_for_vario <- 8
+
+fit_variogram_best <- function(spdf, value_col, candidate_models=c("Exp","Sph","Gau","Mat")){
+  out <- list(emp=NULL,best_fit=NULL,model=NA_character_,
+              range=NA_real_,sill=NA_real_,nugget=NA_real_,
+              sse=NA_real_,line_df=NULL)
+  
+  # Build formula safely
+  fmla <- as.formula(paste(value_col, "~ 1"))
+  
+  v_emp <- tryCatch(variogram(fmla, data=spdf), error=function(e)NULL)
+  if(is.null(v_emp) || nrow(v_emp)==0) return(out)
+  
+  samp_var <- var(spdf[[value_col]], na.rm=TRUE)
+  maxdist <- max(v_emp$dist, na.rm=TRUE)
+  best_sse <- Inf
+  
+  for(m in candidate_models){
+    init_vgm <- tryCatch({
+      if(m=="Mat") vgm(psill=max(1e-6,samp_var*0.8), model="Mat", range=maxdist/3, kappa=0.5)
+      else vgm(psill=max(1e-6,samp_var*0.8), model=m, range=maxdist/3)
+    }, error=function(e) vgm(model=m))
+    
+    fit_try <- tryCatch(fit.variogram(v_emp, model=init_vgm), error=function(e)NULL)
+    if(is.null(fit_try)) next
+    
+    ps <- as.data.frame(fit_try)
+    if(any(ps$range<=0 | ps$psill<0, na.rm=TRUE)) next
+    
+    theo <- tryCatch(variogramLine(fit_try, dist_vector=v_emp$dist), error=function(e)NULL)
+    if(is.null(theo)) next
+    
+    sse <- sum((v_emp$gamma - theo$gamma)^2, na.rm=TRUE)
+    if(is.finite(sse) && sse < best_sse){
+      best_sse <- sse
+      out$best_fit <- fit_try
+      out$model <- m
+      out$line_df <- data.frame(dist=theo$dist, gamma=theo$gamma)
+    }
+  }
+  
+  if(!is.null(out$best_fit)){
+    fit_df <- as.data.frame(out$best_fit)
+    nug_rows <- which(tolower(fit_df$model) %in% c("nug","nugget"))
+    out$nugget <- if(length(nug_rows)>0) as.numeric(fit_df$psill[nug_rows[1]]) else 0
+    struct_rows <- which(!(tolower(fit_df$model) %in% c("nug","nugget")))
+    if(length(struct_rows)>0){
+      out$sill <- as.numeric(fit_df$psill[struct_rows[1]])
+      out$range <- as.numeric(fit_df$range[struct_rows[1]])
+    }
+    out$sse <- best_sse
+  }
+  out$emp <- v_emp
+  out
+}
+
+# --- Loop through nutrients (raw data variograms) ---
+for(nut in soil_vars){
+  plots_pair <- list()
+  for(ds_name in c("SP","C")){
+    soil_sf <- if(ds_name=="SP") soil_sf_SP else soil_sf_C
+    
+    if(!nut %in% names(soil_sf)){
+      plots_pair[[ds_name]] <- ggplot() +
+        annotate("text",x=0.5,y=0.5,label=paste("Missing",nut,"in",ds_name),size=5) + theme_void()
+      next
+    }
+    
+    # --- rename "c" and "n" temporarily to safe names ---
+    safe_col <- nut
+    temp_name <- case_when(
+      nut == "c" ~ "carbon",
+      nut == "n" ~ "nitrogen",
+      TRUE ~ nut
+    )
+    
+    # copy sf and rename column
+    soil_temp <- soil_sf %>% rename(!!temp_name := all_of(nut))
+    spdf <- as(soil_temp[, temp_name], "Spatial")
+    
+    if(sum(!is.na(spdf[[temp_name]])) < min_points_for_vario){
+      plots_pair[[ds_name]] <- ggplot() +
+        annotate("text",x=0.5,y=0.5,label=paste("Too few points for",nut,"in",ds_name),size=5) + theme_void()
+      next
+    }
+    
+    vf <- fit_variogram_best(spdf, temp_name, candidate_models)
+    v_emp <- vf$emp
+    
+    # --- handle no empirical variogram gracefully ---
+    if(is.null(v_emp) || nrow(v_emp)==0){
+      p <- ggplot() + annotate("text",x=0.5,y=0.5,label=paste("No variogram data for",nut,"(",ds_name,")"),size=4) + theme_void()
+      plots_pair[[ds_name]] <- p
+      next
+    }
+    
+    v_emp_df <- as.data.frame(v_emp)
+    p <- ggplot(v_emp_df, aes(x=dist, y=gamma)) +
+      geom_point(size=2) +
+      labs(title=paste0(nut," — ",ds_name," (raw data)"),
+           x="Distance (m)", y="Semivariance") +
+      theme_minimal()
+    
+    if(!is.null(vf$line_df) && nrow(vf$line_df)>1){
+      p <- p + geom_line(data=vf$line_df, aes(x=dist, y=gamma), color="red", size=1) +
+        annotate("text",x=Inf,y=Inf,
+                 label=paste0("model=",vf$model,
+                              "\nrange=",round(vf$range,1),
+                              "\nsill=",round(vf$sill,2),
+                              "\nnugget=",round(vf$nugget,2)),
+                 hjust=1.05,vjust=1.05,size=3)
+    } else {
+      p <- p + annotate("text",x=Inf,y=Inf,label="no theoretical fit",
+                        hjust=1.05,vjust=1.05,size=3)
+    }
+    
+    plots_pair[[ds_name]] <- p
+  }
+  
+  grid.arrange(plots_pair$SP, plots_pair$C, ncol=2)
+  if(interactive()) readline(prompt="Press <Enter> for next nutrient...")
+}
+
+```
+```{r}
+# ============================================================
+# MANUAL EMPIRICAL SEMIVARIOGRAMS FOR C AND N (NO GSTAT)
+# ============================================================
+
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+
+# Function to compute empirical semivariogram manually
+manual_variogram <- function(sf_obj, value_col, n_lags = 15) {
+  df <- sf_obj %>%
+    st_drop_geometry() %>%
+    select(all_of(value_col)) %>%
+    mutate(x = st_coordinates(sf_obj)[,1],
+           y = st_coordinates(sf_obj)[,2]) %>%
+    drop_na()
+  
+  # pairwise distances and semivariances
+  coords <- as.matrix(df[, c("x","y")])
+  vals <- df[[value_col]]
+  
+  dmat <- as.matrix(dist(coords))
+  vmat <- outer(vals, vals, "-")^2 / 2
+  
+  # extract upper triangle (unique pairs)
+  dists <- dmat[upper.tri(dmat)]
+  semivars <- vmat[upper.tri(vmat)]
+  
+  # bin by distance
+  breaks <- seq(0, max(dists, na.rm = TRUE), length.out = n_lags + 1)
+  bins <- cut(dists, breaks, include.lowest = TRUE)
+  
+  vario_df <- data.frame(
+    dist = tapply(dists, bins, mean, na.rm = TRUE),
+    gamma = tapply(semivars, bins, mean, na.rm = TRUE),
+    np = tapply(semivars, bins, length)
+  ) %>%
+    filter(!is.na(dist), !is.na(gamma))
+  
+  return(vario_df)
+}
+
+# ============================================================
+# Run for C and N
+# ============================================================
+
+for (nut in c("c", "n")) {
+  plots_pair <- list()
+  
+  for (ds_name in c("SP","C")) {
+    soil_sf <- if (ds_name == "SP") soil_sf_SP else soil_sf_C
+    
+    # rename safely
+    temp_name <- ifelse(nut == "c", "carbon", "nitrogen")
+    soil_temp <- soil_sf %>% rename(!!temp_name := all_of(nut))
+    
+    # compute manual variogram
+    vario_df <- manual_variogram(soil_temp, temp_name, n_lags = 15)
+    
+    if (nrow(vario_df) == 0) {
+      plots_pair[[ds_name]] <- ggplot() +
+        annotate("text", x=0.5, y=0.5, label=paste("No semivariances for", nut, ds_name), size=5) +
+        theme_void()
+      next
+    }
+    
+    # plot
+    p <- ggplot(vario_df, aes(x = dist, y = gamma)) +
+      geom_point(size = 2, color = "#3366AA") +
+      geom_line(alpha = 0.5) +
+      labs(
+        title = paste0(toupper(nut), " — ", ds_name, " (Manual Empirical Variogram)"),
+        x = "Distance (m)",
+        y = "Semivariance"
+      ) +
+      theme_minimal(base_size = 13)
+    
+    plots_pair[[ds_name]] <- p
+  }
+  
+  grid.arrange(plots_pair$SP, plots_pair$C, ncol = 2)
+}
+
+#fit variograms to C an N:
+for(nut in c("c","n")){
+  plots_pair <- list()
+  for(ds_name in c("SP","C")){
+    soil_sf <- if(ds_name=="SP") soil_sf_SP else soil_sf_C
+    
+    # rename safely
+    temp_name <- ifelse(nut=="c","carbon","nitrogen")
+    soil_temp <- soil_sf %>% rename(!!temp_name := all_of(nut))
+    
+    spdf <- as(soil_temp[, temp_name], "Spatial")
+    
+    if(sum(!is.na(spdf[[temp_name]])) < min_points_for_vario){
+      plots_pair[[ds_name]] <- ggplot() +
+        annotate("text", x=0.5, y=0.5,
+                 label=paste("Too few points for", nut, "in", ds_name),
+                 size=5) + theme_void()
+      next
+    }
+    
+    vf <- fit_variogram_best(spdf, temp_name, candidate_models)
+    v_emp <- vf$emp
+    
+    if(is.null(v_emp) || nrow(v_emp)==0){
+      p <- ggplot() +
+        annotate("text", x=0.5, y=0.5,
+                 label=paste("No variogram data for", nut, "in", ds_name),
+                 size=4) + theme_void()
+      plots_pair[[ds_name]] <- p
+      next
+    }
+    
+    v_emp_df <- as.data.frame(v_emp)
+    p <- ggplot(v_emp_df, aes(x=dist, y=gamma)) +
+      geom_point(size=2) +
+      labs(title=paste0(nut," — ",ds_name," (Fitted Variogram)"),
+           x="Distance (m)", y="Semivariance") +
+      theme_minimal()
+    
+    if(!is.null(vf$line_df) && nrow(vf$line_df)>1){
+      p <- p + geom_line(data=vf$line_df, aes(x=dist, y=gamma), color="red", size=1) +
+        annotate("text", x=Inf, y=Inf,
+                 label=paste0("model=",vf$model,
+                              "\nrange=",round(vf$range,1),
+                              "\nsill=",round(vf$sill,2),
+                              "\nnugget=",round(vf$nugget,2)),
+                 hjust=1.05, vjust=1.05, size=3)
+    } else {
+      p <- p + annotate("text", x=Inf, y=Inf, label="no theoretical fit",
+                        hjust=1.05, vjust=1.05, size=3)
+    }
+    plots_pair[[ds_name]] <- p
+  }
+  grid.arrange(plots_pair$SP, plots_pair$C, ncol=2)
+}
+
+```
+

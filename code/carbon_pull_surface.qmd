@@ -1,0 +1,257 @@
+---
+title: "carbon_pull_surface"
+format: html
+---
+
+```{r}
+library(janitor)
+```
+
+```{r}
+#soil data:
+soil_data <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_points_corrected.csv")
+# str(soil_data)
+# 'data.frame':	272 obs. of  21 variables:
+#  $ ID        : int  240400 240401 240402 240403 240404 240405 240406 240407 240408 240409 ...
+#  $ OBJECTID_1: int  1 1 2 2 3 3 4 4 5 5 ...
+#  $ Label     : int  1 1 2 2 3 3 4 4 5 5 ...
+#  $ Row       : chr  "A" "A" "A" "A" ...
+#  $ PointLabel: chr  "1A" "1A" "2A" "2A" ...
+#  $ x         : num  -83.7 -83.7 -83.7 -83.7 -83.7 ...
+#  $ y         : num  32.4 32.4 32.4 32.4 32.4 ...
+#  $ RowNUM    : int  0 0 0 0 0 0 0 0 0 0 ...
+#  $ one       : int  1 1 1 1 1 1 1 1 1 1 ...
+#  $ Plbsac    : int  92 92 161 161 49 49 31 31 62 62 ...
+#  $ type      : chr  "SPID" "CID" "SPID" "CID" ...
+#  $ LBC.1     : int  189 184 202 170 242 193 156 204 149 187 ...
+#  $ LBCeq     : int  506 487 553 436 700 520 384 561 359 498 ...
+#  $ pH.2      : num  6.55 6.23 5.98 5.87 6.21 6.08 6.18 6.18 5.9 6.12 ...
+#  $ Ca        : int  661 528 655 654 635 510 623 451 413 539 ...
+#  $ K         : num  64.3 58.6 76.3 78.3 97.7 64.3 63.3 57.2 63.2 49.9 ...
+#  $ Mg        : num  74.8 63.2 76.6 95.6 79.8 54.3 55.1 65.5 53.1 66 ...
+#  $ Mn        : num  17.5 10.2 19 17.8 24.2 ...
+#  $ P         : num  45.9 38.6 80.7 82.6 24.6 ...
+#  $ Zn        : num  6.75 5.41 26.25 30.42 1.53 ...
+#  $ geometry  : chr  "c(242744.7559, 3592276.0907, 0)" "c(242744.7559, 3592276.0907, 0)" "c(242834.729, 3592273.4214, 0)" "c(242834.729, 3592273.4214, 0)" ...
+
+#pull carbon data:
+ raw_carbon_data <- read.csv("../LOCAL DATA DO NOT PUSH/carbon/11.5.25.csv")
+# 'data.frame':	1455 obs. of  12 variables:
+#  $ Carbon.Average    : chr  "0.000721 %" "Carbon" "0.00117 %" "0.000821 %" ...
+#  $ Nitrogen.Average  : chr  "0.0439 %" "Nitrogen" "0.0797 %" "0.0319 %" ...
+#  $ Carbon.Std..Dev.  : chr  "0.000511 %" "" "" "" ...
+#  $ Nitrogen.Std..Dev.: chr  "0.0316 %" "" "" "" ...
+#  $ Carbon..RSD       : chr  "70.9" "" "" "" ...
+#  $ Nitrogen..RSD     : chr  "72.0" "" "" "" ...
+#  $ Name              : chr  "Blank" "" "" "" ...
+#  $ Type              : chr  "Blank" "" "" "" ...
+#  $ Description       : chr  "" "" "" "" ...
+#  $ Set.ID            : chr  "0000000000000C64" "" "" "" ...
+#  $ Analysis.Date     : chr  "6/16/2025 3:10:30 PM" "" "" "" ...
+#  $ Date              : chr  "6/16/2025" "" "" "" ...
+
+#clean carbon_data
+ carbon_data <- raw_carbon_data %>%
+   #find rows where header Name has numbers, such as 424 or 516
+   filter(grepl("^[0-9]+$", Name)) %>%
+   clean_names %>%
+   #remove Name numbers that have longer than 3 digits:
+   filter(nchar(name) <= 3) %>%
+   #keep only carbon_average  , nitrogen_average, name
+   select(carbon_average, nitrogen_average, name, date) %>%
+   #keep number values in averages but remove percent and change to numeric
+   mutate(carbon_average = as.numeric(gsub(" %", "", carbon_average)),
+          nitrogen_average = as.numeric(gsub(" %", "", nitrogen_average)),
+          name = as.integer(name)) %>%
+    #remove failed samples yayyyy:
+    #remove rows 10-24
+          slice(-c(10:24)) %>%
+          slice(-c(236:237)) %>%
+    #remove 219 and 233:
+          filter(name != 219 & name != 233)
+# #add column with detection level, so if carbon_average is less than 0.07, then detection_level is "< 0.07", else "negligible"
+#    mutate(detection_level = ifelse(carbon_average < 0.07, "< 0.07", "negligible")) %>%
+#    #set carbon_average to 0.699 if below detection level
+#    mutate(carbon_average = ifelse(carbon_average < 0.07, 0.0699, carbon_average))
+ #remove failed samples:
+  # where 
+ 
+ 
+# #find in carbon_data where name has any duplicates and print those rows:
+ duplicates <- carbon_data$name[duplicated(carbon_data$name)]
+ carbon_data_dupes <- carbon_data %>%
+   filter(name %in% duplicates) %>%
+   arrange(name) %>%
+   #find if duplicates deviate significantly (more than 10%) from each other in carbon_average
+   mutate(deviation = abs(carbon_average - lag(carbon_average)) / lag(carbon_average) * 100)
+
+library(dplyr)
+library(lubridate)
+
+carbon_data_clean <- carbon_data %>%
+  # Convert date to proper date format (month/day/year)
+  mutate(date = mdy(date)) %>%
+  # Group by sample ID (name)
+  group_by(name) %>%
+  # Keep only the *latest* measurement per sample
+  arrange(desc(date), .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup()
+
+#plot carbon_data_clean
+library(ggplot2)
+ggplot(carbon_data_clean, aes(x = date, y = carbon_average)) +
+  geom_point() +
+  labs(title = "Carbon Average by date",
+       x = "date",
+       y = "Carbon Average (%)") +
+  theme_minimal()
+
+#rename all columns to include "leco_" prefix
+carbon_data_clean <- carbon_data_clean %>%
+  rename_with(~ paste0("leco_", .))
+#write dataset
+
+nitrogen_data_clean <- 
+```
+
+
+```{r}
+#merge with soil data with carbon_data_clean with soil ID in soil_data, and name in carbon_data_clean. Keep in mind that name only includes the last 3 digits of soil ID.
+merged_data <- soil_data %>%
+  mutate(soil_id_last3 = as.integer(substr(as.character(ID), nchar(as.character(ID)) - 2, nchar(as.character(ID))))) %>%
+  inner_join(carbon_data_clean, by = c("soil_id_last3" = "leco_name"))
+#save csv
+write.csv(merged_data, "../LOCAL DATA DO NOT PUSH/carbon/soil_data_with_CN.csv", row.names = FALSE)
+#plot map of merged_data with x and y coordinates, colored and labelled by leco_carbon_average
+merged_data_SPID <- merged_data %>%
+  filter(type == "SPID")
+merged_data_CID <- merged_data %>%
+  filter(type == "CID")
+#now, do leaflet with satellite basemap to plot type ==SPID points with leco_carbon_average as color and label.
+library(leaflet)
+library(leaflet.providers)
+#just SPID red gradient:
+leaflet(data = merged_data_SPID) %>%
+  addProviderTiles(providers$Esri.WorldImagery) %>%
+  addCircleMarkers(~x, ~y,
+                   color = ~colorNumeric("YlOrRd", leco_carbon_average)(leco_carbon_average),
+                   label = ~paste("Carbon Average:", leco_carbon_average),
+                   radius = 5,
+                   fillOpacity = 0.8) %>%
+  addLegend("bottomright",
+            pal = colorNumeric("YlOrRd", merged_data_SPID$leco_carbon_average),
+            values = merged_data_SPID$leco_carbon_average,
+            title = "Composite Carbon Average (%)",
+            opacity = 1)
+#just CID blue gradient:
+leaflet(data = merged_data_CID) %>%
+  addProviderTiles(providers$Esri.WorldImagery) %>%
+  addCircleMarkers(~x, ~y,
+                   color = ~colorNumeric("YlGnBu", leco_carbon_average)(leco_carbon_average),
+                   label = ~paste("Carbon Average:", leco_carbon_average),
+                   radius = 5,
+                   fillOpacity = 0.8) %>%
+  addLegend("bottomright",
+            pal = colorNumeric("YlGnBu", merged_data_CID$leco_carbon_average),
+            values = merged_data_CID$leco_carbon_average,
+            title = "Composite Carbon Average (%)",
+            opacity = 1)
+
+
+```
+```{r}
+#density plots of SPID carbon and CID carbon
+library(ggplot2)
+ggplot(merged_data, aes(x = leco_carbon_average, fill = type)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density Plot of SOC % by Sample Type",
+       x = "SOC (%)",
+       y = "Density") +
+  scale_fill_manual(values = c("SPID" = "red", "CID" = "blue")) +
+  theme_minimal()
+
+#plot nitrogen density of SPID and CID
+ggplot(merged_data, aes(x = leco_nitrogen_average, fill = type)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density Plot of Nitrogen % by Sample Type",
+       x = "Nitrogen (%)",
+       y = "Density") +
+  scale_fill_manual(values = c("SPID" = "red", "CID" = "blue")) +
+  theme_minimal()
+
+#plot pointlabel and SOC and color by sample type, SPID is single point and CID is composite
+ggplot(merged_data, aes(x = PointLabel, y = leco_carbon_average, color = type)) +
+  geom_point(size = 3) +
+  labs(title = "SOC % by Sample Point",
+       x = "Sample Point Label",
+       y = "SOC (%)") +
+  scale_color_manual(values = c("SPID" = "red", "CID" = "blue")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+
+
+#plot carbon avg differences for SPID and CID for each Point label
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+carbon_diff <- merged_data %>%
+  # Clean carbon to numeric
+  mutate(leco_carbon_average = as.numeric(gsub("%", "", leco_carbon_average))) %>%
+  
+  # Only use SPID and CID rows
+  filter(type %in% c("SPID", "CID")) %>% 
+  
+  # Summarize in case there are duplicates (take mean)
+  group_by(PointLabel, type) %>%
+  summarise(leco_carbon_average = mean(leco_carbon_average, na.rm = TRUE), .groups = "drop") %>%
+  
+  # Pivot so SPID and CID become columns
+  pivot_wider(names_from = type, values_from = leco_carbon_average) %>%
+  
+  # Remove labels where one is missing
+  drop_na(SPID, CID) %>%
+  
+  # Calculate difference
+  mutate(carbon_diff = SPID - CID)
+
+# Plot
+ggplot(carbon_diff, aes(x = reorder(PointLabel, carbon_diff), y = carbon_diff)) +
+  geom_col(fill = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  labs(title = "Carbon Difference (SPID - CID) by Point Label",
+       x = "Point Label",
+       y = "Difference in Carbon (%)") +
+  theme_minimal()
+
+
+library(dplyr)
+library(ggplot2)
+
+plot_data <- merged_data %>%
+  mutate(leco_carbon_average = as.numeric(gsub("%", "", leco_carbon_average))) %>%
+  filter(type %in% c("SPID", "CID"))
+
+ggplot(plot_data, aes(x = PointLabel, y = leco_carbon_average, fill = type)) +
+  geom_boxplot(alpha = 0.4, position = position_dodge(width = 0.7), outlier.shape = NA) +
+  geom_jitter(aes(color = type), 
+              width = 0.15, height = 0,
+              alpha = 0.7, size = 2) +
+  scale_fill_manual(values = c("SPID" = "#1f78b4", "CID" = "#e31a1c")) +
+  scale_color_manual(values = c("SPID" = "#1f78b4", "CID" = "#e31a1c")) +
+  labs(title = "Soil Organic Carbon Distribution by PointLabel",
+       x = "Point Label",
+       y = "Carbon (%)",
+       fill = "Sample Type",
+       color = "Sample Type") +
+  theme_minimal(base_size = 14) +
+  coord_flip()
+
+```
+
+

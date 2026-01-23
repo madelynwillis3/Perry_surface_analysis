@@ -1,0 +1,316 @@
+---
+title: "Soil Sampling Comparison – Clean Workflow"
+format: html
+---
+
+```{r}
+# --- Libraries ---
+library(tidyverse)
+library(sf)
+library(terra)
+library(gstat)
+library(randomForest)
+library(FNN)
+library(purrr)
+library(ggrepel)
+library(patchwork)
+library(gstat)
+library(purrr)
+
+# --- Load & Merge Data ---
+covariate_stack <- rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
+soil_SP <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_SP.csv")
+soil_C  <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_C.csv")
+
+soil_CN <- read_csv("../LOCAL DATA DO NOT PUSH/carbon/soil_data_with_CN.csv") %>%
+  rename(c = leco_carbon_average, n = leco_nitrogen_average)
+
+SP_CN <- soil_CN %>% filter(type == "SPID")
+C_CN  <- soil_CN %>% filter(type == "CID")
+
+soil_SP_full <- soil_SP %>% left_join(SP_CN %>% select(x, y, c, n), by = c("x", "y"))
+soil_C_full  <- soil_C  %>% left_join(C_CN  %>% select(x, y, c, n), by = c("x", "y"))
+
+soil_vars <- c( "p_h_2", "ca", "k", "mg", "mn", "p", "zn", "c", "n")
+covariates <- setdiff(names(soil_SP_full), c("x", "y", soil_vars))
+
+# Add PointLabel before converting to sf
+soil_SP_full <- soil_SP_full %>%
+  left_join(SP_CN %>% select(x, y, PointLabel), by = c("x", "y"))
+
+soil_C_full <- soil_C_full %>%
+  left_join(C_CN %>% select(x, y, PointLabel), by = c("x", "y"))
+
+soil_sf_SP <- st_as_sf(soil_SP_full, coords = c("x", "y"), crs = 4326) %>% st_transform(32617)
+soil_sf_C  <- st_as_sf(soil_C_full,  coords = c("x", "y"), crs = 4326) %>% st_transform(32617)
+
+
+# --- Detect & Remove Outliers ---
+SP_vals <- soil_SP_full %>% select(x, y, all_of(soil_vars)) %>% mutate(dataset = "SP")
+C_vals  <- soil_C_full %>% select(x, y, all_of(soil_vars)) %>% mutate(dataset = "Composite")
+
+soil_long <- bind_rows(SP_vals, C_vals) %>%
+  pivot_longer(all_of(soil_vars), names_to = "variable", values_to = "value") %>%
+  pivot_wider(names_from = dataset, values_from = value) %>%
+  drop_na(SP, Composite)
+
+soil_long <- soil_long %>%
+  left_join(SP_CN %>% select(x, y, PointLabel), by = c("x", "y"))
+
+soil_outliers <- soil_long %>%
+  group_by(variable) %>%
+  mutate(z = abs(scale(SP - Composite))) %>%
+  ungroup() %>%
+  mutate(outlier = z > 2)
+
+multi_outliers <- soil_outliers %>%
+  group_by(PointLabel) %>%
+  summarise(n_outlier = sum(outlier, na.rm = TRUE)) %>%
+  filter(n_outlier >= 3)
+
+# --- Remove outlier points (by PointLabel) using coordinate join ---
+soil_sf_SP <- soil_sf_SP %>%
+  mutate(x = st_coordinates(.)[,1],
+         y = st_coordinates(.)[,2]) %>%
+  left_join(SP_CN %>% select(x, y, PointLabel), by = c("x", "y")) %>%
+  rename(PointLabel = PointLabel.x) %>% # ensure consistent name
+  filter(!PointLabel %in% multi_outliers$PointLabel) %>%
+  select(-x, -y, -PointLabel)
+
+soil_sf_C <- soil_sf_C %>%
+  mutate(x = st_coordinates(.)[,1],
+         y = st_coordinates(.)[,2]) %>%
+  left_join(C_CN %>% select(x, y, PointLabel), by = c("x", "y")) %>%
+  rename(PointLabel = PointLabel.x) %>% # ensure consistent name
+  filter(!PointLabel %in% multi_outliers$PointLabel) %>%
+  select(-x, -y, -PointLabel)
+
+
+
+# --- Modeling Functions ---
+generate_spatial_bootstrap <- function(sf_data, n_boot = 50, train_frac = 0.7, n_clusters = 8, seed = 123){
+  set.seed(seed)
+  clusters <- kmeans(st_coordinates(sf_data), centers = n_clusters)$cluster
+  replicate(n_boot, {
+    idx <- unlist(lapply(split(seq_len(nrow(sf_data)), clusters),
+                         \(i) sample(i, ceiling(length(i)*train_frac))))
+    sf_data %>% mutate(set = ifelse(seq_len(nrow(sf_data)) %in% idx, "train", "test"))
+  }, simplify = FALSE)
+}
+
+safe_cor2 <- function(x, y){
+  ok <- is.finite(x) & is.finite(y)
+  if(sum(ok) < 2) return(NA_real_)
+  suppressWarnings(cor(x[ok], y[ok], use = "complete.obs")^2)
+}
+
+
+run_RF <- function(boot_list, covariates, soil_vars){
+  map(soil_vars, \(v){
+    map(boot_list, \(df){
+      train <- st_drop_geometry(df %>% filter(set=="train")) %>% select(all_of(c(covariates, v))) %>% na.omit()
+      test  <- st_drop_geometry(df %>% filter(set=="test")) %>% select(all_of(c(covariates, v))) %>% na.omit()
+      if(nrow(train)<5 || nrow(test)<5) return(list(RMSE=NA,R2=NA))
+      m <- randomForest(x=train[,covariates], y=train[[v]], ntree=500)
+      p <- predict(m, newdata=test[,covariates])
+      list(RMSE=sqrt(mean((p-test[[v]])^2)), R2=safe_cor2(p, test[[v]]))
+    })
+  }) |> setNames(soil_vars)
+}
+
+run_OK_boot_safe <- function(boot_list, soil_vars){
+  out <- map(soil_vars, function(v){
+    map(boot_list, function(df){
+      # train/test + drop NAs in target
+      train_sf <- df %>% filter(set == "train") %>% filter(!is.na(.data[[v]]))
+      test_sf  <- df %>% filter(set == "test")  %>% filter(!is.na(.data[[v]]))
+      if(nrow(train_sf) < 5 || nrow(test_sf) < 5) return(list(RMSE = NA_real_, R2 = NA_real_))
+
+      # empirical variogram
+      v_emp <- tryCatch(variogram(reformulate("1", v), train_sf), error = function(e) NULL)
+      if(is.null(v_emp) || nrow(v_emp) == 0) return(list(RMSE = NA_real_, R2 = NA_real_))
+
+      # fit model (simple Exp; lets gstat pick sensible psill/range)
+      v_mod <- tryCatch(fit.variogram(v_emp, vgm(model = "Exp")), error = function(e) NULL)
+      if(is.null(v_mod)) return(list(RMSE = NA_real_, R2 = NA_real_))
+
+      # krige; gstat may drop targets outside hull — we’ll align explicitly
+      ok <- tryCatch(krige(reformulate("1", v), train_sf, test_sf, model = v_mod),
+                     error = function(e) NULL)
+      if(is.null(ok) || !"var1.pred" %in% names(ok)) return(list(RMSE = NA_real_, R2 = NA_real_))
+
+      pred <- as.numeric(ok$var1.pred)
+      obs  <- st_drop_geometry(test_sf)[[v]]
+
+      # Align by length (gstat prediction order == input order for kept points)
+      n <- min(length(pred), length(obs))
+      if(n < 2) return(list(RMSE = NA_real_, R2 = NA_real_))
+
+      pred <- pred[seq_len(n)]
+      obs  <- obs [seq_len(n)]
+      list(
+        RMSE = sqrt(mean((pred - obs)^2)),
+        R2   = safe_cor2(pred, obs)
+      )
+    })
+  })
+  setNames(out, soil_vars)
+}
+
+
+
+run_RK <- function(boot_list, covariates, soil_vars){
+  map(soil_vars, \(v){
+    map(boot_list, \(df){
+      tr <- df %>% filter(set=="train"); te <- df %>% filter(set=="test")
+      tr_df <- st_drop_geometry(tr) %>% select(all_of(c(covariates,v))) %>% na.omit()
+      te_df <- st_drop_geometry(te) %>% select(all_of(c(covariates,v))) %>% na.omit()
+      if(nrow(tr_df)<5 || nrow(te_df)<5) return(list(RMSE=NA,R2=NA))
+      # --- Replace this entire section ---
+      rf <- randomForest(x = tr_df[, covariates], y = tr_df[[v]], ntree = 500)
+      trend_te <- predict(rf, te_df[, covariates])
+      resid_tr <- tr_df[[v]] - predict(rf, tr_df[, covariates])
+      tr$resid <- NA
+      tr$resid[which(!is.na(st_drop_geometry(tr[[v]])))] <- resid_tr
+      
+      vg <- tryCatch(fit.variogram(variogram(resid ~ 1, tr), vgm(model = "Exp")), error = \(e) NULL)
+      if (is.null(vg)) return(list(RMSE = NA, R2 = NA))
+      
+      kr <- tryCatch(krige(resid ~ 1, tr, te, model = vg)$var1.pred, error = \(e) NULL)
+      if (is.null(kr)) return(list(RMSE = NA, R2 = NA))
+      
+      # Align kriging and trend predictions by matching test rows
+      valid_idx <- which(!is.na(te_df[[v]]))
+      final <- trend_te + kr[valid_idx]
+      
+      # Safe metrics
+      if (length(final) != length(te_df[[v]])) return(list(RMSE = NA, R2 = NA))
+      list(
+        RMSE = sqrt(mean((final - te_df[[v]])^2, na.rm = TRUE)),
+        R2   = safe_cor2(final, te_df[[v]])
+      )
+      # --- End of fix ---
+
+    })
+  }) |> setNames(soil_vars)
+}
+
+# --- Run Models ---
+boot_SP <- generate_spatial_bootstrap(soil_sf_SP)
+boot_C  <- generate_spatial_bootstrap(soil_sf_C)
+
+RF_SP <- run_RF(boot_SP, covariates, soil_vars)
+RF_C  <- run_RF(boot_C, covariates, soil_vars)
+OK_SP <- run_OK_boot_safe(boot_SP, soil_vars)
+OK_C  <- run_OK_boot_safe(boot_C,  soil_vars)
+RK_SP <- run_RK(boot_SP, covariates, soil_vars)
+RK_C  <- run_RK(boot_C, covariates, soil_vars)
+
+extract_metrics <- function(res_list, dataset_name){
+  map_dfr(names(res_list), function(v){
+    tibble(variable = v,
+           RMSE = map_dbl(res_list[[v]], "RMSE"),
+           R2   = map_dbl(res_list[[v]], "R2"),
+           dataset = dataset_name)
+  })
+}
+
+metrics_RF <- bind_rows(extract_metrics(RF_SP, "Single Point"),
+                        extract_metrics(RF_C,  "Composite")) %>%
+  mutate(method = "RF")
+
+metrics_OK <- bind_rows(extract_metrics(OK_SP, "Single Point"),
+                        extract_metrics(OK_C,  "Composite")) %>%
+  mutate(method = "OK")
+
+metrics_RK <- bind_rows(extract_metrics(RK_SP, "Single Point"),
+                        extract_metrics(RK_C,  "Composite")) %>%
+  mutate(method = "RK")
+
+combined_metrics <- bind_rows(metrics_RF, metrics_OK, metrics_RK) %>%
+  pivot_longer(c(RMSE, R2), names_to = "metric", values_to = "value")
+
+
+```
+```{r}
+# --- Plot: Density (SP vs Composite) ---
+soil_SP_long <- soil_SP_full %>% mutate(type="Single Point") %>%
+  select(type, all_of(soil_vars)) %>% pivot_longer(all_of(soil_vars))
+soil_C_long  <- soil_C_full  %>% mutate(type="Composite") %>%
+  select(type, all_of(soil_vars)) %>% pivot_longer(all_of(soil_vars))
+soil_all_long <- bind_rows(soil_SP_long, soil_C_long)
+
+ggplot(soil_all_long, aes(x=value, fill=type)) +
+  geom_density(alpha=0.4) +
+  facet_wrap(~name, scales="free") +
+  theme_minimal(base_size=13) +
+  labs(title="Nutrient Distributions: SP vs Composite", x=NULL, y="Density")
+
+# --- Plot: Scatter (SP vs Composite with Outlier Labels) ---
+ggplot(soil_outliers, aes(x=Composite, y=SP)) +
+  geom_point(size=2, alpha=0.7) +
+  geom_abline(slope=1, intercept=0, linetype="dashed", color="red") +
+  geom_smooth(method="lm", se=FALSE, color="black", linewidth=0.7) +
+  geom_text_repel(data = filter(soil_outliers, outlier),
+                  aes(label = PointLabel),
+                  size=2.3, fontface="bold", max.overlaps=Inf, segment.size=0.3) +
+  facet_wrap(~variable, scales="free") +
+  theme_minimal(base_size=13) +
+  labs(title="SP vs Composite Nutrients (Outliers Labeled)",
+       x="Composite", y="Single Point")
+
+# --- Plot: RMSE and R² violin + box plots by nutrient, method, and dataset ---
+
+# consistent method colors
+method_colors <- c(RF = "#92D050", OK = "#0F9ED5", RK = "#884E71")
+
+filtered_metrics_RMSE <- combined_metrics %>%
+  filter(metric == "RMSE", !variable %in% c("lbc_1", "lb_ceq")) %>%
+  mutate(
+    variable = recode(variable, "p_h_2"="pH","ca"="Ca","k"="K","mg"="Mg",
+                      "mn"="Mn","p"="P","zn"="Zn","c"="C","n"="N"),
+    method   = factor(method, levels = c("OK","RF","RK")),
+    dataset  = factor(dataset, levels = c("Single Point","Composite"))
+  )
+
+filtered_metrics_R2 <- combined_metrics %>%
+  filter(metric == "R2", !variable %in% c("lbc_1", "lb_ceq")) %>%
+  mutate(
+    variable = recode(variable, "p_h_2"="pH","ca"="Ca","k"="K","mg"="Mg",
+                      "mn"="Mn","p"="P","zn"="Zn","c"="C","n"="N"),
+    method   = factor(method, levels = c("OK","RF","RK")),
+    dataset  = factor(dataset, levels = c("Single Point","Composite"))
+  )
+
+make_violin_plot <- function(df, ylab, title){
+  ggplot(df, aes(x = dataset, y = value)) +
+    geom_violin(aes(fill = method),
+                position = position_dodge(width = 0.85),
+                width = 0.8, trim = FALSE, alpha = 0.6) +
+    geom_boxplot(aes(color = method, group = interaction(dataset, method)),
+                 position = position_dodge(width = 0.85),
+                 width = 0.14, outlier.shape = NA, fill = NA, size = 0.7) +
+    stat_summary(aes(color = method),
+                 fun = mean, geom = "point",
+                 position = position_dodge(width = 0.85),
+                 size = 2.5, shape = 18) +
+    facet_wrap(~ variable, ncol = 3, scales = "free_y") +
+    scale_fill_manual(values = method_colors, name = "Method") +
+    scale_color_manual(values = method_colors, name = "Method") +
+    labs(title = title, x = "Dataset", y = ylab) +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "top",
+          strip.text = element_text(face = "bold"))
+}
+
+p_rmse <- make_violin_plot(filtered_metrics_RMSE, "RMSE",
+                           "RMSE by Nutrient, Method, and Dataset")
+p_r2   <- make_violin_plot(filtered_metrics_R2, "R²",
+                           "R² by Nutrient, Method, and Dataset")
+
+p_rmse
+p_r2
+
+
+```
+

@@ -1,0 +1,308 @@
+---
+title: "Perry_MZ_analysis_10_2025"
+author: "Madelyn Willis"
+format: html
+---
+
+```{r soil-dem-extraction, message=FALSE, warning=FALSE}
+# Load libraries
+library(sf)
+library(terra)
+library(tidyverse)
+#library(geoid)
+```
+
+```{r}
+# # 8. Extract elevation values for each point from both DEMs
+# drone_elev <- terra::extract(drone_dem_filled, coords_utm)[,1]
+# usgs_elev  <- terra::extract(usgs_dem_merged, coords_utm)[,1]
+# 
+# # 9. Add extracted values to points and compute difference
+# soil_points_utm$drone_elev <- drone_elev
+# soil_points_utm$usgs_elev  <- usgs_elev
+# soil_points_utm$elev_diff  <- drone_elev - usgs_elev
+# 
+# # 10. Inspect results
+# summary(soil_points_utm$drone_elev)
+# summary(soil_points_utm$usgs_elev)
+# summary(soil_points_utm$elev_diff)
+# 
+# offset <- 26.81743 #mean diff 
+# drone_dem_navd88 <- drone_dem_filled + offset
+# writeRaster(drone_dem_navd88, "../Local Data- DO NOT PUSH/Bastos_Data/dem/50cm_DEM_NAVD88.tif", overwrite=TRUE)
+```
+
+```{r soil-dem-extraction, message=FALSE, warning=FALSE}
+# 1. Load soil points as sf, specifying original CRS (WGS84: EPSG:4326)
+soil_data <- read.csv("../Local Data- DO NOT PUSH/soil_points_corrected.csv")
+soil_points <- st_as_sf(soil_data, coords = c("x", "y"), crs = 4326)
+
+# 2. Load USGS DEMs and merge
+usgs_files <- list.files("../Local Data- DO NOT PUSH/USGS_1m_DEM/", pattern = "\\.tif$", full.names = TRUE)
+usgs_dems <- lapply(usgs_files, rast)
+usgs_dem_merged <- do.call(merge, usgs_dems)
+#save as .tif for future use
+#writeRaster(usgs_dem_merged, "../Local Data- DO NOT PUSH/USGS_tile.tif", overwrite=TRUE)
+# 3. Load drone DEM
+drone_dem <- rast("../Local Data- DO NOT PUSH/Bastos_Data/dem/50cm_DEM_processed.tif")
+offset <- 26.81743 #mean diff 
+drone_dem <- drone_dem + offset
+
+# 4. Reproject both DEMs (if necessary) to match USGS DEM CRS (assumed EPSG:32617)
+usgs_crs <- crs(usgs_dem_merged)
+if(crs(drone_dem) != usgs_crs) {
+  drone_dem <- project(drone_dem, usgs_crs)
+}
+# Optionally reproject USGS DEM if needed (rare)
+# usgs_dem_merged <- project(usgs_dem_merged, "EPSG:32617")
+
+# 5. Reproject soil points to DEM CRS
+soil_points_utm <- st_transform(soil_points, crs = usgs_crs)
+coords_utm <- st_coordinates(soil_points_utm)
+
+# 6. Resample drone DEM to USGS grid
+drone_dem_resampled <- resample(drone_dem, usgs_dem_merged, method = "bilinear")
+
+# 7. Fill NAs in drone DEM with USGS DEM values
+drone_dem_filled <- drone_dem_resampled
+na_cells <- is.na(drone_dem_filled)
+drone_dem_filled[na_cells] <- usgs_dem_merged[na_cells]
+
+#smooth out any artifacts from filling
+drone_dem_filled_smooth <- focal(drone_dem_filled, w = matrix(1,3,3), fun = mean, na.rm = TRUE)
+# 8. Save final filled and smoothed DEM
+#writeRaster(drone_dem_filled_smooth, "../Local Data- DO NOT PUSH/Bastos_Data/Bastos_DEM_filled_smooth.tif", overwrite=TRUE)
+# load in border shp and overlay on DEM
+border <- st_read("../Local Data- DO NOT PUSH/Border/border.shp")
+border <- st_transform(border, crs = usgs_crs)
+
+#create new box extent around border with a buffer of 10,000m, centering on the border
+border_center <- st_centroid(st_union(border))
+
+# Extract center coordinates
+center_coords <- st_coordinates(border_center)[1,]
+half_size <- 5000  # half of 10,000 m
+
+# Create bounding box as POLYGON
+bbox_poly <- st_polygon(list(rbind(
+  c(center_coords[1] - half_size, center_coords[2] - half_size),
+  c(center_coords[1] - half_size, center_coords[2] + half_size),
+  c(center_coords[1] + half_size, center_coords[2] + half_size),
+  c(center_coords[1] + half_size, center_coords[2] - half_size),
+  c(center_coords[1] - half_size, center_coords[2] - half_size)
+)))
+bbox_sf <- st_sfc(bbox_poly, crs = st_crs(border))
+
+plot(drone_dem_filled_smooth)
+plot(bbox_sf, add=TRUE, border='red', lwd=2)
+plot(border, add=TRUE, border='blue', lwd=2)
+
+#crop both DEMs to this new extent
+drone_dem_cropped <- crop(drone_dem_filled_smooth, vect(bbox_sf))
+usgs_dem_cropped <- crop(usgs_dem_merged, vect(bbox_sf))
+
+#save .tifs:
+writeRaster(drone_dem_cropped, "../Local Data- DO NOT PUSH/Bastos_Data/dem/Bastos_1m_DEM_cropped.tif", overwrite=TRUE)
+writeRaster(usgs_dem_cropped, "../Local Data- DO NOT PUSH/USGS_1m_DEM/USGS_1m_DEM_cropped.tif", overwrite=TRUE)
+#plot cropped DEMs
+par(mfrow=c(1,2))
+plot(drone_dem_cropped, main="Drone DEM (1m) - Cropped")
+plot(usgs_dem_cropped, main="USGS DEM (1m) - Cropped")
+```
+
+```{r raster comparison function}
+library(terra)
+
+compare_rasters <- function(..., tol = 1e-6) {
+  rasters <- list(...)
+  
+  if (!all(sapply(rasters, inherits, "SpatRaster"))) {
+    stop("All inputs must be 'SpatRaster' objects.")
+  }
+  
+  ref <- rasters[[1]]
+  
+  # Helper to compare numeric vectors with tolerance
+  equal_num <- function(a, b, tol) all(abs(a - b) < tol)
+  
+  # Compare resolution, CRS, and extent
+  res_check <- sapply(rasters, function(x) equal_num(res(x), res(ref), tol))
+  crs_check <- sapply(rasters, function(x) crs(x) == crs(ref))
+  ext_check <- sapply(rasters, function(x) {
+    e1 <- as.vector(ext(x))
+    e2 <- as.vector(ext(ref))
+    equal_num(e1, e2, tol)
+  })
+  
+  summary <- data.frame(
+    Raster = paste0("Raster_", seq_along(rasters)),
+    Resolution_Match = res_check,
+    CRS_Match = crs_check,
+    Extent_Match = ext_check
+  )
+  
+  all_match <- all(res_check) && all(crs_check) && all(ext_check)
+  
+  cat("\n--- Raster Comparison Summary ---\n")
+  print(summary, row.names = FALSE)
+  
+  if (all_match) {
+    cat("\n✅ All rasters have the same resolution, CRS, and extent.\n")
+  } else {
+    cat("\n⚠️  Some rasters differ in one or more attributes.\n")
+  }
+  
+  invisible(summary)
+}
+
+
+```
+
+
+```{r}
+#ndvi
+#NDVI
+    planet_veg <- terra::rast("../Local Data- DO NOT PUSH/Planet_data/Veg_sept_2022/20220921_152148_44_2465_3B_AnalyticMS_SR_8b_clip.tif") %>%
+      #crs to match other rasters
+      project(crs(usgs_dem))
+      #calculate ndvi
+      ndvi <- (planet_veg[[8]] - planet_veg[[6]]) / (planet_veg[[8]] + planet_veg[[6]]) %>%
+        setNames("NDVI") 
+#bare surface:
+      planet_bare_soil_2025 <- rast("../Local Data- DO NOT PUSH/Planet_data/bare_soil_apr_2025/20250419_163606_81_250e_3B_AnalyticMS_SR_8b_clip.tif") %>%
+       #resample to match planet_veg:
+       resample(planet_veg, method="bilinear") %>%
+        #keep only bands "blue", "green", "red", "red_edge", "nir"
+        subset(c("blue", "green", "red", "rededge", "nir"))
+      
+      writeRaster(planet_bare_soil_2025, "../Local Data- DO NOT PUSH/Planet_data/bare_soil_apr_2025/planet_bare_soil_2025_in_order.tif", overwrite=TRUE)
+      
+      #multispec:
+       bastos_multispec_g <- rast("../Local Data- DO NOT PUSH/Bastos_Data/Bastos_multispec/Both_apr_30_may_01_index_green.tif") %>%
+       #resample to match planet_veg:
+       resample(planet_veg, method="bilinear")
+       bastos_multispec_r <- rast("../Local Data- DO NOT PUSH/Bastos_Data/Bastos_multispec/Both_apr_30_may_01_index_red.tif") %>%
+       #resample to match planet_veg:
+       resample(planet_veg, method="bilinear")
+       bastos_multispec_nir <- rast("../Local Data- DO NOT PUSH/Bastos_Data/Bastos_multispec/Both_apr_30_may_01_index_nir.tif") %>%
+       #resample to match planet_veg:
+       resample(planet_veg, method="bilinear")
+       bastos_multispec_b <- rast("../Local Data- DO NOT PUSH/Bastos_Data/Bastos_multispec/Both_apr_30_may_01_index_blue.tif") %>%
+       #resample to match planet_veg:
+       resample(planet_veg, method="bilinear")
+       bastos_multispec_rededge <- rast("../Local Data- DO NOT PUSH/Bastos_Data/Bastos_multispec/Both_apr_30_may_01_index_red_edge.tif") %>%
+       #resample to match planet_veg:
+       resample(planet_veg, method="bilinear")
+       #bastos_multispec_lwir <- rast("../Local Data- DO NOT PUSH/Bastos_Data/Bastos_multispec/Both_apr_30_may_01_index_lwir.tif")
+       
+      #stack all multispectral bands
+      bastos_multispec_stack <- c(bastos_multispec_g, bastos_multispec_r, bastos_multispec_nir, bastos_multispec_b, bastos_multispec_rededge) %>%
+        setNames(c("Green", "Red", "NIR", "Blue", "RedEdge"))
+      #rearrange stack to match planet veg band order (blue, green, red, rededge, nir)
+      bastos_multispec_stack <- bastos_multispec_stack[[c("Blue", "Green", "Red", "RedEdge", "NIR")]]%>%
+        setNames(c("blue", "green", "red", "rededge", "nir"))
+      
+
+```
+```{r}
+
+
+```
+
+```{r}
+library(terra)
+library(randomForest)
+
+# --- 1. Load / assume you already have these (aligned to same 3m grid) ---
+# planet_bare_soil_2025   # SpatRaster with bands: blue, green, red, rededge, nir
+# bastos_multispec_stack  # SpatRaster with bands: blue, green, red, rededge, nir
+
+# --- 2. Rename layers to avoid ambiguous/duplicated names ---
+names(bastos_multispec_stack) <- paste0("ms_", names(bastos_multispec_stack))
+names(planet_bare_soil_2025) <- paste0("pl_", names(planet_bare_soil_2025))
+
+# quick check
+print(names(bastos_multispec_stack))
+print(names(planet_bare_soil_2025))
+
+# --- 3. Build combined stack and sample only locations with valid paired data ---
+combo <- c(bastos_multispec_stack, planet_bare_soil_2025)
+
+
+set.seed(42)
+# sample only where both have data (na.rm = TRUE)
+train_df <- spatSample(combo, size = 30000, method = "random", as.df = TRUE, na.rm = TRUE)
+
+# inspect column names in the training dataframe to be sure
+head(names(train_df))
+# make sure target and predictor columns are present, e.g. "ms_blue", "pl_blue", ...
+
+# --- 4. Train per-band random forest (Planet predictors -> Bastos target) ---
+filled_layers <- list()
+planet_predictors <- paste0("pl_", c("blue","green","red","rededge","nir"))
+target_bands <- c("blue","green","red","rededge","nir")
+
+for(target_base in target_bands) {
+  target_col <- paste0("ms_", target_base)   # e.g. "ms_blue"
+  # formula uses ms_* as response and pl_* as predictors
+  formula_rf <- as.formula(paste(target_col, "~", paste(planet_predictors, collapse = " + ")))
+
+  # Train RF on the sampled dataframe
+  rf_mod <- randomForest(formula_rf, data = train_df, ntree = 300, na.action = na.omit)
+
+  # Predict across the whole Planet covariate stack (planet_bare_soil_2025 has pl_ names)
+  preds <- predict(planet_bare_soil_2025, rf_mod,
+                   filename = paste0("pred_ms_", target_base, ".tif"),
+                   overwrite = TRUE, progress = TRUE)
+
+  # Take original Bastos band (ms_...) and fill NA values with the prediction
+  orig_band <- bastos_multispec_stack[[paste0("ms_", target_base)]]
+  filled_band <- cover(orig_band, preds)  # prefer original where present; otherwise prediction
+
+  filled_layers[[target_base]] <- filled_band
+}
+
+# --- 5. Stack filled bands and write out ---
+bastos_filled_rf <- rast(filled_layers)
+names(bastos_filled_rf) <- target_bands
+writeRaster(bastos_filled_rf, "bastos_multispec_filled_rf_3m.tif", overwrite = TRUE)
+
+
+#plot bastos green against planet green to see relationship from combined stack (include r^2 value and slope value)
+plot(combo[["ms_green"]], combo[["pl_green"]], xlab="Bastos Multispec Green", ylab="Planet Bare Soil Green", main="Bastos vs Planet Green Reflectance") 
+#get r^2 value
+model <- lm(pl_green ~ ms_green, data=as.data.frame(combo, na.rm=TRUE))
+r_squared <- summary(model)$r.squared
+#add r^2 value to plot
+legend("topleft", legend=paste("R² =", round(r_squared, 4)), bty="n")
+#add regression line to plot
+abline(model, col="red")
+
+#red:
+plot(combo[["ms_red"]], combo[["pl_red"]], xlab="Bastos Multispec Red", ylab="Planet Bare Soil Red", main="Bastos vs Planet Red Reflectance") 
+#get r^2 value
+model_red <- lm(pl_red ~ ms_red, data=as.data.frame(combo, na.rm=TRUE))
+r_squared_red <- summary(model_red)$r.squared
+#add r^2 value to plot
+legend("topleft", legend=paste("R² =", round(r_squared_red, 4)), bty="n")
+#add regression line to plot
+abline(model_red, col="red")
+
+#blue 
+plot(combo[["ms_blue"]], combo[["pl_blue"]], xlab="Bastos Multispec Blue", ylab="Planet Bare Soil Blue", main="Bastos vs Planet Blue Reflectance")
+#get r^2 value
+model_blue <- lm(pl_blue ~ ms_blue, data=as.data.frame(combo, na.rm=TRUE))
+r_squared_blue <- summary(model_blue)$r.squared
+#add r^2 value to plot
+legend("topleft", legend=paste("R² =", round(r_squared_blue, 4)), bty="n")
+#add regression line to plot
+abline(model_blue, col="red")
+
+```
+```{r}
+#predict NA bastos data based on linear regression with planet data
+#red edge
+
+```
+
+
