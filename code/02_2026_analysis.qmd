@@ -1,10 +1,10 @@
 ---
-title: "CANVAS_analysis_2"
+title: "02_2026_analysis"
 format: html
 ---
+### Load Libraries
 
-
-```{r}
+```{r, warning=FALSE}
 # --- Load libraries ---
 library(terra)
 library(tidyverse)
@@ -15,141 +15,16 @@ library(randomForest)
 library(FNN)
 library(purrr)
 library(RColorBrewer)
-
-
-# --- Load data ---
-covariate_stack <- rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
-soil_covariate_data_scaled_SP <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_SP.csv")
-  #  str(soil_covariate_data_scaled_SP)
-  # 'data.frame':	136 obs. of  38 variables:
-  #  $ x                                   : num  -83.7 -83.7 -83.7 -83.7 -83.7 ...
-  #  $ y                                   : num  32.4 32.4 32.4 32.4 32.4 ...
-  #  $ lbc_1                               : int  189 202 242 156 149 196 164 128 148 233 ...
-  #  $ lb_ceq                              : int  506 553 700 384 359 531 414 282 355 667 ...
-  #  $ p_h_2                               : num  6.55 5.98 6.21 6.18 5.9 6.03 5.62 5.84 5.36 6.4 ...
-  #  $ ca                                  : int  661 655 635 623 413 441 408 345 313 544 ...
-  #  $ k                                   : num  64.3 76.3 97.7 63.3 63.2 ...
-  #  $ mg                                  : num  74.8 76.6 79.8 55.1 53.1 56.9 38.5 61.4 57.2 49.6 ...
-  #  $ mn                                  : num  17.5 19 24.2 17.9 14.5 ...
-  #  $ p                                   : num  45.9 80.7 24.6 15.7 31.2 ...
-  #  $ zn                                  : num  6.75 26.25 1.53 1.89 1.28 ...
-  #  $ elevation                           : num  1.55 1.79 1.89 1.88 1.77 ...
-  #  $ slope                               : num  0.494 -0.135 -0.266 -0.741 -0.658 ...
-  #  $ profile_curvature                   : num  -0.0597 0.312 0.143 0.3501 -0.6783 ...
-  #  $ plan_curvature                      : num  0.7363 0.1434 -0.0964 2.8397 -1.2748 ...
-  #  $ total_curvature                     : num  -0.219 -0.1072 -0.0863 -0.1061 -0.048 ...
-  #  $ general_curvature                   : num  0.726 0.303 0.224 0.27 -0.987 ...
-  #  $ topographic_wetness_index_usgs      : num  -0.843 -0.686 -0.427 -0.517 -0.478 ...
-  #  $ topographic_position_index          : num  0.651 0.465 0.583 1.235 0.837 ...
-  #  $ flow_accumulation_usgs              : num  -0.248 -0.246 -0.246 -0.248 -0.237 ...
-  #  $ stream_power_index                  : num  -0.0912 -0.0911 -0.091 -0.0911 -0.0908 ...
-  #  $ mrvbf                               : num  -1.2943 -0.0757 0.914 -1.408 0.2195 ...
-  #  $ mrrtf                               : num  -0.181 -0.605 -0.544 2.081 2.691 ...
-  #  $ direct_insolation                   : num  0.678 0.591 0.489 -0.213 -0.556 ...
-  #  $ diffuse_insolation                  : num  -0.368 -0.237 -0.231 -0.137 -0.134 ...
-  #  $ vertical_distance_to_channel_network: num  0.775 1.118 1.316 1.389 1.376 ...
-  #  $ overland_flow_distance              : num  1.93 2.14 1.52 1.68 1.33 ...
-  #  $ horizontal_overland_flow_distance   : num  1.93 2.14 1.52 1.68 1.33 ...
-  #  $ vertical_overland_flow_distance     : num  2.05 2.34 2.47 3.95 2.32 ...
-  #  $ ndvi_sept_2022                      : num  0.22 0.602 0.695 0.352 0.666 ...
-  #  $ coastal_blue                        : num  7.5908 -0.2345 0.0355 0.6161 0.1271 ...
-  #  $ blue                                : num  5.1922 -0.3953 0.0654 0.5503 0.1803 ...
-  #  $ green_i                             : num  5.109 -0.499 -0.128 0.317 0.167 ...
-  #  $ green                               : num  5.0539 -0.5518 -0.1908 0.2225 -0.0445 ...
-  #  $ yellow                              : num  4.4769 -0.4316 -0.0546 0.3099 0.2226 ...
-  #  $ red                                 : num  3.3299 -0.4534 -0.1567 0.2058 0.0179 ...
-  #  $ rededge                             : num  4.4999 -1.0568 -0.6506 0.4254 -0.0883 ...
-  #  $ nir                                 : num  3.374 -1.517 -1.229 -0.282 -0.634 ...
-  # > 
-soil_covariate_data_scaled_C  <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_C.csv")
-soil_vars <- c("lbc_1", "lb_ceq", "p_h_2", "ca", "k", "mg", "mn", "p", "zn", "c","n")
-covariates <- setdiff(names(soil_covariate_data_scaled_SP), c("x","y",soil_vars))
-
-# --- Convert to sf and transform to UTM ---
-soil_sf_SP <- st_as_sf(soil_covariate_data_scaled_SP, coords = c("x","y"), crs = 4326) %>% st_transform(32617)
-soil_sf_C  <- st_as_sf(soil_covariate_data_scaled_C, coords = c("x","y"), crs = 4326) %>% st_transform(32617)
+library(ggrepel)
+library(patchwork)
+library(blockCV)
+library(leaflet)
 ```
 
+### Load Data and Prepare Datasets
 
-```{r}
-#merge carbon data with original soils data
-soil_with_CN <- read_csv("../LOCAL DATA DO NOT PUSH/carbon/soil_data_with_CN.csv")
+```{r, warning=FALSE}
 
-# > str(soil_with_CN)
-# spc_tbl_ [244 × 25] (S3: spec_tbl_df/tbl_df/tbl/data.frame)
-#  $ ID                   : num [1:244] 240401 240402 240403 240404 240405 ...
-#  $ OBJECTID_1           : num [1:244] 1 2 2 3 3 4 4 5 5 6 ...
-#  $ Label                : num [1:244] 1 2 2 3 3 4 4 5 5 6 ...
-#  $ Row                  : chr [1:244] "A" "A" "A" "A" ...
-#  $ PointLabel           : chr [1:244] "1A" "2A" "2A" "3A" ...
-#  $ x                    : num [1:244] -83.7 -83.7 -83.7 -83.7 -83.7 ...
-#  $ y                    : num [1:244] 32.4 32.4 32.4 32.4 32.4 ...
-#  $ RowNUM               : num [1:244] 0 0 0 0 0 0 0 0 0 0 ...
-#  $ one                  : num [1:244] 1 1 1 1 1 1 1 1 1 1 ...
-#  $ Plbsac               : num [1:244] 92 161 161 49 49 31 31 62 62 55 ...
-#  $ type                 : chr [1:244] "CID" "SPID" "CID" "SPID" ...
-#  $ LBC.1                : num [1:244] 184 202 170 242 193 156 204 149 187 196 ...
-#  $ LBCeq                : num [1:244] 487 553 436 700 520 384 561 359 498 531 ...
-#  $ pH.2                 : num [1:244] 6.23 5.98 5.87 6.21 6.08 6.18 6.18 5.9 6.12 6.03 ...
-#  $ Ca                   : num [1:244] 528 655 654 635 510 623 451 413 539 441 ...
-#  $ K                    : num [1:244] 58.6 76.3 78.3 97.7 64.3 63.3 57.2 63.2 49.9 48.9 ...
-#  $ Mg                   : num [1:244] 63.2 76.6 95.6 79.8 54.3 55.1 65.5 53.1 66 56.9 ...
-#  $ Mn                   : num [1:244] 10.2 19 17.8 24.2 13.4 ...
-#  $ P                    : num [1:244] 38.6 80.7 82.6 24.6 17.7 ...
-#  $ Zn                   : num [1:244] 5.41 26.25 30.42 1.53 1.26 ...
-#  $ geometry             : chr [1:244] "c(242744.7559, 3592276.0907, 0)" "c(242834.729, 3592273.4214, 0)" "c(242834.729, 3592273.4214, 0)" "c(242924.7019, 3592270.7521, 0)" ...
-#  $ soil_id_last3        : num [1:244] 401 402 403 404 405 406 407 408 409 410 ...
-#  $ leco_carbon_average  : num [1:244] 0.657 0.88 0.792 0.752 0.712 0.855 0.666 0.612 0.753 0.644 ...
-#  $ leco_nitrogen_average: num [1:244] 0.083 0.0621 0.0534 0.0447 0.0281 0.055 0.0682 0.0222 0.0355 0.0378 ...
-#  $ leco_date            : Date[1:244], format: "2025-06-16" "2025-06-30" "2025-08-07" "2025-08-07" ...
-#  - attr(*, "spec")=
-#   .. cols(
-#   ..   ID = col_double(),
-#   ..   OBJECTID_1 = col_double(),
-#   ..   Label = col_double(),
-#   ..   Row = col_character(),
-#   ..   PointLabel = col_character(),
-#   ..   x = col_double(),
-#   ..   y = col_double(),
-#   ..   RowNUM = col_double(),
-#   ..   one = col_double(),
-#   ..   Plbsac = col_double(),
-#   ..   type = col_character(),
-#   ..   LBC.1 = col_double(),
-#   ..   LBCeq = col_double(),
-#   ..   pH.2 = col_double(),
-#   ..   Ca = col_double(),
-#   ..   K = col_double(),
-#   ..   Mg = col_double(),
-#   ..   Mn = col_double(),
-#   ..   P = col_double(),
-#   ..   Zn = col_double(),
-#   ..   geometry = col_character(),
-#   ..   soil_id_last3 = col_double(),
-#   ..   leco_carbon_average = col_double(),
-#   ..   leco_nitrogen_average = col_double(),
-#   ..   leco_date = col_date(format = "")
-#   .. )
-#  - attr(*, "problems")=<externalptr> 
-# 
-
-#rename leco_carbon_average and leco_nitrogen_average to c and n
-soil_with_CN <- soil_with_CN %>%
-  rename(c = leco_carbon_average,
-         n = leco_nitrogen_average)
-#sort type 
-SP_soil_with_CN <- soil_with_CN %>% filter(type=="SPID")
-C_soil_with_CN  <- soil_with_CN %>% filter(type=="CID")
-
-# merge with soil_covariate_data_scaled_SP and soil_covariate_data_scaled_C based on location
-soil_SP_full <- soil_covariate_data_scaled_SP %>%
-  left_join(SP_soil_with_CN %>% select(x,y,c,n), by=c("x","y"))
-
-soil_C_full <- soil_covariate_data_scaled_C %>%
-  left_join(C_soil_with_CN %>% select(x,y,c,n), by=c("x","y"))
-```
-
-```{r}
 # --- Load data ---
 covariate_stack <- rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
 soil_covariate_data_scaled_SP <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_SP.csv")
@@ -181,12 +56,35 @@ covariates <- setdiff(names(soil_SP_full), c("x","y", soil_vars))
 soil_sf_SP <- st_as_sf(soil_SP_full, coords = c("x","y"), crs = 4326) %>% st_transform(32617)
 soil_sf_C  <- st_as_sf(soil_C_full, coords = c("x","y"), crs = 4326) %>% st_transform(32617)
 
-#plot SP on x axis and C on y axis for all nutrients
 
+# #rename variables:
+# rename_soils <- function(x) {
+#   x %>%
+#     rename(
+#       lbc        = lbc_1,
+#       lbc_eq     = lb_ceq,
+#       ph         = p_h_2,
+#       calcium    = ca,
+#       potassium  = k,
+#       magnesium  = mg,
+#       manganese  = mn,
+#       phosphorus = p,
+#       zinc       = zn,
+#       carbon     = c,
+#       nitrogen   = n
+#     )
+# }
+# 
+# soil_sf_SP <- rename_soils(soil_sf_SP)
+# soil_sf_C  <- rename_soils(soil_sf_C)
+# 
+# soil_vars_clean <- c("lbc","lbc_eq","ph","calcium","potassium","magnesium","manganese","phosphorus","zinc","carbon","nitrogen")
 ```
 
-```{r, warning =FALSE}
-library(tidyverse)
+
+### Plot Composite vs Single Point with Outlier Labels
+
+```{r, warning=FALSE}
 
 # 1) Select only nutrient columns + coordinates
 SP_vals <- soil_SP_full %>% select(x, y, all_of(soil_vars)) %>% mutate(dataset = "SP")
@@ -201,49 +99,7 @@ soil_wide <- soil_long %>%
   pivot_wider(names_from = dataset, values_from = value) %>%
   drop_na(SP, Composite)   # keeps only nutrients where both exist
 
-# Optional: rename variables to nicer plot labels
-soil_wide <- soil_wide %>%
-  mutate(variable = recode(variable,
-                           "lbc_1" = "LBC1",
-                           "lb_ceq" = "LBCeq",
-                           "p_h_2" = "pH",
-                           "ca" = "Ca",
-                           "k" = "K",
-                           "mg" = "Mg",
-                           "mn" = "Mn",
-                           "p" = "P",
-                           "zn" = "Zn",
-                           "c" = "C",
-                           "n" = "N"))
-
-# 4) Make the faceted scatterplot
-ggplot(soil_wide, aes(x = SP, y = Composite)) +
-  geom_point(alpha = 0.6, size = 2, color = "#4c72b0") +
-  geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.8) +
-  facet_wrap(~ variable, scales = "free") +
-  theme_minimal(base_size = 14) +
-  labs(title = "Single Point vs Composite Nutrient Values",
-       x = "Single Point (SP)",
-       y = "Composite (C)") +
-  theme(strip.text = element_text(face = "bold"))
-
-
-#plot but add a 1:1 line
-ggplot(soil_wide, aes(x = SP, y = Composite)) +
-  geom_point(alpha = 0.6, size = 2, color = "#4c72b0") +
-  geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.8) +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
-  facet_wrap(~ variable, scales = "free") +
-  theme_minimal(base_size = 14) +
-  labs(title = "Single Point vs Composite Nutrient Values with 1:1 Line",
-       x = "Single Point (SP)",
-       y = "Composite (C)") +
-  theme(strip.text = element_text(face = "bold"))
-
-
-library(ggplot2)
-library(dplyr)
-
+  
 # --- Attach PointLabel to merged dataset ---
 # We join from SP_soil_with_CN since PointLabel is stable there
 soil_wide_loc <- soil_wide %>%
@@ -263,10 +119,6 @@ soil_wide_loc <- soil_wide_loc %>%
                            "zn" = "Zn",
                            "c" = "C",
                            "n" = "N"))
-
-library(dplyr)
-library(ggrepel)
-
 # --- Compute residuals and identify outliers ---
 soil_outliers <- soil_wide_loc %>%
   group_by(variable) %>%
@@ -278,6 +130,9 @@ soil_outliers <- soil_wide_loc %>%
 
 # ✔ Check how many outliers per nutrient (optional)
 soil_outliers %>% count(variable, outlier)
+
+soil_no_outliers <- soil_outliers %>%
+  filter(outlier == FALSE)
 
 # --- Plot with 1:1 line and label only outliers ---
 ggplot(soil_outliers, aes(x = Composite, y = SP)) +
@@ -300,14 +155,11 @@ ggplot(soil_outliers, aes(x = Composite, y = SP)) +
     y = "Single Point"
   ) +
   theme(strip.text = element_text(face = "bold"))
-
 ```
 
-```{r, fig.width=10, fig.height=8, warning=FALSE, message=FALSE}
+### Plot without outliers and R² values
 
-library(ggplot2)
-library(dplyr)
-library(broom)
+```{r, warning=FALSE}
 
 # --- Compute R² for each nutrient ---
 r2_labels <- soil_no_outliers %>%
@@ -352,59 +204,13 @@ ggplot(soil_no_outliers, aes(x = Composite, y = SP)) +
     plot.title = element_text(face = "bold", hjust = 0.5)
   )
 
-ggsave("../outputs/figures/composite_vs_singlepoint_no_outliers_with_R2.png", width = 16, height = 9, units = "in", dpi = 300)
+# ggsave("../outputs/figures/composite_vs_singlepoint_no_outliers_with_R2.png", width = 16, height = 9, units = "in", dpi = 300)
 
 ```
 
+### Density Plots Comparing Distributions
 
-
-```{r}
-#remove outliers and plot again for all nutrients:
-library(ggplot2)
-# --- Remove outliers based on previous z-score calculation ---
-soil_no_outliers <- soil_outliers %>%
-  filter(!outlier)
-#remove lbc eq and 1
-soil_no_outliers <- soil_no_outliers %>%
-  filter(!variable %in% c("LBC1", "LBCeq"))
-# --- Plot without outliers ---
-ggplot(soil_no_outliers, aes(x = Composite, y = SP)) +
-  geom_point(size = 2, alpha = 0.7) +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red", linewidth = 1) +
-  geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.8) +
-  facet_wrap(~ variable, scales = "free") +
-  theme_minimal(base_size = 14) +
-  labs(
-    title = "Composite vs Single Point without Outliers",
-    x = "Composite (ppm)",
-    y = "Single Point (ppm)"
-  ) +
-  theme(strip.text = element_text(face = "bold"))
-#add R2 on each plot, with units
-#highlight more stable properties together
-
-#highlight less stable properties... lump them together ... management and soil variation connections
-#carbon and nitrogen together 
-
-
-#plot c vs sp in specific order: pH Ca K Mg Mn P Zn C N
-
-
-
-
-
-
-```
-
-```{r}
-#plot composie on y axis and single point on x axis for all nutrientsfrom soil_sf_SP, with labelling of point based on location
-
-```
-
-
-```{r}
-library(tidyverse)
-library(patchwork)
+```{r, warning=FALSE}
 # ---- Prepare long-format dataset for density plots ----
 
 # Select only the soil variables + dataset label
@@ -468,187 +274,33 @@ final_plot <-
   plot_layout(guides = "collect") & theme(legend.position = "bottom")
 
 # Add main title
-final_plot + 
-  plot_annotation(
-    title = "Soil Nutrient Distributions: Single Point vs Composite Sampling",
-    theme = theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
-  )
+# final_plot + 
+#   plot_annotation(
+#     title = "Soil Nutrient Distributions: Single Point vs Composite Sampling",
+#     theme = theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
+#   )
 
 #again but log scale all but pH
-final_plot_log <- 
-  (p_Ca + scale_x_log10() | p_K + scale_x_log10() | p_Mg + scale_x_log10()) /
-  (p_Mn + scale_x_log10() | p_P + scale_x_log10() | p_pH) /
-  (p_C + scale_x_log10() | p_Zn + scale_x_log10() | p_N + scale_x_log10()) +
-  plot_layout(guides = "collect") & theme(legend.position = "bottom")
-# Add main title
-final_plot_log + 
-  plot_annotation(
-    title = "Soil Nutrient Distributions (Log Scale): Single Point vs Composite Sampling",
-    theme = theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
-  )
-final_plot
-
-
-```
-
-```{r}
-library(tidyverse)
-library(patchwork)
-
-# -------------------------------------------------------------------
-# 1. Prepare long-format dataset
-# -------------------------------------------------------------------
-
-soil_SP_long <- soil_SP_full %>%
-  mutate(dataset = "Single Point") %>%
-  select(dataset, all_of(soil_vars)) %>%
-  pivot_longer(cols = all_of(soil_vars), names_to = "variable", values_to = "value")
-
-soil_C_long <- soil_C_full %>%
-  mutate(dataset = "Composite") %>%
-  select(dataset, all_of(soil_vars)) %>%
-  pivot_longer(cols = all_of(soil_vars), names_to = "variable", values_to = "value")
-
-# Combine into one table
-soil_long_all <- bind_rows(soil_SP_long, soil_C_long)
-
-# Recode nicer variable names
-soil_long_all <- soil_long_all %>%
-  mutate(variable = recode(variable,
-                           "lbc_1" = "LBC1",
-                           "lb_ceq" = "LBCeq",
-                           "p_h_2" = "pH",
-                           "ca" = "Ca",
-                           "k" = "K",
-                           "mg" = "Mg",
-                           "mn" = "Mn",
-                           "p" = "P",
-                           "zn" = "Zn",
-                           "c" = "C",
-                           "n" = "N"))
-
-# -------------------------------------------------------------------
-# 2. Custom colors (SP = blue, C = orange)
-# -------------------------------------------------------------------
-
-my_colors <- c("Single Point" = "#1f77b4",
-               "Composite"   = "#ff7f0e")
-
-# -------------------------------------------------------------------
-# 3. Helper function for density plots
-# -------------------------------------------------------------------
-
-make_density <- function(var_name, logscale = FALSE) {
-  p <- ggplot(filter(soil_long_all, variable == var_name),
-              aes(x = value, fill = dataset)) +
-    geom_density(alpha = 0.5) +
-    scale_fill_manual(values = my_colors) +
-    labs(title = var_name, x = NULL, y = "Density", fill = "Sampling Method") +
-    theme_minimal(base_size = 14) +
-    theme(
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-      legend.position = "bottom"
-    )
-  
-  if (logscale && var_name != "pH") {
-    p <- p + scale_x_log10()
-  }
-  
-  return(p)
-}
-
-# -------------------------------------------------------------------
-# 4. Make all plots individually (same order as before)
-# -------------------------------------------------------------------
-
-p_Ca <- make_density("Ca")
-p_K  <- make_density("K")
-p_Mg <- make_density("Mg")
-
-p_Mn <- make_density("Mn")
-p_P  <- make_density("P")
-p_pH <- make_density("pH")
-
-p_C  <- make_density("C")
-p_Zn <- make_density("Zn")
-p_N  <- make_density("N")
-
-# -------------------------------------------------------------------
-# 5. Combined layout (same order as before)
-# -------------------------------------------------------------------
-
-final_plot <-
-  (p_Ca | p_K | p_Mg) /
-  (p_Mn | p_P | p_pH) /
-  (p_C  | p_Zn | p_N) +
-  plot_layout(guides = "collect") &
-  theme(legend.position = "bottom")
-
-final_plot +
-  plot_annotation(
-    title = "Soil Nutrient Distributions: Single Point vs Composite Sampling",
-    theme = theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
-  )
-
-# -------------------------------------------------------------------
-# 6. Log-scale version (all except pH)
-# -------------------------------------------------------------------
-
-p_Ca_l <- make_density("Ca", logscale = TRUE)
-p_K_l  <- make_density("K",  logscale = TRUE)
-p_Mg_l <- make_density("Mg", logscale = TRUE)
-
-p_Mn_l <- make_density("Mn", logscale = TRUE)
-p_P_l  <- make_density("P",  logscale = TRUE)
-p_pH_l <- make_density("pH", logscale = FALSE)   # pH stays normal scale
-
-p_C_l  <- make_density("C",  logscale = TRUE)
-p_Zn_l <- make_density("Zn", logscale = TRUE)
-p_N_l  <- make_density("N",  logscale = TRUE)
 
 final_plot_log <-
-  (p_pH_l | p_Ca_l | p_K_l) /
-  (p_Mg_l | p_Mn_l | p_P_l) /
-  (p_Zn_l  | p_C_l | p_N_l) +
-  plot_layout(guides = "collect") &
-  theme(legend.position = "bottom")
-
-final_plot_log +
+  (
+    (p_Ca + scale_x_log10() | p_K + scale_x_log10() | p_Mg + scale_x_log10()) /
+    (p_Mn + scale_x_log10() | p_P + scale_x_log10() | p_pH) /
+    (p_C + scale_x_log10()  | p_Zn + scale_x_log10() | p_N + scale_x_log10())
+  ) +
+  plot_layout(guides = "collect") +
   plot_annotation(
     title = "Soil Nutrient Distributions (Log Scale): Single Point vs Composite Sampling",
-    theme = theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
-  )
+    theme = theme(plot.title = element_text(size = 12, face = "bold", hjust = 0.5))
+  ) &
+  theme(legend.position = "bottom")
 
+final_plot_log
 
-ggsave("../outputs/figures/soil_nutrient_distributions_log_scale.png", width = 16, height = 9, units = "in", dpi = 300)
 ```
+### Spatial Bootstrapping and Model Comparison
 
-
-```{r}
-# # remove outliers before modeling
-#     library(sf)
-#     # Identify outlier PointLabels from previous analysis
-#     outlier_labels <- soil_outliers %>%
-#       filter(outlier == TRUE) %>%
-#       pull(PointLabel) %>% unique()
-#     # Filter out outlier points from soil_sf_SP and soil_sf_C
-#     soil_sf_SP <- soil_sf_SP %>%
-#       left_join(SP_soil_with_CN %>% select(x, y, PointLabel), by = c("x","y")) %>%
-#       filter(!PointLabel %in% outlier_labels) %>%
-#       select(-PointLabel)
-#     
-#     soil_sf_C <- soil_sf_C %>%
-#       left_join(C_soil_with_CN %>% select(x, y, PointLabel), by = c("x","y")) %>%
-#       filter(!PointLabel %in% outlier_labels) %>%
-#       select(-PointLabel)
-# 
-#     #remove outliers
-#     
-# --- Safe spatial bootstrap function ---
-# --- Load package ---
-library(blockCV)
-library(sf)
-library(dplyr)
+```{r, warning=FALSE}
 
 # --- Spatial blocking function ---
 generate_spatial_bootstrap_block <- function(sf_data,
@@ -887,7 +539,7 @@ combined_metrics <- bind_rows(rf_metrics_all %>% mutate(method="RF"),
   pivot_longer(cols=c(RMSE,R2), names_to="metric", values_to="value")
 
 # --- Plot ---
-library(ggplot2)
+
 ggplot(combined_metrics, aes(x=variable, y=value, fill=dataset)) +
   geom_violin(trim=FALSE, alpha=0.6) +
   geom_boxplot(width=0.1, position=position_dodge(width=0.9), outlier.shape=NA) +
@@ -899,7 +551,7 @@ ggplot(combined_metrics, aes(x=variable, y=value, fill=dataset)) +
 
 ```
 
-```{r}
+```{r, warning=FALSE}
 #better plot: Just R2 for OK RF and RK. Remove LBC1 and LBCeq
 #rename variables for better readability
 filtered_metrics <- combined_metrics %>%
@@ -914,55 +566,19 @@ filtered_metrics <- combined_metrics %>%
                            "zn" = "Zn",
                            "c" = "C",
                            "n" = "N"))
-ggplot(filtered_metrics, aes(x=variable, y=value, fill=dataset)) +
-  geom_violin(trim=FALSE, alpha=0.6) +
-  geom_boxplot(width=0.1, position=position_dodge(width=0.9), outlier.shape=NA) +
-  theme_minimal(base_size=13) +
-  labs(title="Distribution of R² across nutrients - OK, RF, RK Methods",
-       x="Nutrient", y="R² Value") +
-  scale_fill_brewer(palette="Set2") +
-  facet_wrap(~method, nrow=1)
 
-#same thing, except color = method, facet by dataset
-ggplot(filtered_metrics, aes(x=variable, y=value, fill=method)) +
-  geom_violin(trim=FALSE, alpha=0.6) +
-  geom_boxplot(width=0.1, position=position_dodge(width=0.9), outlier.shape=NA) +
-  theme_minimal(base_size=13) +
-  labs(title="Distribution of R² across nutrients - OK, RF, RK Methods",
-       x="Nutrient", y="R² Value") +
-  scale_fill_brewer(palette="Set2") +
-  facet_wrap(~dataset, nrow=1)
-#save plot
-ggsave("../outputs/figures/R2_nutrients_by_method_all50.png", width=10, height=5)
-#RMSE same as above but for RMSE
+# Separate RMSE and R2 for plotting
 filtered_metrics_RMSE <- combined_metrics %>%
-  filter(metric=="RMSE", !variable %in% c("lbc_1","lb_ceq")) %>%
-  mutate(variable = recode(variable,
-                           "p_h_2" = "pH",
-                           "ca" = "Ca",
-                           "k" = "K",
-                           "mg" = "Mg",
-                           "mn" = "Mn",
-                           "p" = "P",
-                           "zn" = "Zn",
-                           "c" = "C",
-                           "n" = "N"))
+  filter(metric == "RMSE", !variable %in% c("lbc_1","lb_ceq")) %>%
+  mutate(
+    variable = recode(variable, "p_h_2"="pH","ca"="Ca","k"="K","mg"="Mg","mn"="Mn","p"="P","zn"="Zn","c"="C","n"="N")
+  )
 
-ggplot(filtered_metrics_RMSE, aes(x=variable, y=value, fill=dataset)) +
-  geom_violin(trim=FALSE, alpha=0.6) +
-  #boxplot with outline same color as violin
-  geom_boxplot(width=0.1, position=position_dodge(width=0.9), outlier.shape=NA) +
-  theme_minimal(base_size=13) +
-  labs(title="Distribution of RMSE across nutrients - OK, RF, RK Methods",
-       x="Nutrient", y="RMSE Value") +
-  scale_fill_brewer(palette="Set2") +
-  facet_wrap(~method, nrow=1)
-#save plot
-ggsave("../outputs/figures/RMSE_nutrients_by_method_all50.png", width=10, height=5)
-
-```
-```{r nicer plots, warning=FALSE}
-
+filtered_metrics_R2 <- combined_metrics %>%
+  filter(metric == "R2", !variable %in% c("lbc_1","lb_ceq")) %>%
+  mutate(
+    variable = recode(variable, "p_h_2"="pH","ca"="Ca","k"="K","mg"="Mg","mn"="Mn","p"="P","zn"="Zn","c"="C","n"="N")
+  )
 # Consistent colors for methods
 method_colors <- c(RF = "#1b9e77", OK = "#d95f02", RK = "#7570b3")
 
@@ -1026,8 +642,8 @@ p_r2 <- ggplot(filtered_metrics_R2, aes(x = dataset, y = value)) +
   theme_minimal(base_size = 13) +
   theme(legend.position = "top",
         strip.text = element_text(face = "bold"))
-print(p_r2)
-library(patchwork)
+
+
 
 make_panel <- function(df_one_metric, nut_label, ylab = "RMSE/R²") {
   ggplot(df_one_metric, aes(x = dataset, y = value)) +
@@ -1070,7 +686,7 @@ if (rem == 1) {
 
 p_rmse_centered <- wrap_plots(panels_rmse, ncol = ncol, guides = "collect") &
   theme(legend.position = "top")
-p_rmse_centered
+
 # If you want a shared legend, add it manually from one base plot; for brevity we keep legends off here.
 
 # Build per-nutrient panels for R2
@@ -1089,18 +705,12 @@ if (rem2 == 1) {
 p_r2_centered <- wrap_plots(panels_r2, ncol = ncol, guides = "collect") &
   theme(legend.position = "top")
 p_r2_centered
+
 ```
 
+### Metric Extraction Helpers
 
-```{r other metrics}
-# compute_validation_metrics_from_results_SP.R
-# Produces predictions_long_SP, per_boot_metrics_SP, pooled_metrics_SP
-# Assumes in-memory: boot_SP, boot_C, RF_results_SP, RF_results_C, OK_results_SP, OK_results_C, RK_results_SP, RK_results_C, covariates, soil_vars
-
-required_pkgs <- c("dplyr","purrr","tibble","sf","sp","gstat","randomForest")
-new_pkgs <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
-if(length(new_pkgs)) install.packages(new_pkgs)
-library(dplyr); library(purrr); library(tibble); library(sf); library(sp); library(gstat); library(randomForest)
+```{r, warning=FALSE}
 
 safe_cor2 <- function(x,y){
   if(length(x)==0 || length(y)==0) return(NA_real_)
@@ -1302,7 +912,7 @@ extract_metrics_for_method <- function(results_list, boot_list, method_name, cov
   predictions_long <- bind_rows(preds_long)
   list(predictions_long = predictions_long, per_boot_metrics = per_boot_metrics)
 }
-
+#SP:
 # Run extraction for Single Point boots (boot_SP) and Composite boots (boot_C)
 message("Extracting metrics for Single Point (SP) boots...")
 rf_SP_out <- extract_metrics_for_method(RF_results_SP, boot_SP, "RF", covariates, soil_vars)
@@ -1326,7 +936,7 @@ pooled_metrics_SP <- predictions_long_SP %>%
   )
 
 # Save results
-dir.create("spatial_cv_results", showWarnings = FALSE)
+dir.create("../ouputs/spatial_cv_results", showWarnings = FALSE)
 saveRDS(predictions_long_SP, file = "spatial_cv_results/predictions_long_SP.rds")
 saveRDS(per_boot_metrics_SP, file = "spatial_cv_results/per_boot_metrics_SP.rds")
 saveRDS(pooled_metrics_SP, file = "spatial_cv_results/pooled_metrics_SP.rds")
@@ -1343,16 +953,48 @@ invisible(list(
   per_boot_metrics_SP = per_boot_metrics_SP,
   pooled_metrics_SP = pooled_metrics_SP
 ))
+
+#C:
+message("Extracting metrics for Composite (C) boots...")
+rf_C_out <- extract_metrics_for_method(RF_results_C, boot_C, "RF", covariates, soil_vars)
+ok_C_out <- extract_metrics_for_method(OK_results_C, boot_C, "OK", covariates, soil_vars)
+rk_C_out <- extract_metrics_for_method(RK_results_C, boot_C, "RK", covariates, soil_vars)
+# Combine C predictions and metrics
+predictions_long_C <- bind_rows(rf_C_out$predictions_long, ok_C_out$predictions_long, rk_C_out$predictions_long)   
+per_boot_metrics_C <- bind_rows(rf_C_out$per_boot_metrics, ok_C_out$per_boot_metrics, rk_C_out$per_boot_metrics)
+# compute pooled metrics per nutrient + method from predictions_long_C
+pooled_metrics_C <- predictions_long_C %>%
+  group_by(nutrient, method) %>%
+  summarize(
+    n_total = sum(!is.na(observed) & !is.na(predicted)),
+    pooled_RMSE = ifelse(n_total==0, NA_real_, sqrt(mean((observed - predicted)^2, na.rm=TRUE))),
+    pooled_MAE  = ifelse(n_total==0, NA_real_, mean(abs(observed - predicted), na.rm=TRUE)),
+    pooled_Bias = ifelse(n_total==0, NA_real_, mean(predicted - observed, na.rm=TRUE)),
+    pooled_R2_cor = ifelse(n_total <= 1, NA_real_, {cc <- suppressWarnings(cor(observed, predicted, use="complete.obs")); ifelse(is.na(cc), NA_real_, cc^2)}),
+    .groups = "drop"
+  )
+# Save results                                    
+
+saveRDS(predictions_long_C, file = "spatial_cv_results/predictions_long_C.rds")
+saveRDS(per_boot_metrics_C, file = "spatial_cv_results/per_boot_metrics_C.rds")
+saveRDS(pooled_metrics_C, file = "spatial_cv_results/pooled_metrics_C.rds")
+# Print short summaries
+message("Per-boot metrics (first rows):")
+print(head(per_boot_metrics_C))                
+message("Pooled metrics (first rows):")
+print(head(pooled_metrics_C))
+# Return invisibly          
+invisible(list(
+  predictions_long_C = predictions_long_C,
+  per_boot_metrics_C = per_boot_metrics_C,
+  pooled_metrics_C = pooled_metrics_C
+))           
+                                       
 ```
 
-### Discussion of results
-#### things to consider: what limits to set on spatial blocking (k-means clusters), number of bootstraps, RF hyperparameters (ntree, mtry), variogram model types, etc. all of these affect output. also consider computational cost vs benefit of more complex methods (RK vs OK vs RF).
-#### Also consider corr R² vs RMSE as metrics. R² is scale-independent but can be misleading for low-variance variables, while RMSE is scale-dependent but more interpretable in absolute terms.
+### Statistical Testing Between Methods
 
-
-```{r method p value differences}
-#Paired statistical tests: because I used identical train/test splits for methods, i will used paired t-test or Wilcoxon signed-rank test on per-bootstrap RMSE or other metrics to test for significant differences between methods.
-# Function to prepare data for paired tests
+```{r, warning=FALSE}
 prepare_paired_data <- function(results_list, dataset_name, method_name){
   map_dfr(names(results_list), function(var){
     res <- results_list[[var]]
@@ -1398,5 +1040,341 @@ formatted_results <- test_results %>%
   select(variable, dataset, RF_vs_OK, RF_vs_RK, OK_vs_RK)
 formatted_results
 ```
+### Covariate Name Matching
+
+```{r}
+
+
+# ------------------------------------------------------------
+# 1) Define soil vars we do NOT want as predictors
+# ------------------------------------------------------------
+soil_vars_all <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn","c","n")
+
+# ------------------------------------------------------------
+# 2) Build normalized-name matching between points and raster
+# ------------------------------------------------------------
+norm_name <- function(x){
+  x %>%
+    tolower() %>%
+    str_replace_all("[^a-z0-9]+", "_") %>%  # collapse punctuation/spaces to _
+    str_replace_all("_+", "_") %>%          # remove repeats
+    str_replace_all("^_|_$", "")            # trim ends
+}
+
+stack_names <- names(covariate_stack)
+sp_names <- names(st_drop_geometry(soil_sf_SP))
+
+# candidates on points side = everything except soil vars + geometry-ish columns
+sp_candidates <- setdiff(sp_names, c(soil_vars_all, "geometry", "set", "fold"))
+
+# make lookup tables
+stack_tbl <- tibble(stack = stack_names, stack_norm = norm_name(stack_names))
+sp_tbl    <- tibble(sp = sp_candidates, sp_norm = norm_name(sp_candidates))
+
+# join by normalized name
+map_tbl <- sp_tbl %>%
+  left_join(stack_tbl, by = c("sp_norm" = "stack_norm"))
+
+# which point cols did not match any raster layer?
+unmatched_sp <- map_tbl %>% filter(is.na(stack)) %>% pull(sp)
+
+# which raster layers were not matched by any point col?
+matched_stack <- na.omit(map_tbl$stack) %>% unique()
+unmatched_stack <- setdiff(stack_names, matched_stack)
+
+cat("Point covariate cols:", length(sp_candidates), "\n")
+cat("Raster layers:", length(stack_names), "\n")
+cat("Matched:", length(matched_stack), "\n")
+cat("UNmatched point cols:", length(unmatched_sp), "\n")
+cat("UNmatched raster layers:", length(unmatched_stack), "\n")
+
+if (length(unmatched_sp) > 0) {
+  cat("\n--- Unmatched point columns (first 30) ---\n")
+  print(head(unmatched_sp, 30))
+}
+if (length(unmatched_stack) > 0) {
+  cat("\n--- Unmatched raster layers (first 30) ---\n")
+  print(head(unmatched_stack, 30))
+}
+
+# ------------------------------------------------------------
+# 3) Actually rename point columns to match raster stack names
+#    Only for those with a match, and avoid collisions.
+# ------------------------------------------------------------
+rename_vec <- map_tbl %>%
+  filter(!is.na(stack)) %>%
+  distinct(sp, stack) %>%
+  # if multiple sp map to same stack (rare), keep first
+  group_by(stack) %>% slice(1) %>% ungroup() %>%
+  { setNames(.$stack, .$sp) }   # old -> new mapping (dplyr::rename expects new=old, so we’ll do base rename)
+
+# base R rename for data.frames: names(df)[match(old, names(df))] <- new
+apply_rename <- function(sf_obj, rename_vec){
+  nm <- names(sf_obj)
+  olds <- names(rename_vec)
+  idx <- match(olds, nm)
+  hit <- !is.na(idx)
+  nm[idx[hit]] <- rename_vec[hit]
+  names(sf_obj) <- nm
+  sf_obj
+}
+
+soil_sf_SP <- apply_rename(soil_sf_SP, rename_vec)
+soil_sf_C  <- apply_rename(soil_sf_C,  rename_vec)
+
+# ------------------------------------------------------------
+# 4) Now you can use ALL raster layers as covariates
+#    (except soil variables if they exist as layers)
+# ------------------------------------------------------------
+covariates <- setdiff(names(covariate_stack), soil_vars_all)
+
+# Final sanity
+missing_now_SP <- setdiff(covariates, names(st_drop_geometry(soil_sf_SP)))
+missing_now_C  <- setdiff(covariates, names(st_drop_geometry(soil_sf_C)))
+
+cat("\nAfter renaming:\n")
+cat("Missing in SP:", length(missing_now_SP), "\n")
+cat("Missing in C :", length(missing_now_C), "\n")
+
+if (length(missing_now_SP) > 0) {
+  cat("\n--- Still missing in SP (first 30) ---\n")
+  print(head(missing_now_SP, 30))
+}
+
+# Optional: reorder stack to covariates
+covariate_stack <- covariate_stack[[covariates]]
+
+```
+### Final Map Prediction Using Best Boot Models
+
+```{r}
+
+# -----------------------------
+# 0) Choose which soil vars to map
+# -----------------------------
+soil_vars_to_map <- c("ca","k","mg","mn","p","zn","c","n","p_h_2")  # edit if you want
+# If you want to exclude pH from log stuff later, fine—here it maps same as others.
+
+# -----------------------------
+# 1) Combine per-boot metrics and pick "best boot" per nutrient/method/dataset
+#    (high R2, low RMSE)
+# -----------------------------
+per_boot_metrics_all <- bind_rows(
+  per_boot_metrics_SP %>% mutate(dataset = "SP"),
+  per_boot_metrics_C  %>% mutate(dataset = "C")
+) %>%
+  rename(R2 = R2_cor) %>%
+  filter(is.finite(RMSE), is.finite(R2))
+
+# score within each nutrient+method+dataset so scale differences don't dominate
+best_boot_tbl <- per_boot_metrics_all %>%
+  filter(nutrient %in% soil_vars_to_map, method %in% c("RF","RK","OK")) %>%
+  group_by(dataset, method, nutrient) %>%
+  mutate(
+    zR2   = as.numeric(scale(R2)),
+    zRMSE = as.numeric(scale(RMSE)),
+    score = zR2 - zRMSE
+  ) %>%
+  slice_max(order_by = score, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+print(best_boot_tbl)
+
+# -----------------------------
+# 2) Helpers: fit+predict FINAL maps (train on all points)
+#    NOTE: covariates must match raster layer names.
+# -----------------------------
+
+# Build covariates from raster stack names (most robust)
+soil_vars_all <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn","c","n")
+covariates <- setdiff(names(covariate_stack), soil_vars_all)
+
+# Ensure point tables have these covariates
+stopifnot(all(covariates %in% names(st_drop_geometry(soil_sf_SP))))
+stopifnot(all(covariates %in% names(st_drop_geometry(soil_sf_C))))
+
+# RF final map
+predict_RF_final <- function(soil_sf, covariate_stack, covariates, nutrient, ntree = 500) {
+  df <- st_drop_geometry(soil_sf) %>%
+    select(all_of(c(covariates, nutrient))) %>%
+    na.omit()
+
+  if (nrow(df) < 10) stop("Too few training rows for RF: ", nutrient)
+
+  rf_mod <- randomForest(
+    x = df[, covariates, drop = FALSE],
+    y = df[[nutrient]],
+    ntree = ntree
+  )
+
+  # Safe predict (no terra::predict): use as.data.frame + complete.cases
+  pred_df <- terra::as.data.frame(covariate_stack[[covariates]], cells = TRUE, na.rm = FALSE)
+  X <- pred_df[, covariates, drop = FALSE]
+  keep <- complete.cases(X)
+
+  pred <- rep(NA_real_, nrow(pred_df))
+  pred[keep] <- as.numeric(predict(rf_mod, newdata = as.data.frame(X[keep, , drop = FALSE])))
+
+  out <- covariate_stack[[1]]
+  vals <- rep(NA_real_, terra::ncell(out))
+  vals[pred_df$cell] <- pred
+  terra::values(out) <- vals
+  out
+}
+
+# OK final map
+predict_OK_final <- function(soil_sf, template_raster, nutrient) {
+  train_sf <- soil_sf
+  vals <- train_sf[[nutrient]]
+  if (sum(!is.na(vals)) < 10 || length(unique(na.omit(vals))) < 2) stop("Too few points for OK: ", nutrient)
+
+  v_emp <- variogram(as.formula(paste(nutrient, "~ 1")), train_sf)
+  v_fit <- tryCatch(
+    fit.variogram(v_emp, vgm(
+      psill  = var(vals, na.rm = TRUE),
+      model  = "Exp",
+      nugget = 0.1,
+      range  = max(v_emp$dist, na.rm = TRUE)/3
+    )),
+    error = function(e) vgm(psill = var(vals, na.rm = TRUE), model = "Nug", nugget = 0.1)
+  )
+
+  xy <- terra::crds(template_raster, df = TRUE)
+  grd_sf <- st_as_sf(xy, coords = c("x","y"), crs = st_crs(train_sf))
+
+  ok <- krige(as.formula(paste(nutrient, "~ 1")), train_sf, grd_sf, model = v_fit)
+
+  out <- template_raster
+  values(out) <- ok$var1.pred
+  out
+}
+
+# RK final map: RF trend + OK residuals
+predict_RK_final <- function(soil_sf, covariate_stack, covariates, nutrient, ntree = 500) {
+  # Fit RF trend on points
+  df <- st_drop_geometry(soil_sf) %>%
+    select(all_of(c(covariates, nutrient))) %>%
+    na.omit()
+  if (nrow(df) < 10) stop("Too few training rows for RK: ", nutrient)
+
+  rf_mod <- randomForest(
+    x = df[, covariates, drop = FALSE],
+    y = df[[nutrient]],
+    ntree = ntree
+  )
+
+  trend_pts <- predict(rf_mod, newdata = df[, covariates, drop = FALSE])
+  resid <- df[[nutrient]] - trend_pts
+
+  # attach residuals to a matching sf (subset soil_sf rows to df rownames)
+  soil_sf2 <- soil_sf[rownames(df), ]
+  train_res_sf <- soil_sf2 %>% mutate(resid = resid)
+
+  # variogram for residuals
+  v_emp <- variogram(resid ~ 1, train_res_sf)
+  v_fit <- tryCatch(
+    fit.variogram(v_emp, vgm(
+      psill  = var(resid, na.rm = TRUE),
+      model  = "Exp",
+      nugget = 0.1,
+      range  = max(v_emp$dist, na.rm = TRUE)/3
+    )),
+    error = function(e) vgm(psill = var(resid, na.rm = TRUE), model = "Nug", nugget = 0.1)
+  )
+
+  # trend raster (safe predict)
+  pred_df <- terra::as.data.frame(covariate_stack[[covariates]], cells = TRUE, na.rm = FALSE)
+  X <- pred_df[, covariates, drop = FALSE]
+  keep <- complete.cases(X)
+
+  trend_pred <- rep(NA_real_, nrow(pred_df))
+  trend_pred[keep] <- as.numeric(predict(rf_mod, newdata = as.data.frame(X[keep, , drop = FALSE])))
+
+  trend_r <- covariate_stack[[1]]
+  vals <- rep(NA_real_, terra::ncell(trend_r))
+  vals[pred_df$cell] <- trend_pred
+  values(trend_r) <- vals
+
+  # residual kriging to raster grid
+  xy <- terra::crds(trend_r, df = TRUE)
+  grd_sf <- st_as_sf(xy, coords = c("x","y"), crs = st_crs(train_res_sf))
+  kr_res <- krige(resid ~ 1, train_res_sf, grd_sf, model = v_fit)
+
+  res_r <- trend_r
+  values(res_r) <- kr_res$var1.pred
+
+  trend_r + res_r
+}
+
+# -----------------------------
+# 3) Run: for each dataset + nutrient, pick the best method(s) and map them
+# -----------------------------
+out_dir <- "best_boot_maps"
+dir.create(out_dir, showWarnings = FALSE)
+
+template_r <- covariate_stack[[1]]
+
+for (ds in c("SP","C")) {
+
+  soil_sf_use <- if (ds == "SP") soil_sf_SP else soil_sf_C
+
+  for (nut in soil_vars_to_map) {
+
+    # best boot rows (one per method)
+    bb <- best_boot_tbl %>% filter(dataset == ds, nutrient == nut)
+
+    if (nrow(bb) == 0) next
+
+    # Option: map ALL three methods; or only the top one.
+    # Here: map all methods that exist in bb
+    for (meth in bb$method) {
+
+      cat("Mapping:", ds, nut, meth, "\n")
+
+      r <- tryCatch({
+        if (meth == "RF") predict_RF_final(soil_sf_use, covariate_stack, covariates, nut)
+        else if (meth == "RK") predict_RK_final(soil_sf_use, covariate_stack, covariates, nut)
+        else predict_OK_final(soil_sf_use, template_r, nut)
+      }, error = function(e) {
+        message("FAILED: ", ds, " ", nut, " ", meth, " -> ", e$message)
+        NULL
+      })
+
+      if (!is.null(r)) {
+        fn <- file.path(out_dir, sprintf("%s_%s_%s_bestboot.tif", ds, nut, meth))
+        terra::writeRaster(r, fn, overwrite = TRUE)
+      }
+    }
+  }
+}
+
+cat("Done. Outputs in:", out_dir, "\n")
+```
+### Example Leaflet Plot of a Best Boot Map
+
+```{r}
+#plot
+
+ca_rf <- rast("best_boot_maps/SP_ca_RF_bestboot.tif")
+
+# project to lat/long for leaflet
+ca_rf_proj <- project(ca_rf, "EPSG:4326")
+
+pal <- colorNumeric("viridis", values(ca_rf_proj), na.color = "transparent")
+
+leaflet() %>%
+  addTiles() %>%
+  addProviderTiles(providers$Esri.WorldImagery, group = "Satellite")  %>%
+  addRasterImage(ca_rf_proj, colors = pal, opacity = 0.8) %>%
+  addLegend(pal = pal, values = values(ca_rf_proj), title = "Ca (ppm)", opacity = 1)
+  #basemap: satellite bottom layer
+
+```
+
+
+
+
+
+
 
 
