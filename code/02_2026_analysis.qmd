@@ -19,6 +19,8 @@ library(ggrepel)
 library(patchwork)
 library(blockCV)
 library(leaflet)
+library(tidytext)
+
 ```
 
 ### Load Data and Prepare Datasets
@@ -1148,69 +1150,78 @@ covariate_stack <- covariate_stack[[covariates]]
 ### Final Map Prediction Using Best Boot Models
 
 ```{r}
+# ============================================================
+# Best-boot selection + FINAL mapping (RF / OK / RK) in ONE chunk
+# ============================================================
+
+# libs assumed loaded: terra, sf, dplyr, gstat, randomForest
 
 # -----------------------------
-# 0) Choose which soil vars to map
+# 0) Soil vars to map
 # -----------------------------
-soil_vars_to_map <- c("ca","k","mg","mn","p","zn","c","n","p_h_2")  # edit if you want
-# If you want to exclude pH from log stuff later, fine—here it maps same as others.
+soil_vars_to_map <- c("ca","k","mg","mn","p","zn","c","n","p_h_2")
 
 # -----------------------------
-# 1) Combine per-boot metrics and pick "best boot" per nutrient/method/dataset
-#    (high R2, low RMSE)
+# 1) Best boot table (high R2, low RMSE) — for reporting only
 # -----------------------------
-per_boot_metrics_all <- bind_rows(
-  per_boot_metrics_SP %>% mutate(dataset = "SP"),
-  per_boot_metrics_C  %>% mutate(dataset = "C")
+per_boot_metrics_all <- dplyr::bind_rows(
+  per_boot_metrics_SP %>% dplyr::mutate(dataset = "SP"),
+  per_boot_metrics_C  %>% dplyr::mutate(dataset = "C")
 ) %>%
-  rename(R2 = R2_cor) %>%
-  filter(is.finite(RMSE), is.finite(R2))
+  dplyr::rename(R2 = R2_cor) %>%
+  dplyr::filter(is.finite(RMSE), is.finite(R2))
 
-# score within each nutrient+method+dataset so scale differences don't dominate
 best_boot_tbl <- per_boot_metrics_all %>%
-  filter(nutrient %in% soil_vars_to_map, method %in% c("RF","RK","OK")) %>%
-  group_by(dataset, method, nutrient) %>%
-  mutate(
+  dplyr::filter(nutrient %in% soil_vars_to_map, method %in% c("RF","RK","OK")) %>%
+  dplyr::group_by(dataset, method, nutrient) %>%
+  dplyr::mutate(
     zR2   = as.numeric(scale(R2)),
     zRMSE = as.numeric(scale(RMSE)),
     score = zR2 - zRMSE
   ) %>%
-  slice_max(order_by = score, n = 1, with_ties = FALSE) %>%
-  ungroup()
+  dplyr::slice_max(order_by = score, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup()
 
 print(best_boot_tbl)
 
 # -----------------------------
-# 2) Helpers: fit+predict FINAL maps (train on all points)
-#    NOTE: covariates must match raster layer names.
+# 2) Covariates = raster stack names minus soil vars
 # -----------------------------
-
-# Build covariates from raster stack names (most robust)
 soil_vars_all <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn","c","n")
 covariates <- setdiff(names(covariate_stack), soil_vars_all)
 
-# Ensure point tables have these covariates
-stopifnot(all(covariates %in% names(st_drop_geometry(soil_sf_SP))))
-stopifnot(all(covariates %in% names(st_drop_geometry(soil_sf_C))))
+stopifnot(all(covariates %in% names(sf::st_drop_geometry(soil_sf_SP))))
+stopifnot(all(covariates %in% names(sf::st_drop_geometry(soil_sf_C))))
 
-# RF final map
+template_r <- covariate_stack[[1]]
+
+# -----------------------------
+# 3) Helpers
+# -----------------------------
+align_sf_to_raster <- function(soil_sf, r){
+  crs_r <- terra::crs(r, proj = TRUE)
+  if (is.na(crs_r) || crs_r == "") stop("Raster has no CRS.")
+  sf::st_transform(soil_sf, crs_r)
+}
+
+# RF final map (safe predict)
 predict_RF_final <- function(soil_sf, covariate_stack, covariates, nutrient, ntree = 500) {
-  df <- st_drop_geometry(soil_sf) %>%
-    select(all_of(c(covariates, nutrient))) %>%
-    na.omit()
+
+  df <- sf::st_drop_geometry(soil_sf) %>%
+    dplyr::select(dplyr::all_of(c(covariates, nutrient))) %>%
+    stats::na.omit()
 
   if (nrow(df) < 10) stop("Too few training rows for RF: ", nutrient)
 
-  rf_mod <- randomForest(
+  rf_mod <- randomForest::randomForest(
     x = df[, covariates, drop = FALSE],
     y = df[[nutrient]],
     ntree = ntree
   )
 
-  # Safe predict (no terra::predict): use as.data.frame + complete.cases
   pred_df <- terra::as.data.frame(covariate_stack[[covariates]], cells = TRUE, na.rm = FALSE)
   X <- pred_df[, covariates, drop = FALSE]
-  keep <- complete.cases(X)
+  keep <- stats::complete.cases(X)
 
   pred <- rep(NA_real_, nrow(pred_df))
   pred[keep] <- as.numeric(predict(rf_mod, newdata = as.data.frame(X[keep, , drop = FALSE])))
@@ -1222,97 +1233,150 @@ predict_RF_final <- function(soil_sf, covariate_stack, covariates, nutrient, ntr
   out
 }
 
-# OK final map
-predict_OK_final <- function(soil_sf, template_raster, nutrient) {
-  train_sf <- soil_sf
-  vals <- train_sf[[nutrient]]
-  if (sum(!is.na(vals)) < 10 || length(unique(na.omit(vals))) < 2) stop("Too few points for OK: ", nutrient)
+# OK final map (CRS-safe + cell-index assignment)
+predict_OK_final <- function(soil_sf, template_raster, nutrient, debug = TRUE) {
 
-  v_emp <- variogram(as.formula(paste(nutrient, "~ 1")), train_sf)
-  v_fit <- tryCatch(
-    fit.variogram(v_emp, vgm(
-      psill  = var(vals, na.rm = TRUE),
-      model  = "Exp",
-      nugget = 0.1,
-      range  = max(v_emp$dist, na.rm = TRUE)/3
-    )),
-    error = function(e) vgm(psill = var(vals, na.rm = TRUE), model = "Nug", nugget = 0.1)
+  # align to raster CRS
+  train_sf <- sf::st_transform(soil_sf, terra::crs(template_raster, proj = TRUE))
+
+  # drop NA response rows (CRITICAL for gstat)
+  train_sf <- train_sf %>% dplyr::filter(!is.na(.data[[nutrient]]))
+
+  if (debug) {
+    cat("\n[OK DEBUG] nutrient:", nutrient, "\n")
+    cat("  n rows (non-NA):", nrow(train_sf), "\n")
+    cat("  unique values:", length(unique(train_sf[[nutrient]])), "\n")
+    cat("  CRS:", sf::st_crs(train_sf)$wkt %>% substr(1, 60), "...\n")
+  }
+
+  vals <- train_sf[[nutrient]]
+  if (length(vals) < 10 || length(unique(vals)) < 2)
+    stop("Too few usable (non-NA) points for OK: ", nutrient)
+
+  # empirical variogram
+  v_emp <- tryCatch(
+    gstat::variogram(stats::as.formula(paste(nutrient, "~ 1")), train_sf),
+    error = function(e) stop("Variogram failed for OK ", nutrient, ": ", e$message)
   )
 
-  xy <- terra::crds(template_raster, df = TRUE)
-  grd_sf <- st_as_sf(xy, coords = c("x","y"), crs = st_crs(train_sf))
+  if (nrow(v_emp) < 3) stop("Variogram has too few bins for OK: ", nutrient)
 
-  ok <- krige(as.formula(paste(nutrient, "~ 1")), train_sf, grd_sf, model = v_fit)
+  init_range <- max(v_emp$dist, na.rm = TRUE) / 3
+  init_psill <- stats::var(vals, na.rm = TRUE)
+
+  v_fit <- tryCatch(
+    gstat::fit.variogram(
+      v_emp,
+      gstat::vgm(psill = init_psill, model = "Exp",
+                 nugget = 0.1 * init_psill, range = init_range)
+    ),
+    error = function(e) gstat::vgm(psill = init_psill, model = "Nug", nugget = 0.1 * init_psill)
+  )
+
+  # grid WITH cell index (prevents ordering artifacts)
+  grid_df <- terra::as.data.frame(template_raster, cells = TRUE, xy = TRUE, na.rm = FALSE) %>%
+    dplyr::select(cell, x, y)
+
+  grd_sf <- sf::st_as_sf(
+    grid_df, coords = c("x","y"),
+    crs = terra::crs(template_raster, proj = TRUE),
+    remove = FALSE
+  )
+
+  ok <- tryCatch(
+    gstat::krige(stats::as.formula(paste(nutrient, "~ 1")), train_sf, grd_sf, model = v_fit),
+    error = function(e) stop("Kriging failed for OK ", nutrient, ": ", e$message)
+  )
 
   out <- template_raster
-  values(out) <- ok$var1.pred
+  vals_out <- rep(NA_real_, terra::ncell(out))
+  vals_out[grid_df$cell] <- ok$var1.pred
+  terra::values(out) <- vals_out
+
   out
 }
 
-# RK final map: RF trend + OK residuals
+
+# RK final map (RF trend + kriged residuals; CRS-safe + cell-index assignment)
 predict_RK_final <- function(soil_sf, covariate_stack, covariates, nutrient, ntree = 500) {
-  # Fit RF trend on points
-  df <- st_drop_geometry(soil_sf) %>%
-    select(all_of(c(covariates, nutrient))) %>%
-    na.omit()
+
+  soil_sf_r <- align_sf_to_raster(soil_sf, covariate_stack[[1]])
+
+  df0 <- sf::st_drop_geometry(soil_sf_r) %>%
+    dplyr::select(dplyr::all_of(c(covariates, nutrient))) %>%
+    dplyr::mutate(.row_id = dplyr::row_number())
+
+  keep_train <- stats::complete.cases(df0[, c(covariates, nutrient)])
+  df <- df0[keep_train, , drop = FALSE]
+
   if (nrow(df) < 10) stop("Too few training rows for RK: ", nutrient)
 
-  rf_mod <- randomForest(
+  rf_mod <- randomForest::randomForest(
     x = df[, covariates, drop = FALSE],
     y = df[[nutrient]],
     ntree = ntree
   )
 
-  trend_pts <- predict(rf_mod, newdata = df[, covariates, drop = FALSE])
+  trend_pts <- as.numeric(predict(rf_mod, newdata = df[, covariates, drop = FALSE]))
   resid <- df[[nutrient]] - trend_pts
 
-  # attach residuals to a matching sf (subset soil_sf rows to df rownames)
-  soil_sf2 <- soil_sf[rownames(df), ]
-  train_res_sf <- soil_sf2 %>% mutate(resid = resid)
+  soil_sf2 <- soil_sf_r[df$.row_id, ]
+  train_res_sf <- soil_sf2 %>% dplyr::mutate(resid = resid)
 
-  # variogram for residuals
-  v_emp <- variogram(resid ~ 1, train_res_sf)
+  v_emp <- tryCatch(gstat::variogram(resid ~ 1, train_res_sf), error = function(e) NULL)
+  if (is.null(v_emp) || nrow(v_emp) < 3) {
+    message("RK residual variogram failed for ", nutrient, " -> returning RF trend only")
+    return(predict_RF_final(soil_sf_r, covariate_stack, covariates, nutrient, ntree = ntree))
+  }
+
+  init_range <- max(v_emp$dist, na.rm = TRUE) / 3
+  init_psill <- stats::var(resid, na.rm = TRUE)
+
   v_fit <- tryCatch(
-    fit.variogram(v_emp, vgm(
-      psill  = var(resid, na.rm = TRUE),
-      model  = "Exp",
-      nugget = 0.1,
-      range  = max(v_emp$dist, na.rm = TRUE)/3
-    )),
-    error = function(e) vgm(psill = var(resid, na.rm = TRUE), model = "Nug", nugget = 0.1)
+    gstat::fit.variogram(
+      v_emp,
+      gstat::vgm(psill = init_psill, model = "Exp",
+                 nugget = 0.1 * init_psill, range = init_range)
+    ),
+    error = function(e) gstat::vgm(psill = init_psill, model = "Nug", nugget = 0.1 * init_psill)
   )
 
-  # trend raster (safe predict)
+  # RF trend raster (safe predict)
   pred_df <- terra::as.data.frame(covariate_stack[[covariates]], cells = TRUE, na.rm = FALSE)
   X <- pred_df[, covariates, drop = FALSE]
-  keep <- complete.cases(X)
+  keep <- stats::complete.cases(X)
 
   trend_pred <- rep(NA_real_, nrow(pred_df))
   trend_pred[keep] <- as.numeric(predict(rf_mod, newdata = as.data.frame(X[keep, , drop = FALSE])))
 
   trend_r <- covariate_stack[[1]]
-  vals <- rep(NA_real_, terra::ncell(trend_r))
-  vals[pred_df$cell] <- trend_pred
-  values(trend_r) <- vals
+  vals_tr <- rep(NA_real_, terra::ncell(trend_r))
+  vals_tr[pred_df$cell] <- trend_pred
+  terra::values(trend_r) <- vals_tr
 
-  # residual kriging to raster grid
-  xy <- terra::crds(trend_r, df = TRUE)
-  grd_sf <- st_as_sf(xy, coords = c("x","y"), crs = st_crs(train_res_sf))
-  kr_res <- krige(resid ~ 1, train_res_sf, grd_sf, model = v_fit)
+  # residual kriging to raster grid (cell-index assignment)
+  grid_df <- terra::as.data.frame(trend_r, cells = TRUE, xy = TRUE, na.rm = FALSE) %>%
+    dplyr::select(cell, x, y)
+
+  grd_sf <- sf::st_as_sf(grid_df, coords = c("x","y"),
+                         crs = terra::crs(trend_r, proj = TRUE),
+                         remove = FALSE)
+
+  kr_res <- gstat::krige(resid ~ 1, train_res_sf, grd_sf, model = v_fit)
 
   res_r <- trend_r
-  values(res_r) <- kr_res$var1.pred
+  vals_res <- rep(NA_real_, terra::ncell(res_r))
+  vals_res[grid_df$cell] <- kr_res$var1.pred
+  terra::values(res_r) <- vals_res
 
   trend_r + res_r
 }
 
 # -----------------------------
-# 3) Run: for each dataset + nutrient, pick the best method(s) and map them
+# 4) Write FINAL maps (train on all points) for ALL methods
 # -----------------------------
 out_dir <- "best_boot_maps"
 dir.create(out_dir, showWarnings = FALSE)
-
-template_r <- covariate_stack[[1]]
 
 for (ds in c("SP","C")) {
 
@@ -1320,21 +1384,14 @@ for (ds in c("SP","C")) {
 
   for (nut in soil_vars_to_map) {
 
-    # best boot rows (one per method)
-    bb <- best_boot_tbl %>% filter(dataset == ds, nutrient == nut)
-
-    if (nrow(bb) == 0) next
-
-    # Option: map ALL three methods; or only the top one.
-    # Here: map all methods that exist in bb
-    for (meth in bb$method) {
+    for (meth in c("RF","OK","RK")) {
 
       cat("Mapping:", ds, nut, meth, "\n")
 
       r <- tryCatch({
-        if (meth == "RF") predict_RF_final(soil_sf_use, covariate_stack, covariates, nut)
-        else if (meth == "RK") predict_RK_final(soil_sf_use, covariate_stack, covariates, nut)
-        else predict_OK_final(soil_sf_use, template_r, nut)
+        if (meth == "RF")      predict_RF_final(soil_sf_use, covariate_stack, covariates, nut)
+        else if (meth == "OK") predict_OK_final(soil_sf_use, template_r, nut)
+        else                   predict_RK_final(soil_sf_use, covariate_stack, covariates, nut)
       }, error = function(e) {
         message("FAILED: ", ds, " ", nut, " ", meth, " -> ", e$message)
         NULL
@@ -1349,29 +1406,885 @@ for (ds in c("SP","C")) {
 }
 
 cat("Done. Outputs in:", out_dir, "\n")
+
 ```
+
+```{r}
+
+
+# helper: make soil_sf match raster CRS
+align_sf_to_raster <- function(soil_sf, r){
+  crs_r <- terra::crs(r, proj = TRUE)
+  if (is.na(crs_r) || crs_r == "") stop("Raster has no CRS.")
+  sf::st_transform(soil_sf, crs_r)
+}
+
+# OK final map (CRS-safe + variogram fallback)
+predict_OK_final <- function(soil_sf, template_raster, nutrient) {
+
+  # align points to raster CRS
+  train_sf <- sf::st_transform(soil_sf, terra::crs(template_raster, proj = TRUE))
+
+  vals <- train_sf[[nutrient]]
+  if (sum(!is.na(vals)) < 10 || length(unique(na.omit(vals))) < 2)
+    stop("Too few points for OK: ", nutrient)
+
+  # empirical variogram + fit
+  v_emp <- gstat::variogram(stats::as.formula(paste(nutrient, "~ 1")), train_sf)
+
+  init_range <- max(v_emp$dist, na.rm = TRUE) / 3
+  init_psill <- stats::var(vals, na.rm = TRUE)
+
+  v_fit <- tryCatch(
+    gstat::fit.variogram(
+      v_emp,
+      gstat::vgm(psill = init_psill, model = "Exp",
+                 nugget = 0.1 * init_psill, range = init_range)
+    ),
+    error = function(e) gstat::vgm(psill = init_psill, model = "Nug", nugget = 0.1 * init_psill)
+  )
+
+  # build raster grid WITH cell index (this prevents re-ordering artifacts)
+  grid_df <- terra::as.data.frame(template_raster, cells = TRUE, xy = TRUE, na.rm = FALSE) |>
+    dplyr::select(cell, x, y)
+
+  grd_sf <- sf::st_as_sf(grid_df, coords = c("x","y"),
+                         crs = terra::crs(template_raster, proj = TRUE), remove = FALSE)
+
+  ok <- gstat::krige(stats::as.formula(paste(nutrient, "~ 1")),
+                     train_sf, grd_sf, model = v_fit)
+
+  # assign by cell index (robust)
+  out <- template_raster
+  vals_out <- rep(NA_real_, terra::ncell(out))
+  vals_out[grid_df$cell] <- ok$var1.pred
+  terra::values(out) <- vals_out
+
+  out
+}
+
+# RK final map (CRS-safe + robust row alignment)
+predict_RK_final <- function(soil_sf, covariate_stack, covariates, nutrient, ntree = 500) {
+
+  # 1) align soil_sf to raster CRS (critical)
+  soil_sf_r <- align_sf_to_raster(soil_sf, covariate_stack[[1]])
+
+  # 2) training df (keep row ids for alignment)
+  df0 <- sf::st_drop_geometry(soil_sf_r) %>%
+    dplyr::select(dplyr::all_of(c(covariates, nutrient))) %>%
+    dplyr::mutate(.row_id = dplyr::row_number())
+
+  keep_train <- stats::complete.cases(df0[, c(covariates, nutrient)])
+  df <- df0[keep_train, , drop = FALSE]
+
+  if (nrow(df) < 10) stop("Too few training rows for RK: ", nutrient)
+
+  # 3) RF trend on points
+  rf_mod <- randomForest::randomForest(
+    x = df[, covariates, drop = FALSE],
+    y = df[[nutrient]],
+    ntree = ntree
+  )
+
+  trend_pts <- as.numeric(predict(rf_mod, newdata = df[, covariates, drop = FALSE]))
+  resid <- df[[nutrient]] - trend_pts
+
+  # 4) attach residuals back to matching sf rows (via .row_id)
+  soil_sf2 <- soil_sf_r[df$.row_id, ]
+  train_res_sf <- soil_sf2 %>% dplyr::mutate(resid = resid)
+
+  # 5) variogram on residuals + fit
+  v_emp <- tryCatch(gstat::variogram(resid ~ 1, train_res_sf), error = function(e) NULL)
+  if (is.null(v_emp) || nrow(v_emp) < 3) {
+    # if variogram fails, just return RF trend map
+    message("RK residual variogram failed for ", nutrient, " -> returning RF trend only")
+    return(predict_RF_final(soil_sf_r, covariate_stack, covariates, nutrient, ntree = ntree))
+  }
+
+  init_range <- max(v_emp$dist, na.rm = TRUE) / 3
+  init_psill <- stats::var(resid, na.rm = TRUE)
+
+  v_fit <- tryCatch(
+    gstat::fit.variogram(
+      v_emp,
+      gstat::vgm(psill = init_psill, model = "Exp", nugget = 0.1 * init_psill, range = init_range)
+    ),
+    error = function(e) gstat::vgm(psill = init_psill, model = "Nug", nugget = 0.1 * init_psill)
+  )
+
+  # 6) RF trend raster (your safe predict logic)
+  pred_df <- terra::as.data.frame(covariate_stack[[covariates]], cells = TRUE, na.rm = FALSE)
+  X <- pred_df[, covariates, drop = FALSE]
+  keep <- stats::complete.cases(X)
+
+  trend_pred <- rep(NA_real_, nrow(pred_df))
+  trend_pred[keep] <- as.numeric(predict(rf_mod, newdata = as.data.frame(X[keep, , drop = FALSE])))
+
+  trend_r <- covariate_stack[[1]]
+  vals <- rep(NA_real_, terra::ncell(trend_r))
+  vals[pred_df$cell] <- trend_pred
+  terra::values(trend_r) <- vals
+
+  # 7) krige residuals to raster grid (grid CRS = raster CRS)
+  grid_df <- terra::as.data.frame(trend_r, cells = TRUE, xy = TRUE, na.rm = FALSE) |>
+  dplyr::select(cell, x, y)
+
+    grd_sf <- sf::st_as_sf(grid_df, coords = c("x","y"),
+                           crs = terra::crs(trend_r, proj = TRUE), remove = FALSE)
+    
+    kr_res <- gstat::krige(resid ~ 1, train_res_sf, grd_sf, model = v_fit)
+    
+    res_r <- trend_r
+    vals_res <- rep(NA_real_, terra::ncell(res_r))
+    vals_res[grid_df$cell] <- kr_res$var1.pred
+    terra::values(res_r) <- vals_res
+    
+    trend_r + res_r
+
+}
+template_r <- covariate_stack[[1]]
+out_dir <- "best_boot_maps"
+dir.create(out_dir, showWarnings = FALSE)
+
+for (ds in c("SP","C")) {
+  soil_sf_use <- if (ds == "SP") soil_sf_SP else soil_sf_C
+
+  for (nut in soil_vars_to_map) {
+
+    # OK
+    cat("Mapping:", ds, nut, "OK\n")
+    r_ok <- tryCatch(predict_OK_final(soil_sf_use, template_r, nut), error = function(e){message(e$message); NULL})
+    if (!is.null(r_ok)) terra::writeRaster(r_ok, file.path(out_dir, sprintf("%s_%s_OK_bestboot.tif", ds, nut)), overwrite=TRUE)
+
+    # RK
+    cat("Mapping:", ds, nut, "RK\n")
+    r_rk <- tryCatch(predict_RK_final(soil_sf_use, covariate_stack, covariates, nut), error = function(e){message(e$message); NULL})
+    if (!is.null(r_rk)) terra::writeRaster(r_rk, file.path(out_dir, sprintf("%s_%s_RK_bestboot.tif", ds, nut)), overwrite=TRUE)
+  }
+}
+
+```
+
 ### Example Leaflet Plot of a Best Boot Map
 
 ```{r}
 #plot
 
-ca_rf <- rast("best_boot_maps/SP_ca_RF_bestboot.tif")
+ca_ok <- rast("best_boot_maps/C_ca_OK_bestboot.tif")
 
 # project to lat/long for leaflet
-ca_rf_proj <- project(ca_rf, "EPSG:4326")
+ca_ok_proj <- project(ca_ok, "EPSG:4326")
 
-pal <- colorNumeric("viridis", values(ca_rf_proj), na.color = "transparent")
+pal <- colorNumeric("viridis", values(ca_ok_proj), na.color = "transparent")
 
 leaflet() %>%
   addTiles() %>%
   addProviderTiles(providers$Esri.WorldImagery, group = "Satellite")  %>%
-  addRasterImage(ca_rf_proj, colors = pal, opacity = 0.8) %>%
-  addLegend(pal = pal, values = values(ca_rf_proj), title = "Ca (ppm)", opacity = 1)
+  addRasterImage(ca_ok_proj, colors = pal, opacity = 0.8) %>%
+  addLegend(pal = pal, values = values(ca_ok_proj), title = "Ca (ppm)", opacity = 1)
   #basemap: satellite bottom layer
 
 ```
+### Map Panels of Best Boot Maps
 
 
+```{r}
+
+in_dir  <- "best_boot_maps"
+out_dir <- "map_panels"
+dir.create(out_dir, showWarnings = FALSE)
+
+methods   <- c("RF","OK","RK")
+datasets  <- c("SP","C")
+nutrients <- c("ca","k","mg","mn","p","zn","c","n","p_h_2")   # 9 nutrients
+
+nut_labels <- c(ca="Ca", k="K", mg="Mg", mn="Mn", p="P", zn="Zn", c="Carbon", n="Nitrogen", p_h_2="pH")
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# locate file robustly (exact filename expected)
+get_path <- function(ds, nut, meth){
+  f <- file.path(in_dir, sprintf("%s_%s_%s_bestboot.tif", ds, nut, meth))
+  if (file.exists(f)) return(f)
+  return(NA_character_)
+}
+
+make_map_one <- function(r, title){
+  df <- as.data.frame(r, xy = TRUE, na.rm = FALSE)
+  names(df) <- c("x","y","pred")
+
+  ggplot(df, aes(x, y, fill = pred)) +
+    geom_raster() +
+    coord_equal() +
+    labs(title = title, x = NULL, y = NULL, fill = NULL) +
+    scale_fill_viridis_c(na.value = "transparent") +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(face="bold", hjust=0.5, size=11),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "bottom",
+      legend.key.width  = unit(2.0, "cm"),
+      legend.key.height = unit(0.25, "cm"),
+      legend.text  = element_text(size = 8),
+      plot.margin = ggplot2::margin(2, 2, 2, 2, unit = "pt")
+    )
+}
+
+# Build one patchwork for a single (method, dataset)
+make_panel <- function(meth, ds, ncol = 3){
+
+  paths <- tibble(nutrient = nutrients) %>%
+    mutate(path = map_chr(nutrient, ~get_path(ds, .x, meth))) %>%
+    mutate(exists = !is.na(path))
+
+  cat("\n---", meth, ds, "---\n")
+  print(paths)
+
+  plots <- list()
+
+  for (i in seq_len(nrow(paths))) {
+    nut <- paths$nutrient[i]
+    f   <- paths$path[i]
+    if (is.na(f)) next
+
+    r <- tryCatch(rast(f), error = function(e) NULL)
+    if (is.null(r)) next
+
+    lab <- nut_labels[[nut]] %||% nut
+    plots[[length(plots) + 1]] <- make_map_one(r, lab)
+  }
+
+  if (length(plots) == 0) return(NULL)
+
+  wrap_plots(plots, ncol = ncol) +
+    plot_annotation(
+      title = paste0(meth, " — ", ds, " (Best-boot maps)")
+    ) &
+    theme(plot.title = element_text(face="bold", hjust=0.5, size=16))
+}
+
+# Make 6 patchwork plots
+pw_RF_SP <- make_panel("RF", "SP")
+pw_RF_C  <- make_panel("RF", "C")
+pw_OK_SP <- make_panel("OK", "SP")
+pw_OK_C  <- make_panel("OK", "C")
+pw_RK_SP <- make_panel("RK", "SP")  # likely NULL until RK rasters exist
+pw_RK_C  <- make_panel("RK", "C")
+
+pw_RF_SP; pw_RF_C
+pw_OK_SP; pw_OK_C
+pw_RK_SP; pw_RK_C
+
+# Save big enough so plots aren't tiny
+save_pw <- function(pw, name){
+  if (is.null(pw)) return(invisible(NULL))
+  ggsave(file.path(out_dir, name),
+         pw,
+         width = 12,
+         height = 8.5,   # good for 3x3 grid
+         dpi = 300)
+}
+
+# save_pw(pw_RF_SP, "RF_SP.png")
+# save_pw(pw_RF_C,  "RF_C.png")
+# save_pw(pw_OK_SP, "OK_SP.png")
+# save_pw(pw_OK_C,  "OK_C.png")
+# save_pw(pw_RK_SP, "RK_SP.png")
+# save_pw(pw_RK_C,  "RK_C.png")
+
+
+
+```
+
+### Variogram Diagnostics and VIP Analysis
+
+```{r}
+
+# -----------------------------
+# Settings
+# -----------------------------
+soil_vars_to_use <- c("ca","k","mg","mn","p","zn","c","n","p_h_2")  # edit if needed
+top_k_vip <- 6
+
+template_r <- covariate_stack[[1]]
+out_dir_vario <- "variogram_diagnostics"
+out_dir_vip   <- "vip_outputs"
+out_dir_vipmaps <- file.path(out_dir_vip, "vip_maps")
+dir.create(out_dir_vario, showWarnings = FALSE, recursive = TRUE)
+dir.create(out_dir_vip, showWarnings = FALSE, recursive = TRUE)
+dir.create(out_dir_vipmaps, showWarnings = FALSE, recursive = TRUE)
+
+# Covariates (from raster stack names, robust)
+soil_vars_all <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn","c","n")
+covariates <- setdiff(names(covariate_stack), soil_vars_all)
+
+stopifnot(all(covariates %in% names(st_drop_geometry(soil_sf_SP))))
+stopifnot(all(covariates %in% names(st_drop_geometry(soil_sf_C))))
+
+# -----------------------------
+# Helpers
+# -----------------------------
+align_sf_to_raster <- function(soil_sf, r){
+  crs_r <- terra::crs(r, proj = TRUE)
+  if (is.na(crs_r) || crs_r == "") stop("Raster has no CRS.")
+  sf::st_transform(soil_sf, crs_r)
+}
+
+fit_variogram_safe <- function(v_emp, vals){
+  # reasonable starts + fallback
+  init_range <- max(v_emp$dist, na.rm = TRUE)/3
+  init_psill <- stats::var(vals, na.rm = TRUE)
+  v_fit <- tryCatch(
+    gstat::fit.variogram(
+      v_emp,
+      gstat::vgm(psill = init_psill, model = "Exp",
+                 nugget = 0.1 * init_psill, range = init_range)
+    ),
+    error = function(e) gstat::vgm(psill = init_psill, model = "Nug", nugget = 0.1 * init_psill)
+  )
+  v_fit
+}
+
+save_variogram_plot <- function(v_emp, v_fit, title, out_png){
+  # model line
+  vline <- tryCatch({
+    vl <- gstat::variogramLine(v_fit, maxdist = max(v_emp$dist, na.rm = TRUE), n = 200)
+    as_tibble(vl)
+  }, error = function(e) NULL)
+
+  p <- ggplot(as_tibble(v_emp), aes(x = dist, y = gamma)) +
+    geom_point(size = 2, alpha = 0.85) +
+    labs(title = title, x = "Distance", y = "Semivariance") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face="bold", hjust = 0.5))
+
+  if (!is.null(vline)) {
+    p <- p + geom_line(data = vline, aes(x = dist, y = gamma), linewidth = 1)
+  }
+
+  ggsave(out_png, p, width = 7.2, height = 5.0, dpi = 300)
+  invisible(p)
+}
+
+get_vgm_params <- function(v_fit){
+  # v_fit is a data.frame-like variogram model
+  # handle cases where rownames are model types
+  tibble(
+    model  = paste(v_fit$model, collapse = "+"),
+    nugget = sum(v_fit$psill[v_fit$model == "Nug"], na.rm = TRUE),
+    sill   = sum(v_fit$psill, na.rm = TRUE),
+    range  = suppressWarnings(max(v_fit$range, na.rm = TRUE))
+  )
+}
+
+# -----------------------------
+# 1) Variogram diagnostics: OK (nutrient ~ 1)
+# -----------------------------
+ok_param_rows <- list()
+
+for (ds in c("SP","C")) {
+
+  soil_sf_use <- if (ds == "SP") soil_sf_SP else soil_sf_C
+  soil_sf_use <- align_sf_to_raster(soil_sf_use, template_r)
+
+  for (nut in soil_vars_to_use) {
+
+    # drop NA response rows (critical for gstat)
+    train_sf <- soil_sf_use %>% filter(!is.na(.data[[nut]]))
+    vals <- train_sf[[nut]]
+
+    # skip if not enough data
+    if (length(vals) < 10 || length(unique(vals)) < 2) {
+      message("[OK VARIO] skipping ", ds, " ", nut, " (too few non-NA/unique)")
+      next
+    }
+
+    v_emp <- tryCatch(
+      gstat::variogram(stats::as.formula(paste(nut, "~ 1")), train_sf),
+      error = function(e) NULL
+    )
+    if (is.null(v_emp) || nrow(v_emp) < 3) {
+      message("[OK VARIO] skipping ", ds, " ", nut, " (variogram failed)")
+      next
+    }
+
+    v_fit <- fit_variogram_safe(v_emp, vals)
+
+    out_png <- file.path(out_dir_vario, sprintf("OK_%s_%s_variogram.png", ds, nut))
+    save_variogram_plot(v_emp, v_fit,
+                        title = paste0("OK variogram — ", ds, " — ", nut),
+                        out_png = out_png)
+
+    params <- get_vgm_params(v_fit) %>%
+      mutate(dataset = ds, method = "OK", nutrient = nut)
+
+    ok_param_rows[[length(ok_param_rows) + 1]] <- params
+
+    # also save empirical variogram table
+    write.csv(v_emp, file.path(out_dir_vario, sprintf("OK_%s_%s_empirical.csv", ds, nut)), row.names = FALSE)
+  }
+}
+
+ok_params_tbl <- bind_rows(ok_param_rows)
+write.csv(ok_params_tbl, file.path(out_dir_vario, "OK_variogram_params.csv"), row.names = FALSE)
+
+# -----------------------------
+# 2) Variogram diagnostics: RK residuals (resid ~ 1)
+# -----------------------------
+rk_param_rows <- list()
+
+for (ds in c("SP","C")) {
+
+  soil_sf_use <- if (ds == "SP") soil_sf_SP else soil_sf_C
+  soil_sf_use <- align_sf_to_raster(soil_sf_use, template_r)
+
+  for (nut in soil_vars_to_use) {
+
+    # build training df for RF trend
+    df0 <- st_drop_geometry(soil_sf_use) %>%
+      select(all_of(c(covariates, nut))) %>%
+      mutate(.row_id = row_number())
+
+    keep <- complete.cases(df0[, c(covariates, nut)])
+    df <- df0[keep, , drop = FALSE]
+
+    if (nrow(df) < 15) {
+      message("[RK VARIO] skipping ", ds, " ", nut, " (too few complete rows)")
+      next
+    }
+
+    # fit RF trend (importance not needed here)
+    rf_mod <- tryCatch(
+      randomForest::randomForest(
+        x = df[, covariates, drop = FALSE],
+        y = df[[nut]],
+        ntree = 500
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(rf_mod)) {
+      message("[RK VARIO] skipping ", ds, " ", nut, " (RF failed)")
+      next
+    }
+
+    trend <- as.numeric(predict(rf_mod, newdata = df[, covariates, drop = FALSE]))
+    resid <- df[[nut]] - trend
+
+    # attach residuals to matching sf rows
+    train_res_sf <- soil_sf_use[df$.row_id, ] %>% mutate(resid = resid)
+
+    v_emp <- tryCatch(gstat::variogram(resid ~ 1, train_res_sf), error = function(e) NULL)
+    if (is.null(v_emp) || nrow(v_emp) < 3) {
+      message("[RK VARIO] skipping ", ds, " ", nut, " (resid variogram failed)")
+      next
+    }
+
+    v_fit <- fit_variogram_safe(v_emp, resid)
+
+    out_png <- file.path(out_dir_vario, sprintf("RKresid_%s_%s_variogram.png", ds, nut))
+    save_variogram_plot(v_emp, v_fit,
+                        title = paste0("RK residual variogram — ", ds, " — ", nut),
+                        out_png = out_png)
+
+    params <- get_vgm_params(v_fit) %>%
+      mutate(dataset = ds, method = "RK_residual", nutrient = nut)
+
+    rk_param_rows[[length(rk_param_rows) + 1]] <- params
+
+    write.csv(v_emp, file.path(out_dir_vario, sprintf("RKresid_%s_%s_empirical.csv", ds, nut)), row.names = FALSE)
+  }
+}
+
+rk_params_tbl <- bind_rows(rk_param_rows)
+write.csv(rk_params_tbl, file.path(out_dir_vario, "RK_residual_variogram_params.csv"), row.names = FALSE)
+
+# -----------------------------
+# 3) VIP (RF importance) for SP and C, per nutrient
+# -----------------------------
+get_rf_vip <- function(soil_sf, covariates, nut, ntree = 500){
+  df <- st_drop_geometry(soil_sf) %>%
+    select(all_of(c(covariates, nut))) %>%
+    na.omit()
+  if (nrow(df) < 15) return(NULL)
+
+  rf <- randomForest::randomForest(
+    x = df[, covariates, drop = FALSE],
+    y = df[[nut]],
+    ntree = ntree,
+    importance = TRUE
+  )
+
+  imp <- randomForest::importance(rf)
+
+  # regression: importance is matrix; keep whatever exists
+  imp_tbl <- as.data.frame(imp) %>%
+    tibble::rownames_to_column("covariate") %>%
+    as_tibble()
+
+  # pick a primary importance column
+  # commonly: "%IncMSE" or "IncNodePurity"
+  primary <- intersect(c("%IncMSE", "IncNodePurity"), names(imp_tbl))
+  if (length(primary) == 0) {
+    # fallback: first numeric column
+    primary <- names(imp_tbl)[sapply(imp_tbl, is.numeric)][1]
+  } else {
+    primary <- primary[1]
+  }
+
+  imp_tbl %>%
+    mutate(primary_metric = primary, importance_value = .data[[primary]]) %>%
+    arrange(desc(importance_value))
+}
+
+vip_rows <- list()
+
+for (ds in c("SP","C")) {
+  soil_sf_use <- if (ds == "SP") soil_sf_SP else soil_sf_C
+
+  for (nut in soil_vars_to_use) {
+    vip_tbl <- get_rf_vip(soil_sf_use, covariates, nut)
+    if (is.null(vip_tbl)) next
+
+    vip_rows[[length(vip_rows) + 1]] <- vip_tbl %>%
+      mutate(dataset = ds, nutrient = nut)
+  }
+}
+
+vip_all <- bind_rows(vip_rows)
+write.csv(vip_all, file.path(out_dir_vip, "vip_all.csv"), row.names = FALSE)
+
+vip_top <- vip_all %>%
+  group_by(dataset, nutrient) %>%
+  slice_max(order_by = importance_value, n = top_k_vip, with_ties = FALSE) %>%
+  ungroup()
+
+write.csv(vip_top, file.path(out_dir_vip, sprintf("vip_top%d.csv", top_k_vip)), row.names = FALSE)
+
+# -----------------------------
+# 4) Plot VIP covariate maps (patchwork) — SP and C separately
+#    For each nutrient, map its top_k covariates from vip_top
+# -----------------------------
+make_cov_map <- function(r, title){
+  df <- as.data.frame(r, xy = TRUE, na.rm = FALSE)
+  names(df) <- c("x","y","val")
+
+  ggplot(df, aes(x, y, fill = val)) +
+    geom_raster() +
+    coord_equal() +
+    labs(title = title, x = NULL, y = NULL, fill = NULL) +
+    scale_fill_viridis_c(na.value = "transparent") +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(face="bold", hjust=0.5, size=11),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "bottom",
+      legend.key.width  = unit(2.0, "cm"),
+      legend.key.height = unit(0.25, "cm"),
+      legend.text  = element_text(size = 8),
+      plot.margin = ggplot2::margin(2, 2, 2, 2, unit = "pt")
+    )
+}
+
+plot_vip_maps_one <- function(dataset_label, nutrient, vip_top_tbl, covariate_stack, top_k = 6, ncol = 3){
+  sel <- vip_top_tbl %>%
+    filter(dataset == dataset_label, nutrient == nutrient) %>%
+    slice_head(n = top_k)
+
+  if (nrow(sel) == 0) return(NULL)
+
+  plots <- list()
+  for (cv in sel$covariate) {
+    if (!cv %in% names(covariate_stack)) next
+    r <- covariate_stack[[cv]]
+    plots[[length(plots) + 1]] <- make_cov_map(r, cv)
+  }
+
+  if (length(plots) == 0) return(NULL)
+
+  wrap_plots(plots, ncol = ncol) +
+    plot_annotation(title = paste0("Top ", top_k, " RF predictors — ", dataset_label, " — ", nutrient)) &
+    theme(plot.title = element_text(face="bold", hjust=0.5, size=16))
+}
+
+# build and save VIP map panels (per dataset + nutrient)
+for (ds in c("SP","C")) {
+  for (nut in soil_vars_to_use) {
+
+    pw <- plot_vip_maps_one(ds, nut, vip_top, covariate_stack, top_k = top_k_vip, ncol = 3)
+    if (is.null(pw)) next
+
+    out_png <- file.path(out_dir_vipmaps, sprintf("VIPmaps_%s_%s_top%d.png", ds, nut, top_k_vip))
+    ggsave(out_png, pw, width = 12, height = 8.5, dpi = 300)
+  }
+}
+
+cat("\nDone.\n",
+    "Variograms saved in: ", out_dir_vario, "\n",
+    "VIP tables saved in: ", out_dir_vip, "\n",
+    "VIP map panels saved in: ", out_dir_vipmaps, "\n")
+```
+
+### VIP Analysis for RF and RK Models with SR Indices
+
+```{r}
+#VIPS for RF and RK models with SR indices:
+#cov stack:
+covariate_stack_idx <- terra::rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m_all_with_SR_indices.tif")
+
+
+# stack with indices + covariates you want to use
+stack_use <- covariate_stack_idx
+
+# soil variables you want to predict (keep these from the point table)
+soil_vars_all <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn","c","n")
+
+extract_covs_to_points_nodupes <- function(soil_sf, rstack, soil_vars_all){
+
+  # 1) align CRS to raster
+  soil_sf_r <- st_transform(soil_sf, terra::crs(rstack, proj = TRUE))
+
+  # 2) keep ONLY soil vars that exist + geometry (prevents duplicates later)
+  keep_soils <- intersect(soil_vars_all, names(soil_sf_r))
+  soil_sf_min <- soil_sf_r %>% dplyr::select(all_of(keep_soils), geometry)
+
+  # 3) extract all raster layers to points
+  ex <- terra::extract(rstack, terra::vect(soil_sf_min))
+
+  # 4) bind extracted values back by row order (ID is 1..n in order)
+  #    ex includes ID + raster columns
+  ex <- ex %>% dplyr::select(-ID)
+
+  out <- dplyr::bind_cols(soil_sf_min, ex)
+
+  # 5) sanity check: extracted covariates should match raster names exactly
+  stopifnot(all(names(rstack) %in% names(out)))
+
+  out
+}
+
+soil_sf_SP2 <- extract_covs_to_points_nodupes(soil_sf_SP, stack_use, soil_vars_all)
+soil_sf_C2  <- extract_covs_to_points_nodupes(soil_sf_C,  stack_use, soil_vars_all)
+
+# covariates are exactly raster names minus soil variables (if any overlap)
+covariates <- setdiff(names(stack_use), soil_vars_all)
+
+# sanity checks (these should PASS now)
+stopifnot(all(covariates %in% names(st_drop_geometry(soil_sf_SP2))))
+stopifnot(all(covariates %in% names(st_drop_geometry(soil_sf_C2))))
+
+cat("✅ Extraction complete with NO duplicate .x/.y columns\n")
+cat("Covariates used:", length(covariates), "\n")
+cat("First covariates:", paste(head(covariates, 12), collapse = ", "), "\n")
+
+# -----------------------------
+# 1) Fit RF + extract VIP (bar-graph-ready)
+# -----------------------------
+get_vip_one <- function(soil_sf, covariates, nutrient, ntree = 500, seed = 1){
+
+  set.seed(seed)
+
+  df <- st_drop_geometry(soil_sf) %>%
+    select(all_of(c(covariates, nutrient))) %>%
+    na.omit()
+
+  if (nrow(df) < 15) return(NULL)
+
+  rf <- randomForest::randomForest(
+    x = df[, covariates, drop = FALSE],
+    y = df[[nutrient]],
+    ntree = ntree,
+    importance = TRUE
+  )
+
+  imp <- randomForest::importance(rf) %>% as.data.frame()
+  imp <- tibble::rownames_to_column(imp, "covariate")
+
+  # pick a primary importance column (prefer %IncMSE)
+  primary <- intersect(c("%IncMSE", "IncNodePurity"), names(imp))
+  primary <- if (length(primary) == 0) names(imp)[sapply(imp, is.numeric)][1] else primary[1]
+
+  imp %>%
+    transmute(
+      covariate,
+      importance_metric = primary,
+      importance_value = .data[[primary]]
+    ) %>%
+    arrange(desc(importance_value))
+}
+
+# -----------------------------
+# 2) Build VIP table for SP/C and RF/RK
+#    (RK uses RF trend VIP; we label it "RK" so you can plot alongside RF.)
+# -----------------------------
+vip_rows <- list()
+
+for (ds in c("SP","C")) {
+
+  soil_sf_use <- if (ds == "SP") soil_sf_SP2 else soil_sf_C2
+
+  for (nut in soil_vars_to_map) {
+
+    vip_rf <- get_vip_one(soil_sf_use, covariates, nut, ntree = 500, seed = 1)
+
+    if (!is.null(vip_rf)) {
+
+      vip_rf <- vip_rf %>%
+        mutate(dataset = ds, method = "RF", nutrient = nut)
+
+      # RK “VIP” = same RF-trend VIP (because RK trend is RF)
+      vip_rk <- vip_rf %>%
+        mutate(method = "RK")
+
+      vip_rows[[length(vip_rows) + 1]] <- vip_rf
+      vip_rows[[length(vip_rows) + 1]] <- vip_rk
+    }
+  }
+}
+
+vip_all <- bind_rows(vip_rows) %>%
+  group_by(dataset, method, nutrient) %>%
+  mutate(rank = row_number()) %>%
+  ungroup()
+
+# Save bar-graph data
+dir.create("vip_outputs", showWarnings = FALSE)
+write.csv(vip_all, "vip_outputs/vip_all_RF_RK_SP_C.csv", row.names = FALSE)
+
+# -----------------------------
+# 3) Quick bar plot (top K predictors per nutrient)
+# -----------------------------
+top_k <- 10
+
+vip_plot_dat <- vip_all %>%
+  filter(rank <= top_k) %>%
+  mutate(covariate = reorder_within(covariate, importance_value, interaction(dataset, method, nutrient)))
+
+# helper for reorder_within
+reorder_within <- function(x, by, within, fun = mean, sep = "___", ...) {
+  new_x <- paste(x, within, sep = sep)
+  stats::reorder(new_x, by, FUN = fun)
+}
+scale_x_reordered <- function(..., sep = "___") {
+  ggplot2::scale_x_discrete(labels = function(x) sub(paste0(sep, ".*$"), "", x), ...)
+}
+
+p_vip <- ggplot(vip_plot_dat, aes(x = covariate, y = importance_value)) +
+  geom_col() +
+  coord_flip() +
+  facet_grid(nutrient ~ dataset + method, scales = "free_y") +
+  scale_x_reordered() +
+  theme_minimal(base_size = 8) +
+  labs(
+    title = paste0("Top ", top_k, " VIP predictors (new indices)"),
+    x = NULL,
+    y = "Importance"
+  )
+
+# ggsave("vip_outputs/vip_top_predictors_RF_RK_SP_C.png", p_vip, width = 14, height = 10, dpi = 300)
+
+#p_vip
+
+```
+
+```{r}
+
+top_k <- 5
+method_keep <- "RF"   # change to "RK" for RK plot
+
+soil_vars_to_plot <- c("p_h_2","ca","k","mg","mn","p","zn","c","n")
+
+nut_labs <- c(
+  "p_h_2" = "pH",
+  "ca"    = "Calcium (Ca)",
+  "k"     = "Potassium (K)",
+  "mg"    = "Magnesium (Mg)",
+  "mn"    = "Manganese (Mn)",
+  "p"     = "Phosphorus (P)",
+  "zn"    = "Zinc (Zn)",
+  "c"     = "Carbon (C)",
+  "n"     = "Nitrogen (N)"
+)
+
+# 1) Top K per nutrient PER dataset (SP and C separately)
+top_each_ds <- vip_all %>%
+  filter(method == method_keep,
+         dataset %in% c("SP","C"),
+         nutrient %in% soil_vars_to_plot) %>%
+  group_by(nutrient, dataset) %>%
+  slice_max(order_by = importance_value, n = top_k, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    dataset_lab = factor(dataset, levels = c("SP","C"),
+                         labels = c("Single Point (SP)", "Composite (C)")),
+    nutrient_lab = recode(nutrient, !!!nut_labs)
+  )
+
+# quick proof it’s top 5 per dataset:
+# top_each_ds %>% count(nutrient_lab, dataset_lab)
+
+# 2) Per-nutrient x-limit (shared within nutrient so SP/C comparable)
+xlim_tbl <- top_each_ds %>%
+  group_by(nutrient_lab) %>%
+  summarize(xmax = max(importance_value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(xmax = xmax * 1.08)
+
+make_one_nutrient_plot <- function(df_nut, title_txt, xmax){
+
+  # dataset-specific y-key so each facet can have its own ordering
+  df_nut <- df_nut %>%
+    mutate(cov_plot = paste(dataset_lab, covariate, sep = "___")) %>%
+    group_by(dataset_lab) %>%
+    arrange(importance_value, .by_group = TRUE) %>%  # low->high (so high ends up top after flip-like reading)
+    mutate(cov_plot = factor(cov_plot, levels = unique(cov_plot))) %>%
+    ungroup()
+
+  ggplot(df_nut, aes(x = importance_value, y = cov_plot, fill = dataset_lab)) +
+    geom_col(width = 0.75, alpha = 0.95) +
+    facet_wrap(~ dataset_lab, nrow = 1, scales = "free_y") +
+    scale_x_continuous(limits = c(0, xmax), expand = expansion(mult = c(0, 0))) +
+    # strip the dataset prefix from y labels
+    scale_y_discrete(labels = function(x) sub("^.*___", "", x)) +
+    labs(title = title_txt, x = "VIP", y = NULL) +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title = element_text(face = "bold", size = 11, hjust = 0.5),
+      strip.text = element_text(face = "bold", size = 9),
+      axis.text.y = element_text(size = 8),
+      axis.text.x = element_text(size = 8),
+      legend.position = "none",
+      panel.grid.major.y = element_blank()
+    )
+}
+
+plots <- top_each_ds %>%
+  group_split(nutrient_lab) %>%
+  lapply(function(d){
+    nut <- unique(d$nutrient_lab)
+    xmax <- xlim_tbl$xmax[xlim_tbl$nutrient_lab == nut][1]
+    make_one_nutrient_plot(d, nut, xmax)
+  })
+
+final_patch <- wrap_plots(plots, ncol = 2) +
+  plot_annotation(
+    title = paste0("Top ", top_k, " VIP predictors per nutrient (", method_keep, "): SP vs Composite"),
+    theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 14))
+  )
+
+final_patch
+#save as 300 dpi png, with powerpoint slide size (11 in x 8.5 in)
+ggsave("vip_outputs/vip_top5_RF_SP_vs_C.png", final_patch, width = 16, height = 9, dpi = 300)
+# Negative importance → shuffling improves performance → predictor is actively harmful / noisy / redundant
+
+```
+
+```{r}
+# now onto validation. I have a dataset with validation points.
+
+
+```
 
 
 

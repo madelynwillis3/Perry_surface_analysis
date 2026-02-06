@@ -961,6 +961,9 @@ ggplot(filtered_metrics_RMSE, aes(x=variable, y=value, fill=dataset)) +
 ggsave("../outputs/figures/RMSE_nutrients_by_method_all50.png", width=10, height=5)
 
 ```
+
+### Plots with violin + boxplot + mean point, colored by method, faceted by nutrient
+
 ```{r nicer plots, warning=FALSE}
 
 # Consistent colors for methods
