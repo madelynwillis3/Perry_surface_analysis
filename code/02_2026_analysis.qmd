@@ -20,7 +20,7 @@ library(patchwork)
 library(blockCV)
 library(leaflet)
 library(tidytext)
-
+library(viridis)
 ```
 
 ### Load Data and Prepare Datasets
@@ -2219,15 +2219,15 @@ top_each_ds <- vip_all %>%
   mutate(
     dataset_lab = factor(dataset, levels = c("SP","C"),
                          labels = c("Single Point (SP)", "Composite (C)")),
-    nutrient_lab = recode(nutrient, !!!nut_labs)
+    nutrient = recode(nutrient, !!!nut_labs)
   )
 
 # quick proof it’s top 5 per dataset:
-# top_each_ds %>% count(nutrient_lab, dataset_lab)
+# top_each_ds %>% count(nutrient, dataset_lab)
 
 # 2) Per-nutrient x-limit (shared within nutrient so SP/C comparable)
 xlim_tbl <- top_each_ds %>%
-  group_by(nutrient_lab) %>%
+  group_by(nutrient) %>%
   summarize(xmax = max(importance_value, na.rm = TRUE), .groups = "drop") %>%
   mutate(xmax = xmax * 1.08)
 
@@ -2260,10 +2260,10 @@ make_one_nutrient_plot <- function(df_nut, title_txt, xmax){
 }
 
 plots <- top_each_ds %>%
-  group_split(nutrient_lab) %>%
+  group_split(nutrient) %>%
   lapply(function(d){
-    nut <- unique(d$nutrient_lab)
-    xmax <- xlim_tbl$xmax[xlim_tbl$nutrient_lab == nut][1]
+    nut <- unique(d$nutrient)
+    xmax <- xlim_tbl$xmax[xlim_tbl$nutrient == nut][1]
     make_one_nutrient_plot(d, nut, xmax)
   })
 
@@ -2283,7 +2283,419 @@ ggsave("vip_outputs/vip_top5_RF_SP_vs_C.png", final_patch, width = 16, height = 
 ```{r}
 # now onto validation. I have a dataset with validation points.
 
+map_dir <- "C:/git/Perry_surface_analysis/code/best_boot_maps"
+r <- rast(file.path(map_dir, "SP_c_RF_bestboot.tif"))  # raster is EPSG:26917
 
+validation_data <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/perry_fp_Ap_0_20_with_coords.csv") %>%
+  mutate(
+    x = as.numeric(x),
+    y = as.numeric(y)
+  )
+
+# IMPORTANT: your x/y are Web Mercator meters
+validation_sf_fix <- st_as_sf(validation_data, coords = c("x","y"), crs = 3857, remove = FALSE) %>%
+  st_transform(terra::crs(r, proj = TRUE))  # -> 26917
+
+# confirm coords now look like UTM-ish
+xy <- st_coordinates(validation_sf_fix)
+print(summary(xy[,1]))
+print(summary(xy[,2]))
+
+# check overlap
+val_v_fix <- terra::vect(validation_sf_fix)
+inside <- terra::relate(val_v_fix, r, "intersects")
+cat("Points intersect raster extent:", sum(inside), "of", length(inside), "\n")
+
+map_dir <- "C:/git/Perry_surface_analysis/code/best_boot_maps"
+r <- rast(file.path(map_dir, "SP_c_RF_bestboot.tif"))  # raster is EPSG:26917
+
+validation_data <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/perry_fp_Ap_0_20_with_coords.csv") %>%
+  mutate(
+    x = as.numeric(x),
+    y = as.numeric(y)
+  )
+
+# IMPORTANT: your x/y are Web Mercator meters
+validation_sf_fix <- st_as_sf(validation_data, coords = c("x","y"), crs = 3857, remove = FALSE) %>%
+  st_transform(terra::crs(r, proj = TRUE))  # -> 26917
+
+# confirm coords now look like UTM-ish
+xy <- st_coordinates(validation_sf_fix)
+print(summary(xy[,1]))
+print(summary(xy[,2]))
+
+# check overlap
+val_v_fix <- terra::vect(validation_sf_fix)
+inside <- terra::relate(val_v_fix, r, "intersects")
+cat("Points intersect raster extent:", sum(inside), "of", length(inside), "\n")
+
+
+# -----------------------------
+# SETTINGS
+# -----------------------------
+map_dir <- "C:/git/Perry_surface_analysis/code/best_boot_maps"
+dataset_keep <- "SP"
+soil_vars_to_validate <- c("ca","k","mg","mn","p","zn","c","n","p_h_2")
+methods <- c("RF","OK","RK")
+
+stopifnot(exists("validation_sf_fix"))
+val_v <- terra::vect(validation_sf_fix)
+
+# -----------------------------
+# Index map files
+# -----------------------------
+map_files <- list.files(map_dir, pattern = "\\.tif$", full.names = TRUE)
+
+map_index <- tibble(path = map_files, file = basename(map_files)) %>%
+  mutate(
+    dataset = str_match(file, "^(SP|C)_")[,2],
+    method  = str_match(file, "_(RF|OK|RK)_bestboot\\.tif$")[,2],
+    nutrient = str_match(file, "^(SP|C)_(.*)_(RF|OK|RK)_bestboot\\.tif$")[,3]
+  ) %>%
+  filter(!is.na(dataset), !is.na(method), !is.na(nutrient))
+
+map_index_use <- map_index %>%
+  filter(dataset == dataset_keep, method %in% methods, nutrient %in% soil_vars_to_validate)
+
+# -----------------------------
+# Extract predictions -> long table
+# -----------------------------
+extract_one <- function(nut, meth){
+  if(!nut %in% names(validation_sf_fix)) {
+    return(tibble(observed = numeric(0), predicted = numeric(0)))
+  }
+
+  obs <- as.numeric(validation_sf_fix[[nut]])
+
+  row_match <- map_index_use %>% filter(nutrient == nut, method == meth)
+  if(nrow(row_match) == 0){
+    return(tibble(observed = obs, predicted = rep(NA_real_, length(obs))))
+  }
+
+  r <- terra::rast(row_match$path[1])
+  val_v_use <- if(!terra::same.crs(r, val_v)) terra::project(val_v, terra::crs(r)) else val_v
+
+  ex <- terra::extract(r, val_v_use)
+  pred <- if(!is.null(ex) && nrow(ex) == length(obs)) as.numeric(ex[[2]]) else rep(NA_real_, length(obs))
+
+  tibble(observed = obs, predicted = pred)
+}
+
+val_pred_long <- crossing(nutrient = soil_vars_to_validate, method = methods) %>%
+  mutate(dat = map2(nutrient, method, extract_one)) %>%
+  unnest(dat) %>%
+  mutate(dataset = dataset_keep) %>%
+  filter(is.finite(observed), is.finite(predicted))
+
+stopifnot(nrow(val_pred_long) > 0)
+
+# -----------------------------
+# Metrics
+# -----------------------------
+safe_r2 <- function(o, p){
+  ok <- is.finite(o) & is.finite(p)
+  if(sum(ok) < 2) return(NA_real_)
+  cc <- suppressWarnings(cor(o[ok], p[ok], use="complete.obs"))
+  if(is.na(cc)) NA_real_ else cc^2
+}
+
+val_metrics <- val_pred_long %>%
+  group_by(dataset, nutrient, method) %>%
+  summarise(
+    n = n(),
+    RMSE = sqrt(mean((predicted - observed)^2)),
+    R2   = safe_r2(observed, predicted),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    lab = paste0("n=", n,
+                 "\nRMSE=", format(round(RMSE, 3), nsmall = 3),
+                 "\nR²=",   ifelse(is.na(R2), "NA", format(round(R2, 3), nsmall = 3)))
+  )
+
+print(val_metrics)
+
+# -----------------------------
+# Pretty nutrient labels
+# -----------------------------
+nut_labs <- c(ca="Ca", k="K", mg="Mg", mn="Mn", p="P", zn="Zn", c="C", n="N", p_h_2="pH")
+
+make_one_nutrient_plot <- function(nut){
+
+  df  <- val_pred_long %>% filter(nutrient == nut)
+  met <- val_metrics    %>% filter(nutrient == nut)
+
+  # ---- if NOTHING to facet, return a placeholder plot ----
+  if(nrow(df) == 0){
+    return(
+      ggplot() +
+        theme_void(base_size = 12) +
+        labs(title = paste0("Validation: ", nut_labs[[nut]] %||% nut, " (", dataset_keep, ")")) +
+        annotate("text", x = 0, y = 0, label = "No finite observed/predicted pairs\n(check extraction + NAs)", size = 4) +
+        theme(plot.title = element_text(face = "bold", hjust = 0.5))
+    )
+  }
+
+  # make sure method is a factor so facet order is stable
+  df <- df %>% mutate(method = factor(method, levels = methods))
+  met <- met %>% mutate(method = factor(method, levels = methods))
+
+  # if a method is missing for this nutrient, facet_wrap is still OK as long as df has rows
+  ggplot(df, aes(observed, predicted)) +
+    geom_point(alpha = 0.85, size = 2) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+    facet_wrap(~ method, scales = "free") +
+    theme_minimal(base_size = 12) +
+    labs(
+      title = paste0("Validation: ", nut_labs[[nut]] %||% nut, " (", dataset_keep, ")"),
+      x = "Observed (validation)",
+      y = "Predicted (map)"
+    ) +
+    theme(
+      strip.text = element_text(face = "bold"),
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    ) +
+    geom_label(
+      data = met,
+      aes(x = -Inf, y = Inf, label = lab),
+      inherit.aes = FALSE,
+      hjust = -0.05, vjust = 1.1,
+      size = 3,
+      label.size = 0.2
+    )
+}
+
+plots <- lapply(soil_vars_to_validate, make_one_nutrient_plot)
+
+final_validation_plot <- wrap_plots(plots, ncol = 3)
+print(final_validation_plot)
+
+# Optional save:
+ggsave("../ouputs/validation_SP_all_nutrients.png", final_validation_plot, width = 16, height = 9, dpi = 300)
+
+#this is OVERFIT "best r2"
+# | Nutrient | Best method   | Interpretation                               |
+# | -------- | ------------- | -------------------------------------------- |
+# | **P**    | OK            | Strong spatial signal, weak covariate signal |
+# | **Mg**   | OK            | Moderate spatial coherence                   |
+# | **Ca**   | OK            | Spatial smoothing beats ML                   |
+# | **K**    | None          | Weak signal overall                          |
+# | **Mn**   | None          | High noise / microscale                      |
+# | **Zn**   | RF/RK (weak)  | Slight covariate signal                      |
+# | **pH**   | None          | Depth + management driven                    |
+# | **C, N** | Not validated | (and that’s okay to state explicitly)        |
+
+
+
+```
+
+```{r}
+
+
+# val_pred_long must have: nutrient, method, observed, predicted
+# example methods: "RF","OK","RK"
+stopifnot(all(c("nutrient","method","observed","predicted") %in% names(val_pred_long)))
+
+# 1) Compute validation metrics from val_pred_long (so we don't rely on a separate table)
+val_metrics <- val_pred_long %>%
+  group_by(nutrient, method) %>%
+  summarise(
+    n = sum(is.finite(observed) & is.finite(predicted)),
+    RMSE = sqrt(mean((predicted - observed)^2, na.rm = TRUE)),
+    R2 = {cc <- suppressWarnings(cor(observed, predicted, use = "complete.obs")); ifelse(is.na(cc), NA_real_, cc^2)},
+    sd_obs = sd(observed, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 2) Standardize errors: by RMSE (recommended) + by observed SD (optional)
+val_std <- val_pred_long %>%
+  left_join(val_metrics, by = c("nutrient","method")) %>%
+  mutate(
+    err = predicted - observed,
+    z_rmse = err / RMSE,                     # "how many RMSEs off?"
+    z_sd   = err / sd_obs,                   # "how many observed SDs off?"
+    abs_z_rmse = abs(z_rmse)
+  ) %>%
+  filter(is.finite(z_rmse))
+
+# 3) Nice labels (edit if you want)
+nut_labs <- c(
+  ca="Ca", k="K", mg="Mg", mn="Mn", p="P", zn="Zn", c="C", n="N", p_h_2="pH"
+)
+
+val_std <- val_std %>%
+  mutate(
+    nutrient_lab = ifelse(nutrient %in% names(nut_labs), nut_labs[nutrient], nutrient),
+    method = factor(method, levels = c("OK","RF","RK"))
+  )
+
+# ---- PLOT 1: Distribution of standardized errors (by RMSE) ----
+# Interpretation: 0 = perfect; +/-1 = off by 1 RMSE; +/-2 = off by 2 RMSE
+p1 <- ggplot(val_std, aes(x = z_rmse, fill = method)) +
+  geom_histogram(bins = 15, alpha = 0.6, position = "identity") +
+  geom_vline(xintercept = 0, linewidth = 0.7) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", linewidth = 0.6) +
+  geom_vline(xintercept = c(-2, 2), linetype = "dotted", linewidth = 0.6) +
+  facet_wrap(~ nutrient_lab, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Validation: standardized prediction error (in RMSE units)",
+    x = "(Predicted − Observed) / RMSE  [per nutrient + method]",
+    y = "Count",
+    fill = "Method"
+  ) +
+  theme(legend.position = "top")
+print(p1)
+
+# ---- PLOT 2: “How far off?” absolute standardized errors ----
+# This one is super intuitive: lower is better.
+p2 <- val_std %>%
+  group_by(nutrient_lab, method) %>%
+  summarise(
+    n = dplyr::n(),
+    median_abs = median(abs_z_rmse, na.rm = TRUE),
+    mean_abs = mean(abs_z_rmse, na.rm = TRUE),
+    p90_abs = quantile(abs_z_rmse, 0.90, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = nutrient_lab, y = median_abs, color = method, group = method)) +
+  geom_point(size = 2.6) +
+  geom_line(linewidth = 0.7) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Validation: median absolute error in RMSE units (lower = better)",
+    x = NULL,
+    y = "Median |(Pred−Obs)/RMSE|",
+    color = "Method"
+  ) +
+  theme(legend.position = "top")
+print(p2)
+
+# ---- SUMMARY TABLE: % within 1 RMSE and 2 RMSE ----
+val_within <- val_std %>%
+  group_by(nutrient_lab, method) %>%
+  summarise(
+    n = dplyr::n(),
+    pct_within_1 = mean(abs_z_rmse <= 1, na.rm = TRUE) * 100,
+    pct_within_2 = mean(abs_z_rmse <= 2, na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(nutrient_lab, method)
+
+print(val_within)
+
+#nice table:
+library(knitr)
+val_within %>%
+  kable(
+    caption = "Validation: Percentage of predictions within 1 RMSE and 2 RMSE",
+    col.names = c("Nutrient", "Method", "N", "% within 1 RMSE", "% within 2 RMSE"),
+    digits = c(0,0,0,1,1)
+  )
+```
+
+```{r}
+
+
+# -----------------------------
+# 0) Settings you control
+# -----------------------------
+map_dir  <- "C:/git/Perry_surface_analysis/code/best_boot_maps"  # adjust if needed
+dataset  <- "SP"
+nutrient <- "p"
+
+# IMPORTANT: set to the depth your P map represents
+depth_cm <- 15      # <-- change to 20 if your P map is 0–20 cm
+bd_gcm3  <- 1.33    # bulk density assumption (g/cm3)
+
+# -----------------------------
+# 1) Coastal Plain P thresholds (lbs/ac) from your table
+# -----------------------------
+# Low: 0–30, Medium: 31–60, High: 61–100, Very High: 100+
+p_lbs_breaks <- c(0, 30, 60, 100, Inf)
+
+# -----------------------------
+# 2) Convert lbs/ac thresholds -> ppm thresholds for your depth + BD
+#    ppm_to_lbsac(1 ppm) gives the lbs/ac per ppm at that depth.
+# -----------------------------
+ppm_to_lbsac_factor <- function(depth_cm, bulk_density_gcm3 = 1.33){
+  area_m2 <- 4046.8564224
+  depth_m <- depth_cm / 100
+  bd_kgm3 <- bulk_density_gcm3 * 1000
+  soil_mass_kg <- area_m2 * depth_m * bd_kgm3
+  # 1 ppm = 1 mg/kg, so lbs/ac per ppm:
+  (soil_mass_kg * 2.2046226218) / 1e6
+}
+
+lbs_per_ppm <- ppm_to_lbsac_factor(depth_cm, bd_gcm3)
+
+# Convert lbs/ac breaks to ppm breaks (same number of breaks)
+# (Inf stays Inf)
+p_ppm_breaks <- p_lbs_breaks
+p_ppm_breaks[is.finite(p_ppm_breaks)] <- p_ppm_breaks[is.finite(p_ppm_breaks)] / lbs_per_ppm
+
+cat("Depth (cm):", depth_cm, " BD:", bd_gcm3, "\n")
+cat("lbs/ac per ppm:", round(lbs_per_ppm, 4), "\n")
+cat("P thresholds (lbs/ac):", paste(p_lbs_breaks, collapse=" | "), "\n")
+cat("P thresholds (ppm)   :", paste(round(p_ppm_breaks, 2), collapse=" | "), "\n\n")
+
+# -----------------------------
+# 3) Helper to bin a ppm raster into categorical zones
+# -----------------------------
+classify_P_zones_ppm <- function(r_ppm, breaks_ppm, breaks_lbs){
+  # Create a categorical raster with classes 1..4
+  # zones: [0,b1], (b1,b2], (b2,b3], (b3,Inf]
+  r_cat <- classify(r_ppm, rcl = matrix(c(
+    -Inf, breaks_ppm[2], 1,
+    breaks_ppm[2], breaks_ppm[3], 2,
+    breaks_ppm[3], breaks_ppm[4], 3,
+    breaks_ppm[4],  Inf,          4
+  ), ncol = 3, byrow = TRUE), include.lowest = TRUE, right = TRUE)
+
+  r_cat <- as.factor(r_cat)
+
+  # Pretty labels include BOTH ppm & lbs/ac ranges
+  lab <- c(
+    paste0("Low (≤",   round(breaks_ppm[2],2), " ppm; ≤", breaks_lbs[2], " lb/ac)"),
+    paste0("Medium (", round(breaks_ppm[2],2), "–", round(breaks_ppm[3],2), " ppm; ",
+           breaks_lbs[2]+1, "–", breaks_lbs[3], " lb/ac)"),
+    paste0("High (",   round(breaks_ppm[3],2), "–", round(breaks_ppm[4],2), " ppm; ",
+           breaks_lbs[3]+1, "–", breaks_lbs[4], " lb/ac)"),
+    paste0("Very High (>", round(breaks_ppm[4],2), " ppm; >", breaks_lbs[4], " lb/ac)")
+  )
+
+  levels(r_cat) <- data.frame(value = 1:4, zone = lab)
+  r_cat
+}
+
+# -----------------------------
+# 4) Load SP P rasters for RF / OK / RK and classify
+# -----------------------------
+methods <- c("RF","OK","RK")
+
+p_maps <- lapply(methods, function(m){
+  f <- file.path(map_dir, sprintf("%s_%s_%s_bestboot.tif", dataset, nutrient, m))
+  if(!file.exists(f)) stop("Missing file: ", f)
+  rast(f)
+})
+names(p_maps) <- methods
+
+p_zones <- lapply(p_maps, classify_P_zones_ppm, breaks_ppm = p_ppm_breaks, breaks_lbs = p_lbs_breaks)
+
+# -----------------------------
+# 5) Plot side-by-side (not saving yet)
+# -----------------------------
+op <- par(no.readonly = TRUE)
+par(mfrow = c(1,3), mar = c(3,3,4,7))
+
+for(m in methods){
+  plot(p_zones[[m]],
+       main = sprintf("P Zones (%s %s)\nDepth=%scm  BD=%s", dataset, m, depth_cm, bd_gcm3),
+       axes = FALSE)
+}
+
+par(op)
 ```
 
 

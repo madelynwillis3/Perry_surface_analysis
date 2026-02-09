@@ -1,0 +1,154 @@
+---
+title: "SR_analysis_02_2026"
+format: html
+---
+
+```{r}
+library(terra)
+library(dplyr)
+```
+
+```{r}
+# 
+# | Soil Reflectance Indices               |
+# | Concept             | Index idea                    | Soil meaning                 |
+# | ------------------- | ----------------------------- | ---------------------------- |
+# | Brightness          | `(R + G + B) / 3`             | Surface albedo, texture, SOM |
+# | Redness             | `R / (R + G)`                 | Iron oxides                  |
+# | Iron vs OM          | `Red / NIR`                   | Fe vs carbon darkening       |
+# | Soil color contrast | `(Red − Green)/(Red + Green)` | Hue differences              |
+# | Clay proxy          | `RedEdge / NIR`               | Mineral absorption features  |
+
+
+# 
+# BI_rgb_mean / BI_rgb_root: “surface brightness/albedo proxy” (texture + OM + moisture history signals)
+# 
+# RI / RGRI / IOI_RB: “redness / iron oxide expression” proxies
+# 
+# VARI: “visible index designed to reduce illumination sensitivity”
+# 
+# NDRE / RE_NIR: “red-edge/NIR contrast (material/edge behavior), useful even in sparse vegetation or mixed bare soil conditions” (and it’s a standard red-edge form)
+# Red/Blue iron oxide ratio is a widely used proxy for iron oxide expression (blue absorption + red reflectance).
+# 
+# Redness Index and related RGB color indices (brightness, hue-ish metrics) are commonly used in soil/earth observation contexts.
+# 
+# VARI is a standard “visible” index designed to be more robust to illumination effects than raw bands.
+# 
+
+
+#load dataL:
+
+covariate_stack_SR <- rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
+
+#select SR bands only:
+SR_bands <- covariate_stack_SR[[c("red", "green", "blue", "rededge", "nir","coastal_blue","yellow","green_i")]]
+
+# -----------------------------
+# 0) Optional: rescale SR to 0–1 if it looks like 0–10000 scaled integers
+#    (Planet SR is often scaled; check range quickly)
+# -----------------------------
+sr_minmax <- global(SR_bands, fun = range, na.rm = TRUE)
+print(sr_minmax)
+
+# If max is > 2-ish, it’s almost certainly scaled ints; convert to 0–1
+if (max(sr_minmax, na.rm = TRUE) > 2) {
+  SR <- SR_bands / 10000
+} else {
+  SR <- SR_bands
+}
+
+# -----------------------------
+# 1) Helpers
+# -----------------------------
+eps <- 1e-6
+safe_div <- function(num, den) num / (den + eps)
+
+R  <- SR[["red"]]
+G  <- SR[["green"]]
+B  <- SR[["blue"]]
+RE <- SR[["rededge"]]
+N  <- SR[["nir"]]
+CB <- SR[["coastal_blue"]]
+Y  <- SR[["yellow"]]
+GI <- SR[["green_i"]]
+
+SUM_RGB <- R + G + B + eps
+
+# -----------------------------
+# 2) Indices (soil-interpretable)
+# -----------------------------
+idx <- c(
+  # Brightness / albedo proxies
+  BI_rgb_mean  = (R + G + B) / 3,                           # “brightness”
+  BI_rgb_root  = sqrt((R^2 + G^2 + B^2) / 3),               # brightness index variant
+
+  # Normalized color components (help separate hue vs illumination)
+  NR = safe_div(R, SUM_RGB),
+  NG = safe_div(G, SUM_RGB),
+  NB = safe_div(B, SUM_RGB),
+
+  # Redness / color contrast (iron oxide / hue-ish behavior)
+  RI      = safe_div(R - G, R + G),                         # Redness Index (R,G)
+  RGRI    = safe_div(R, G),                                 # Red/Green ratio
+
+  # Iron oxide expression proxy (classic)
+  IOI_RB  = safe_div(R, B),                                 # Iron Oxide Index/Ratio ~ Red/Blue
+
+  # Visible “illumination-robust” color
+  VARI    = safe_div(G - R, (G + R - B)),                   # Visible Atmospherically Resistant Index
+
+  # Red-edge contrast (often tracks pigment edge / subtle material shifts)
+  NDRE    = safe_div(N - RE, N + RE),                       # NIR vs RedEdge contrast
+  RE_NIR  = safe_div(RE, N),                                # simple ratio
+
+  # Bare-soil “blueing” vs redness (sometimes tracks OM darkening / haze effects)
+  RB_norm = safe_div(R - B, R + B),                         # normalized red-blue contrast
+  CB_ratio = safe_div(CB, B),                               # coastal-blue relative to blue (atmosphere/scatter-ish)
+
+  # Yellow and GreenI contrasts (can behave like “yellowing” / slope of visible)
+  YR_norm  = safe_div(Y - R, Y + R),
+  GI_G_norm = safe_div(GI - G, GI + G)
+)
+
+names(idx) <- names(idx)  # keep names stable
+
+# Optional: drop any extreme junk values (rare but can happen with eps + tiny denominators)
+idx <- terra::rast(idx)
+idx <- idx * 1  # force SpatRaster evaluation
+
+for (i in seq_len(nlyr(idx))) {
+  idx[[i]] <- terra::clamp(idx[[i]], lower = -5, upper = 5, values = TRUE)
+}
+
+# -----------------------------
+# 3) Output: stack of indices you can append to covariate_stack
+# -----------------------------
+SR_indices <- idx
+print(SR_indices)
+names(SR_indices)
+
+plot(SR_indices)
+```
+
+```{r}  
+#merge back with covariate stack
+cov_no_rawSR <- covariate_stack_SR[[setdiff(names(covariate_stack_SR), names(SR_bands))]]
+covariate_stack_idx <- c(cov_no_rawSR, SR_indices)
+
+#all together: 
+covariate_stack_SR_all <- c(covariate_stack_SR, SR_indices)
+#save stack:
+#writeRaster(covariate_stack_idx, "../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m_with_SR_indices.tif", overwrite=TRUE)
+writeRaster(covariate_stack_SR_all, "../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m_all_with_SR_indices.tif", overwrite=TRUE)
+```
+
+```{r}
+#see if we can play a little bit with UMAP:
+library(umap)
+
+
+
+
+```
+
+
