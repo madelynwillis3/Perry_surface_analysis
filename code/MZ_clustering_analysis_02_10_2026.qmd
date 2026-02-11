@@ -1,0 +1,282 @@
+---
+title: "MZ_clustering_analysis_02_10_2026"
+format: html
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+#breakdown:
+#1. load libraries
+#2. load data
+#3. data cleaning and preprocessing
+#4. clustering analysis - UMAP and kmeans or isodata
+#5. visualization of clusters
+#6. Management zone creation from clusters
+#7. Validation of management zones with independent soil data 
+
+```
+
+```{r load_libraries}
+library(terra)
+library(stringr)
+library(tibble)
+library(dplyr)
+library(uwot)
+
+map_dir   <- "C:/git/Perry_surface_analysis/code/best_boot_maps"
+methods   <- c("RF","OK","RK")
+datasets  <- c("SP","C")
+nutrients <- c("ca","k","mg","mn","p","zn","c","n","p_h_2")
+
+# -----------------------------
+# Index map files
+# -----------------------------
+map_index <- tibble(
+  path = list.files(map_dir, pattern="\\.tif$", full.names=TRUE),
+  file = basename(path)
+) %>%
+  mutate(
+    dataset  = str_match(file, "^(SP|C)_")[,2],
+    method   = str_match(file, "_(RF|OK|RK)_bestboot\\.tif$")[,2],
+    nutrient = str_match(file, "^(SP|C)_(.*)_(RF|OK|RK)_bestboot\\.tif$")[,3]
+  ) %>%
+  filter(!is.na(dataset), !is.na(method), !is.na(nutrient),
+         dataset %in% datasets, method %in% methods, nutrient %in% nutrients)
+
+# -----------------------------
+# Load nutrient stack for one dataset+method
+# -----------------------------
+load_feature_stack <- function(map_index, dataset_keep, method_keep, nutrients){
+  rows <- map_index %>%
+    filter(dataset == dataset_keep, method == method_keep, nutrient %in% nutrients) %>%
+    arrange(match(nutrient, nutrients))
+
+  if(nrow(rows) != length(nutrients)){
+    missing <- setdiff(nutrients, rows$nutrient)
+    stop("Missing rasters for ", dataset_keep, " ", method_keep, ": ",
+         paste(missing, collapse=", "))
+  }
+
+  s <- rast(rows$path)
+  names(s) <- rows$nutrient
+
+  # enforce identical geometry (safe)
+  s <- resample(s, s[[1]], method="bilinear")
+  s
+}
+
+# -----------------------------
+# Fit UMAP+Kmeans on sample, assign zones to ALL pixels
+# (NO dplyr::select used)
+# -----------------------------
+fit_umap_clusters <- function(feature_stack,
+                              n_zones = 4,
+                              sample_n = 40000,
+                              seed = 1,
+                              umap_n_neighbors = 30,
+                              umap_min_dist = 0.05){
+
+  set.seed(seed)
+
+  df <- terra::as.data.frame(feature_stack, cells = TRUE, na.rm = FALSE)
+
+  # base-subset to predictors
+  pred_names <- setdiff(names(df), "cell")
+  Xdf <- df[, pred_names, drop = FALSE]
+
+  keep <- complete.cases(Xdf)
+  df   <- df[keep, , drop = FALSE]
+  Xdf  <- Xdf[keep, , drop = FALSE]
+
+  X  <- as.matrix(Xdf)
+  Xs <- scale(X)
+
+  n_use <- min(sample_n, nrow(Xs))
+  idx   <- sample(seq_len(nrow(Xs)), n_use)
+  Xs_samp <- Xs[idx, , drop = FALSE]
+
+  # learn UMAP on sample
+  umap_model <- uwot::umap(
+    Xs_samp,
+    n_neighbors = umap_n_neighbors,
+    min_dist = umap_min_dist,
+    n_components = 2,
+    metric = "euclidean",
+    ret_model = TRUE,
+    verbose = TRUE
+  )
+
+  # transform ALL pixels using fitted model
+  emb_all <- uwot::umap_transform(Xs, umap_model)
+
+  # kmeans in UMAP space
+  km <- kmeans(emb_all, centers = n_zones, nstart = 20)
+
+  list(
+    cells   = df$cell,
+    cluster = km$cluster,
+    umap    = emb_all,
+    km      = km
+  )
+}
+
+make_zone_raster <- function(template_raster, fit_obj){
+  z <- template_raster
+  vals <- rep(NA_integer_, terra::ncell(z))
+  vals[fit_obj$cells] <- fit_obj$cluster
+  terra::values(z) <- vals
+  z <- terra::as.factor(z)
+  levels(z) <- data.frame(value = sort(unique(na.omit(fit_obj$cluster))),
+                          zone  = paste0("Zone ", sort(unique(na.omit(fit_obj$cluster)))))
+  z
+}
+
+# -----------------------------
+# Run ALL dataset × method combos
+# -----------------------------
+zones_all <- list()
+
+for(ds in datasets){
+  for(m in methods){
+    cat("\n--- Fitting zones:", ds, m, "---\n")
+    s   <- load_feature_stack(map_index, ds, m, nutrients)
+    fit <- fit_umap_clusters(s, n_zones = 4, sample_n = 40000, seed = 7)
+    z   <- make_zone_raster(s[[1]], fit)
+
+    key <- paste(ds, m, sep = "_")
+    zones_all[[key]] <- z
+  }
+}
+
+# -----------------------------
+# Quick plot (6 panels)
+# -----------------------------
+op <- par(no.readonly = TRUE)
+par(mfrow = c(2,3), mar = c(2,2,3,5))
+for(nm in names(zones_all)){
+  plot(zones_all[[nm]], main = nm, axes = FALSE)
+}
+par(op)
+
+# zones_all now holds 6 management-zone rasters (SP_RF, SP_OK, SP_RK, C_RF, C_OK, C_RK)
+
+```
+```{r}
+#validation:
+
+# -----------------------------
+# 0) Inputs you already have
+# -----------------------------
+map_dir <- "C:/git/Perry_surface_analysis/code/best_boot_maps"
+methods <- c("RF","RK")  # add "OK" later if you want
+dataset_keep <- "SP"
+
+# validation data you already fixed earlier (x/y are EPSG:3857)
+validation_data <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/perry_fp_Ap_0_20_with_coords.csv") %>%
+  mutate(x = as.numeric(x), y = as.numeric(y))
+
+# use ANY raster just to get CRS (your maps are EPSG:26917)
+r_template <- terra::rast(file.path(map_dir, "SP_c_RF_bestboot.tif"))
+
+validation_sf_fix <- st_as_sf(validation_data, coords = c("x","y"), crs = 3857, remove = FALSE) %>%
+  st_transform(terra::crs(r_template, proj = TRUE))  # -> EPSG:26917
+
+val_v <- terra::vect(validation_sf_fix)  # SpatVector for terra::extract
+
+# -----------------------------
+# 1) P breaks (ppm) — Coastal Plain thresholds converted from lbs/ac
+#    (use your same settings!)
+# -----------------------------
+depth_cm <- 15
+bd_gcm3  <- 1.33
+
+ppm_to_lbsac_factor <- function(depth_cm, bulk_density_gcm3 = 1.33){
+  area_m2 <- 4046.8564224
+  depth_m <- depth_cm / 100
+  bd_kgm3 <- bulk_density_gcm3 * 1000
+  soil_mass_kg <- area_m2 * depth_m * bd_kgm3
+  (soil_mass_kg * 2.2046226218) / 1e6
+}
+
+lbs_per_ppm <- ppm_to_lbsac_factor(depth_cm, bd_gcm3)
+
+p_lbs_breaks <- c(0, 30, 60, 100, Inf)
+p_ppm_breaks <- p_lbs_breaks
+p_ppm_breaks[is.finite(p_ppm_breaks)] <- p_ppm_breaks[is.finite(p_ppm_breaks)] / lbs_per_ppm
+
+# function: bin numeric ppm into 1..4
+bin_p <- function(x_ppm, breaks_ppm){
+  cut(
+    x_ppm,
+    breaks = c(-Inf, breaks_ppm[2], breaks_ppm[3], breaks_ppm[4], Inf),
+    labels = 1:4,
+    right = TRUE,
+    include.lowest = TRUE
+  ) %>% as.integer()
+}
+
+zone_labels <- c("Low","Medium","High","Very High")
+
+# observed P bin from validation
+stopifnot("p" %in% names(validation_sf_fix))
+obs_p_ppm <- as.numeric(validation_sf_fix$p)
+obs_bin   <- bin_p(obs_p_ppm, p_ppm_breaks)
+
+# -----------------------------
+# 2) Extract predicted zones from zone rasters (RF/RK)
+#    IMPORTANT: always use terra::extract()
+# -----------------------------
+get_pred_bin_from_raw_map <- function(method){
+  f <- file.path(map_dir, sprintf("%s_p_%s_bestboot.tif", dataset_keep, method))
+  stopifnot(file.exists(f))
+  r <- terra::rast(f)
+
+  # extract predicted P at validation points
+  ex <- terra::extract(r, val_v)   # data.frame with ID + layer
+  pred_p <- as.numeric(ex[[2]])
+
+  pred_bin <- bin_p(pred_p, p_ppm_breaks)
+  tibble(
+    method = method,
+    observed_ppm = obs_p_ppm,
+    predicted_ppm = pred_p,
+    obs_bin = obs_bin,
+    pred_bin = pred_bin
+  )
+}
+
+val_bins <- bind_rows(lapply(methods, get_pred_bin_from_raw_map)) %>%
+  filter(is.finite(obs_bin), is.finite(pred_bin))
+
+# -----------------------------
+# 3) Overall accuracy + within-1-bin
+# -----------------------------
+zone_acc <- val_bins %>%
+  group_by(method) %>%
+  summarise(
+    n = n(),
+    accuracy = mean(pred_bin == obs_bin),
+    pct_accuracy = 100 * accuracy,
+    pct_within_1_bin = 100 * mean(abs(pred_bin - obs_bin) <= 1),
+    .groups = "drop"
+  )
+
+print(zone_acc)
+
+# "confusion" style counts
+zone_counts <- val_bins %>%
+  mutate(
+    obs_label  = factor(zone_labels[obs_bin], levels = zone_labels),
+    pred_label = factor(zone_labels[pred_bin], levels = zone_labels)
+  ) %>%
+  count(method, obs_label, pred_label) %>%
+  arrange(method, obs_label, pred_label)
+
+print(zone_counts)
+
+```
+
+
+

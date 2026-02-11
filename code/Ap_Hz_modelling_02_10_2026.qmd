@@ -1,0 +1,153 @@
+---
+title: "Ap_Hz_modelling_02_10_2026"
+format: html
+---
+
+```{r}
+
+```
+
+```{r}
+#load libraries
+library(terra)
+library(dplyr)
+library(stringr)
+```
+
+```{r}
+#pull in full Ap hz data:
+Ap_hz_perry <- read.csv("../LOCAL DATA DO NOT PUSH/Ap_hz_data/perry_Ap_data_full_02_10_2026.csv")
+
+#depth weighting function
+# -----------------------------
+# 1) Clean depths
+# -----------------------------
+Ap_hz_clean <- Ap_hz_perry %>%
+  mutate(
+    top_cm    = as.numeric(str_extract(To.Depth..cm., "^\\d+")),
+    bottom_cm = as.numeric(str_extract(To.Depth..cm., "(?<=-)\\d+"))
+  ) %>%
+  mutate(
+    bottom_cm = ifelse(
+      is.na(bottom_cm) & !is.na(top_cm) & !is.na(H.Depth.cm.),
+      top_cm + H.Depth.cm.,
+      bottom_cm
+    )
+  ) %>%
+  filter(
+    is.finite(top_cm),
+    is.finite(bottom_cm),
+    bottom_cm > top_cm
+  )
+
+# -----------------------------
+# 2) Depth-weighting function (0–15 cm)
+# -----------------------------
+depth_weighted_0_15 <- function(df, value_col,
+                               id_col = "Point",
+                               top_col = "top_cm",
+                               bot_col = "bottom_cm",
+                               zmax = 15) {
+
+  df %>%
+    mutate(
+      z_top = .data[[top_col]],
+      z_bot = .data[[bot_col]],
+      val   = as.numeric(.data[[value_col]])
+    ) %>%
+    filter(is.finite(val)) %>%
+    mutate(
+      thick = pmax(0, pmin(z_bot, zmax) - pmax(z_top, 0))
+    ) %>%
+    group_by(.data[[id_col]]) %>%
+    summarise(
+      cover_cm = sum(thick, na.rm = TRUE),
+      value_0_15 = ifelse(
+        cover_cm >= zmax,
+        sum(val * thick, na.rm = TRUE) / zmax,
+        NA_real_
+      ),
+      .groups = "drop"
+    )
+}
+
+# -----------------------------
+# 3) Choose nutrient columns to depth-weight
+#    (edit this vector if you want)
+# -----------------------------
+nutrients <- c("Ca","K","Mg","Mn","P","Zn","pH.2","LBC.1","LBCeq","C_pct","N_pct")
+
+# keep only nutrients that actually exist in your dataframe
+nutrients <- nutrients[nutrients %in% names(Ap_hz_clean)]
+print(nutrients)
+
+# -----------------------------
+# 4) Compute all depth-weighted 0–15 results
+# -----------------------------
+hz_0_15_list <- map(nutrients, ~{
+  out <- depth_weighted_0_15(Ap_hz_clean, value_col = .x)
+  names(out)[names(out) == "value_0_15"] <- paste0(.x, "_0_15")
+  out
+})
+names(hz_0_15_list) <- nutrients
+
+# -----------------------------
+# 5) Combine into ONE WIDE dataset (1 row per Point)
+# -----------------------------
+hz_0_15_wide <- reduce(hz_0_15_list, full_join, by = "Point")
+
+# quick checks
+cat("\nRows (Points):", nrow(hz_0_15_wide), "\n")
+na_summary <- hz_0_15_wide %>%
+  summarise(across(-Point, ~sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "var", values_to = "n_NA") %>%
+  arrange(desc(n_NA))
+print(na_summary)
+
+# -----------------------------
+# 6) ALSO make a LONG dataset (good for distributions/plots)
+# -----------------------------
+hz_0_15_long <- hz_0_15_wide %>%
+  pivot_longer(
+    cols = -Point,
+    names_to = "nutrient",
+    values_to = "value_0_15"
+  )
+
+# Example: distribution summaries by nutrient
+dist_summary <- hz_0_15_long %>%
+  group_by(nutrient) %>%
+  summarise(
+    n = sum(is.finite(value_0_15)),
+    min = min(value_0_15, na.rm = TRUE),
+    q25 = quantile(value_0_15, 0.25, na.rm = TRUE),
+    median = median(value_0_15, na.rm = TRUE),
+    mean = mean(value_0_15, na.rm = TRUE),
+    q75 = quantile(value_0_15, 0.75, na.rm = TRUE),
+    max = max(value_0_15, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(dist_summary)
+
+# -----------------------------
+# 7) Optional: save
+# -----------------------------
+hz_0_15_wide <- hz_0_15_wide %>%
+#remove  columns with .x or .y
+  dplyr::select(Point, ends_with("_0_15")) %>%
+  #remove na rows
+  filter(if_any(-Point, ~is.finite(.x))) %>%
+  #add point locs
+  left_join(
+    Ap_hz_clean %>%
+      dplyr::select(Point, POINT_X, POINT_Y) %>%
+      distinct(),
+    by = "Point"
+  ) 
+
+
+
+write.csv("../LOCAL DATA DO NOT PUSH/Ap_hz_data/perry_Ap_hz_0_15cm_depth_func_02_10_2026.csv", row.names = FALSE)
+
+```
+

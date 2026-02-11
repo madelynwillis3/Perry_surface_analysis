@@ -83,6 +83,80 @@ soil_sf_C  <- st_as_sf(soil_C_full, coords = c("x","y"), crs = 4326) %>% st_tran
 # soil_vars_clean <- c("lbc","lbc_eq","ph","calcium","potassium","magnesium","manganese","phosphorus","zinc","carbon","nitrogen")
 ```
 
+### UMAP test
+
+```{r}
+library(umap)
+# Prepare data for UMAP (only soil variables, no coordinates)
+soil_umap_SP <- soil_sf_SP %>%
+  st_drop_geometry() %>%
+  select(all_of(soil_vars)) %>%
+  drop_na()
+
+soil_umap_C <- soil_sf_C %>%
+  st_drop_geometry() %>%
+  select(all_of(soil_vars)) %>%
+  drop_na()
+
+# Run UMAP separately on SP and Composite datasets
+set.seed(626)  # for reproducibility
+umap_SP <- umap(soil_umap_SP)
+umap_C <- umap(soil_umap_C)
+
+#plot UMAP results
+umap_df_SP <- as.data.frame(umap_SP$layout) %>% mutate(dataset = "Single Point")
+umap_df_C <- as.data.frame(umap_C$layout) %>% mutate(dataset = "Composite")
+umap_df <- bind_rows(umap_df_SP, umap_df_C)
+ggplot(umap_df, aes(x = V1, y = V2, color = dataset)) +
+  geom_point(alpha = 0.7) +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal(base_size = 14) +
+  labs(title = "UMAP of Soil Nutrient Profiles",
+       x = "UMAP Dimension 1", y = "UMAP Dimension 2", color = "Dataset") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+#cluster:
+library(dbscan)
+set.seed(626)
+dbscan_SP <- dbscan(umap_SP$layout, eps = 0.5, minPts = 5)
+dbscan_C  <- dbscan(umap_C$layout, eps = 0.5, minPts = 5)
+umap_df_SP$cluster <- as.factor(dbscan_SP$cluster)
+umap_df_C$cluster  <- as.factor(dbscan_C$cluster)
+ggplot(umap_df_SP, aes(x = V1, y = V2, color = cluster)) +
+  geom_point(alpha = 0.7) +
+  scale_color_viridis_d() +
+  theme_minimal(base_size = 14) +
+  labs(title = "UMAP Clusters of Single Point Soil Nutrient Profiles",
+       x = "UMAP Dimension 1", y = "UMAP Dimension 2", color = "Cluster") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+ggplot(umap_df_C, aes(x = V1, y = V2, color = cluster)) +
+  geom_point(alpha = 0.7) +
+  scale_color_viridis_d() +
+  theme_minimal(base_size = 14) +
+  labs(title = "UMAP Clusters of Composite Soil Nutrient Profiles",
+       x = "UMAP Dimension 1", y = "UMAP Dimension 2", color = "Cluster") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+## Explore cluster characteristics (e.g., mean nutrient values per cluster)
+cluster_summary_SP <- soil_umap_SP %>%
+  mutate(cluster = as.factor(dbscan_SP$cluster)) %>%
+  group_by(cluster) %>%
+  summarise(across(all_of(soil_vars), mean, na.rm = TRUE))
+cluster_summary_C <- soil_umap_C %>%
+  mutate(cluster = as.factor(dbscan_C$cluster)) %>%
+  group_by(cluster) %>%
+  summarise(across(all_of(soil_vars), mean, na.rm = TRUE))  
+  
+print(cluster_summary_SP)
+print(cluster_summary_C)
+
+## Note: UMAP and clustering results can be sensitive to parameters (e.g., eps for DBSCAN), so you may want to experiment with those for better separation or more meaningful clusters.
+
+#how can i use this to predict properties?
+
+```
+
 
 ### Plot Composite vs Single Point with Outlier Labels
 
@@ -212,7 +286,7 @@ ggplot(soil_no_outliers, aes(x = Composite, y = SP)) +
 
 ### Density Plots Comparing Distributions
 
-```{r, warning=FALSE}
+```{r, warning=FALSE eval=FALSE}
 # ---- Prepare long-format dataset for density plots ----
 
 # Select only the soil variables + dataset label
@@ -2189,6 +2263,8 @@ p_vip <- ggplot(vip_plot_dat, aes(x = covariate, y = importance_value)) +
 
 ```
 
+### VIP Bar Plots with Shared X-Limits for SP vs Composite Comparison
+
 ```{r}
 
 top_k <- 5
@@ -2279,6 +2355,9 @@ ggsave("vip_outputs/vip_top5_RF_SP_vs_C.png", final_patch, width = 16, height = 
 # Negative importance → shuffling improves performance → predictor is actively harmful / noisy / redundant
 
 ```
+
+
+### Validation of predictions at point locations
 
 ```{r}
 # now onto validation. I have a dataset with validation points.
@@ -2490,6 +2569,9 @@ ggsave("../ouputs/validation_SP_all_nutrients.png", final_validation_plot, width
 
 ```
 
+
+### Validation: Standardized Errors and “How Far Off?” Plots
+
 ```{r}
 
 
@@ -2595,6 +2677,9 @@ val_within %>%
   )
 ```
 
+
+### MZ maps for P
+
 ```{r}
 
 
@@ -2698,6 +2783,325 @@ for(m in methods){
 par(op)
 ```
 
+```{r}
+
+# -----------------------------
+# SETTINGS
+# -----------------------------
+map_dir  <- "C:/git/Perry_surface_analysis/code/best_boot_maps"
+dataset  <- "SP"
+nutrient <- "p"
+methods  <- c("RF","OK","RK")
+
+# Your UGA Coastal Plain thresholds (lbs/ac)
+p_lbs_breaks <- c(0, 30, 60, 100, Inf)
+
+# Choose ONE binning basis for EVERYTHING:
+#   "ppm"  = assume raster+validation are ppm
+#   "lbs"  = assume raster+validation should be treated as lbs/ac
+bin_basis <- "lbs"   # <-- TRY "lbs" FIRST given your weird result
+
+# Conversion settings (only used if we need ppm <-> lbs/ac)
+depth_cm <- 15
+bd_gcm3  <- 1.33
+
+# -----------------------------
+# 1) Read reference raster for CRS
+# -----------------------------
+r_ref <- rast(file.path(map_dir, "SP_c_RF_bestboot.tif"))  # EPSG:26917
+
+# -----------------------------
+# 2) Validation points (your fix: x/y are EPSG:3857)
+# -----------------------------
+validation_data <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/perry_fp_Ap_0_20_with_coords.csv") %>%
+  mutate(x = as.numeric(x), y = as.numeric(y))
+
+validation_sf_fix <- st_as_sf(validation_data, coords = c("x","y"), crs = 3857, remove = FALSE) %>%
+  st_transform(terra::crs(r_ref, proj = TRUE))
+
+stopifnot(nutrient %in% names(validation_sf_fix))
+val_v <- vect(validation_sf_fix)
+
+# overlap check
+inside <- relate(val_v, r_ref, "intersects")
+cat("Points intersect raster extent:", sum(inside), "of", length(inside), "\n")
+
+# -----------------------------
+# 3) Helpers
+# -----------------------------
+ppm_to_lbsac_factor <- function(depth_cm, bulk_density_gcm3 = 1.33){
+  area_m2 <- 4046.8564224
+  depth_m <- depth_cm / 100
+  bd_kgm3 <- bulk_density_gcm3 * 1000
+  soil_mass_kg <- area_m2 * depth_m * bd_kgm3
+  (soil_mass_kg * 2.2046226218) / 1e6  # lbs/ac per ppm
+}
+
+lbs_per_ppm <- ppm_to_lbsac_factor(depth_cm, bd_gcm3)
+
+# Binning function (returns 1..4)
+bin_P <- function(x, breaks){
+  as.integer(cut(x,
+    breaks = c(-Inf, breaks[2], breaks[3], breaks[4], Inf),
+    labels = 1:4, right = TRUE, include.lowest = TRUE
+  ))
+}
+
+# -----------------------------
+# 4) Extract RAW predicted values at points
+# -----------------------------
+# --- Extract RAW predicted values at points (FIXED) ---
+extract_pred_vals <- function(meth){
+  f <- file.path(map_dir, sprintf("%s_%s_%s_bestboot.tif", dataset, nutrient, meth))
+  if(!file.exists(f)) stop("Missing raster: ", f)
+
+  r <- terra::rast(f)
+
+  val_use <- if(!terra::same.crs(r, val_v)) terra::project(val_v, terra::crs(r)) else val_v
+
+  ex <- terra::extract(r, val_use)   # <-- force terra::extract
+  as.numeric(ex[[2]])
+}
+
+
+obs_ppm <- as.numeric(validation_sf_fix[[nutrient]])
+
+pred_tbl <- tibble(
+  id = seq_along(obs_ppm),
+  observed_ppm = obs_ppm,
+  RF = extract_pred_vals("RF"),
+  OK = extract_pred_vals("OK"),
+  RK = extract_pred_vals("RK")
+) %>%
+  pivot_longer(cols = all_of(methods), names_to = "method", values_to = "pred_raw") %>%
+  filter(is.finite(observed_ppm), is.finite(pred_raw))
+
+# -----------------------------
+# 5) DEBUG PRINTS: are rasters ppm or lbs?
+# -----------------------------
+cat("\n--- Observed P (validation) summary (ppm) ---\n")
+print(summary(pred_tbl$observed_ppm))
+
+cat("\n--- Predicted RAW P summary by method (whatever units raster is in) ---\n")
+print(pred_tbl %>% group_by(method) %>% summarise(
+  n = n(),
+  min = min(pred_raw, na.rm=TRUE),
+  q25 = quantile(pred_raw, 0.25, na.rm=TRUE),
+  med = median(pred_raw, na.rm=TRUE),
+  q75 = quantile(pred_raw, 0.75, na.rm=TRUE),
+  max = max(pred_raw, na.rm=TRUE)
+))
+
+cat("\n--- Quick ratio check: median(pred)/median(obs) ---\n")
+print(pred_tbl %>% group_by(method) %>% summarise(
+  ratio_med = median(pred_raw, na.rm=TRUE) / median(observed_ppm, na.rm=TRUE)
+))
+
+# If ratio ~2 (or >>2), your raster is probably NOT ppm.
+
+# -----------------------------
+# 6) Put OBSERVED and PREDICTED on same binning basis
+# -----------------------------
+if(bin_basis == "ppm"){
+  # interpret table thresholds as lbs/ac, convert thresholds -> ppm (your earlier approach)
+  p_ppm_breaks <- p_lbs_breaks
+  p_ppm_breaks[is.finite(p_ppm_breaks)] <- p_ppm_breaks[is.finite(p_ppm_breaks)] / lbs_per_ppm
+
+  cat("\nUsing bin_basis = ppm\n")
+  cat("lbs/ac per ppm:", round(lbs_per_ppm, 4), "\n")
+  cat("P thresholds (ppm):", paste(round(p_ppm_breaks, 2), collapse=" | "), "\n")
+
+  pred_tbl2 <- pred_tbl %>%
+    mutate(
+      obs_bin  = bin_P(observed_ppm, p_ppm_breaks),
+      pred_bin = bin_P(pred_raw,      p_ppm_breaks)
+    )
+
+} else {
+  # bin_basis == "lbs": convert observed ppm -> lbs/ac, and assume raster pred_raw is ALSO lbs/ac
+  # (This is the most likely fix if your rasters were already converted or are “furrow-slice-like”.)
+  cat("\nUsing bin_basis = lbs\n")
+  cat("lbs/ac per ppm factor:", round(lbs_per_ppm, 4), "\n")
+
+  pred_tbl2 <- pred_tbl %>%
+    mutate(
+      observed_lbs = observed_ppm * lbs_per_ppm,
+      obs_bin  = bin_P(observed_lbs, p_lbs_breaks),
+      pred_bin = bin_P(pred_raw,     p_lbs_breaks)
+    )
+}
+
+# -----------------------------
+# 7) Accuracy on bins (overall + within 1 bin)
+# -----------------------------
+mz_accuracy <- pred_tbl2 %>%
+  group_by(method) %>%
+  summarise(
+    n = n(),
+    accuracy = mean(obs_bin == pred_bin),
+    pct_accuracy = 100 * accuracy,
+    pct_within_1_bin = 100 * mean(abs(obs_bin - pred_bin) <= 1),
+    .groups = "drop"
+  )
+
+cat("\n--- Bin accuracy ---\n")
+print(mz_accuracy)
+
+cat("\n--- Counts table (like a confusion matrix) ---\n")
+print(pred_tbl2 %>% count(method, obs_bin, pred_bin) %>% arrange(method, obs_bin, pred_bin))
+
+```
+
+
+```{r}
+
+# -----------------------------
+# SETTINGS (same as your MZ chunk)
+# -----------------------------
+map_dir  <- "C:/git/Perry_surface_analysis/code/best_boot_maps"
+dataset  <- "SP"
+nutrient <- "p"
+methods  <- c("RF","OK","RK")
+P_0_15 <- read.csv("../LOCAL DATA DO NOT PUSH/Ap_hz_data/P_0_15_clean_test_02_10_2026.csv")  # must have Point, value_0_15
+depth_cm <- 15
+bd_gcm3  <- 1.33
+
+# Coastal Plain P thresholds (lbs/ac) from your table
+p_lbs_breaks <- c(0, 30, 60, 100, Inf)
+
+ppm_to_lbsac_factor <- function(depth_cm, bulk_density_gcm3 = 1.33){
+  area_m2 <- 4046.8564224
+  depth_m <- depth_cm / 100
+  bd_kgm3 <- bulk_density_gcm3 * 1000
+  soil_mass_kg <- area_m2 * depth_m * bd_kgm3
+  (soil_mass_kg * 2.2046226218) / 1e6
+}
+lbs_per_ppm <- ppm_to_lbsac_factor(depth_cm, bd_gcm3)
+
+# Convert lbs/ac breaks -> ppm breaks (0–15 cm support)
+p_ppm_breaks <- p_lbs_breaks
+p_ppm_breaks[is.finite(p_ppm_breaks)] <- p_ppm_breaks[is.finite(p_ppm_breaks)] / lbs_per_ppm
+
+cat("P breaks (lbs/ac):", paste(p_lbs_breaks, collapse=" | "), "\n")
+cat("P breaks (ppm)   :", paste(round(p_ppm_breaks, 2), collapse=" | "), "\n\n")
+
+# -----------------------------
+# 1) Observed P for validation = depth-weighted 0–15 cm per Point
+#    ASSUMES you already made P_0_15 with: Point, value_0_15
+# -----------------------------
+stopifnot(exists("validation_sf_fix"))
+stopifnot(exists("P_0_15"))
+stopifnot(all(c("Point","value_0_15") %in% names(P_0_15)))
+
+#rename P_0_15 Point to match validation_sf_fix
+P_0_15 <- P_0_15 %>%
+  rename(PointLabel = Point)
+
+val_pts <- validation_sf_fix %>%
+  left_join(P_0_15, by = "PointLabel") %>%
+  filter(is.finite(value_0_15))
+
+
+cat("Validation points with depth-harmonized P (0–15):", nrow(val_pts), "\n")
+
+# classify observed bins (1..4) using ppm thresholds
+bin_from_ppm <- function(x, breaks_ppm){
+  cut(x,
+      breaks = breaks_ppm,
+      include.lowest = TRUE,
+      right = TRUE,
+      labels = FALSE)
+}
+
+val_pts <- val_pts %>%
+  mutate(obs_bin = bin_from_ppm(value_0_15, p_ppm_breaks))
+
+# terra points object
+val_v <- terra::vect(val_pts)
+
+# -----------------------------
+# 2) Make / load zone rasters for each method and extract predicted bin
+#    IMPORTANT: classify zones based on ppm breaks (same as observed)
+# -----------------------------
+classify_P_zones_ppm <- function(r_ppm, breaks_ppm){
+  # output values 1..4
+  terra::classify(
+    r_ppm,
+    rcl = matrix(c(
+      -Inf, breaks_ppm[2], 1,
+      breaks_ppm[2], breaks_ppm[3], 2,
+      breaks_ppm[3], breaks_ppm[4], 3,
+      breaks_ppm[4],  Inf,          4
+    ), ncol = 3, byrow = TRUE),
+    include.lowest = TRUE,
+    right = TRUE
+  )
+}
+
+extract_pred_bin <- function(meth){
+
+  f <- file.path(map_dir, sprintf("%s_%s_%s_bestboot.tif", dataset, nutrient, meth))
+  stopifnot(file.exists(f))
+
+  r_ppm <- terra::rast(f)
+
+  # zone raster (1..4)
+  r_zone <- classify_P_zones_ppm(r_ppm, p_ppm_breaks)
+
+  # extract
+  ex <- terra::extract(r_zone, val_v)
+  pred_bin <- as.integer(ex[[2]])
+
+  tibble(
+    method = meth,
+    Point = val_pts$Point,
+    observed_ppm_0_15 = val_pts$value_0_15,
+    obs_bin = val_pts$obs_bin,
+    pred_bin = pred_bin
+  )
+}
+
+mz_val_long <- bind_rows(lapply(methods, extract_pred_bin)) %>%
+  filter(is.finite(obs_bin), is.finite(pred_bin))
+
+stopifnot(nrow(mz_val_long) > 0)
+
+# -----------------------------
+# 3) Accuracy metrics on bins
+# -----------------------------
+mz_metrics <- mz_val_long %>%
+  group_by(method) %>%
+  summarise(
+    n = n(),
+    accuracy = mean(pred_bin == obs_bin),
+    pct_accuracy = 100 * accuracy,
+    pct_within_1_bin = 100 * mean(abs(pred_bin - obs_bin) <= 1),
+    .groups = "drop"
+  )
+
+print(mz_metrics)
+
+# confusion-ish counts
+mz_counts <- mz_val_long %>%
+  count(method, obs_bin, pred_bin) %>%
+  arrange(method, obs_bin, pred_bin)
+
+print(mz_counts)
+
+# Optional: nice labels for bins
+bin_labels <- tibble(
+  bin = 1:4,
+  label = c("Low", "Medium", "High", "Very High")
+)
+
+mz_counts_labeled <- mz_counts %>%
+  left_join(bin_labels, by = c("obs_bin" = "bin")) %>%
+  rename(obs_label = label) %>%
+  left_join(bin_labels, by = c("pred_bin" = "bin")) %>%
+  rename(pred_label = label)
+
+print(mz_counts_labeled)
+```
 
 
 
