@@ -1,0 +1,1532 @@
+---
+title: "MZ_clusetering_analysis_03_12_2026"
+format: html
+---
+
+```{r, setup, include=FALSE}
+# --- Load libraries ---
+library(terra)
+library(tidyverse)
+library(sf)
+library(sp)
+library(gstat)
+library(randomForest)
+library(purrr)
+library(RColorBrewer)
+library(ggrepel)
+library(patchwork)
+library(blockCV)
+library(leaflet)
+library(tidytext)
+library(viridis)
+library(tibble)
+
+library(dbscan)
+library(uwot)
+```
+
+
+```{r}
+#structure:
+#data pull
+#run bootstrapped OK, RF, and RK on SP and COMP samples for each nutrient
+
+#run spatial blocking bootstrapping OK, RF, and RK on SP and COMP samples for each nutrient
+
+  #perform ensemble mapping on metrics of model performance (e.g., R2, RMSE) across bootstraps to identify best-performing method for each nutrient and dataset
+
+#run UMAP hdbscan bootstrapped OK, RF, and RK for SP and COMP for multinutrients.
+  #compare clusters across methods and datasets
+#Creation of management zones from clusters
+#Validation of management zones with independent soil data (e.g., Ap hz data)
+```
+
+```{r}
+# --- Load data ---
+covariate_stack <- rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
+
+# if you still need the sample coordinates / soil values from csv:
+soil_SP_raw <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_SP.csv")
+soil_C_raw  <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_C.csv")
+
+# Load carbon + nitrogen dataset
+soil_with_CN <- read_csv("../LOCAL DATA DO NOT PUSH/carbon/soil_data_with_CN.csv") %>%
+  rename(
+    c = leco_carbon_average,
+    n = leco_nitrogen_average
+  )
+
+# Split by sampling type
+SP_soil_with_CN <- soil_with_CN %>% filter(type == "SPID")
+C_soil_with_CN  <- soil_with_CN %>% filter(type == "CID")
+
+# Merge CN into point tables
+soil_SP_full <- soil_SP_raw %>%
+  select(x, y, lbc_1, lb_ceq, p_h_2, ca, k, mg, mn, p, zn) %>%
+  left_join(SP_soil_with_CN %>% select(x, y, c, n), by = c("x", "y"))
+
+soil_C_full <- soil_C_raw %>%
+  select(x, y, lbc_1, lb_ceq, p_h_2, ca, k, mg, mn, p, zn) %>%
+  left_join(C_soil_with_CN %>% select(x, y, c, n), by = c("x", "y"))
+
+soil_vars <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn","c","n")
+
+# Convert to sf in same CRS as raster
+soil_sf_SP <- st_as_sf(soil_SP_full, coords = c("x","y"), crs = 4326) %>%
+  st_transform(crs(covariate_stack))
+
+soil_sf_C <- st_as_sf(soil_C_full, coords = c("x","y"), crs = 4326) %>%
+  st_transform(crs(covariate_stack))
+
+# Extract raster covariates directly at sample points
+extract_covariates_to_sf <- function(sf_obj, rast_obj) {
+  vals <- terra::extract(rast_obj, terra::vect(sf_obj))
+  vals <- vals %>% dplyr::select(-ID)
+  bind_cols(sf_obj, vals)
+}
+
+soil_sf_SP <- extract_covariates_to_sf(soil_sf_SP, covariate_stack)
+soil_sf_C  <- extract_covariates_to_sf(soil_sf_C,  covariate_stack)
+
+# Define covariates from raster names only
+covariates <- names(covariate_stack)
+
+# Keep only numeric covariates that exist in both sf tables
+covariates <- covariates[covariates %in% names(soil_sf_SP)]
+
+```
+
+### Spatial Bootstrapping and Model Comparison
+
+```{r, warning=FALSE}
+
+# --- Spatial blocking function ---
+generate_spatial_bootstrap_block <- function(sf_data,
+                                             n_boot = 50,
+                                             train_frac = 0.7,
+                                             theRange = 50,
+                                             n_folds = 5,
+                                             seed = 123) {
+  set.seed(seed)
+
+  sb <- spatialBlock(
+    speciesData = sf_data,
+    theRange = theRange,
+    k = n_folds,
+    selection = "random",
+    showBlocks = FALSE,
+    progress = FALSE
+  )
+
+  sf_data$fold <- sb$foldID
+
+  boot_list <- vector("list", n_boot)
+
+  for (i in seq_len(n_boot)) {
+    n_train_folds <- max(1, ceiling(train_frac * n_folds))
+    train_folds <- sample(unique(sf_data$fold), n_train_folds)
+
+    df <- sf_data %>%
+      mutate(set = ifelse(fold %in% train_folds, "train", "test"))
+
+    # guard against empty split
+    if (sum(df$set == "train") == 0 || sum(df$set == "test") == 0) next
+
+    boot_list[[i]] <- df
+  }
+
+  boot_list <- boot_list[!map_lgl(boot_list, is.null)]
+  boot_list
+}
+
+# --- Safe R² function ---
+safe_cor2 <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  x <- x[ok]
+  y <- y[ok]
+  
+  if (length(x) < 3 || length(y) < 3) return(NA_real_)
+  if (stats::var(x) == 0 || stats::var(y) == 0) return(0)
+  
+  suppressWarnings(cor(x, y)^2)
+}
+  #uses correlation with complete.obs to avoid NA issues... but I am not sure if this is the best way to handle it.
+
+# --- Generate bootstraps ---
+# Estimate an average variogram range first if you have it
+# e.g., from your variogram fits:
+# mean_range <- mean(fit_variograms$range, na.rm = TRUE)
+# Otherwise start with 50 m as a field-scale approximation
+
+boot_SP <- generate_spatial_bootstrap_block(soil_sf_SP,
+                                            n_boot = 50,
+                                            train_frac = 0.7,
+                                            theRange = 50,
+                                            n_folds = 5)
+
+boot_C  <- generate_spatial_bootstrap_block(soil_sf_C,
+                                            n_boot = 50,
+                                            train_frac = 0.7,
+                                            theRange = 50,
+                                            n_folds = 5)
+
+
+# --- Random Forest function ---
+run_RF <- function(boot_list, covariates, soil_vars) {
+  results <- list()
+
+  for (var in soil_vars) {
+    boot_results <- map(boot_list, function(df) {
+      train_df <- st_drop_geometry(df %>% filter(set == "train")) %>%
+        select(all_of(c(covariates, var))) %>%
+        na.omit()
+
+      test_df <- st_drop_geometry(df %>% filter(set == "test")) %>%
+        select(all_of(c(covariates, var))) %>%
+        na.omit()
+
+      if (nrow(train_df) < 5 || nrow(test_df) < 5) {
+        return(list(RMSE = NA_real_, R2 = NA_real_))
+      }
+
+      rf_model <- randomForest(
+        x = train_df[, covariates, drop = FALSE],
+        y = train_df[[var]],
+        ntree = 500
+      )
+
+      pred <- predict(rf_model, newdata = test_df[, covariates, drop = FALSE])
+
+      list(
+        model = rf_model,
+        pred = pred,
+        RMSE = sqrt(mean((pred - test_df[[var]])^2, na.rm = TRUE)),
+        R2 = safe_cor2(pred, test_df[[var]])
+      )
+    })
+
+    results[[var]] <- boot_results
+  }
+
+  results
+}
+# --- Ordinary Kriging function with fallback ---
+# --- Ordinary Kriging function with fallback (always returns R² even if only nugget) ---
+run_OK_safe <- function(boot_list, soil_vars) {
+  results <- list()
+
+  for (var in soil_vars) {
+    boot_results <- map(boot_list, function(df) {
+      train_sf <- df %>% filter(set == "train")
+      test_sf  <- df %>% filter(set == "test")
+
+      train_sf <- train_sf %>% filter(is.finite(.data[[var]]))
+      test_sf  <- test_sf  %>% filter(is.finite(.data[[var]]))
+
+      if (nrow(train_sf) < 5 || nrow(test_sf) < 1) {
+        return(list(RMSE = NA_real_, R2 = NA_real_))
+      }
+
+      train_vals <- train_sf[[var]]
+      test_vals  <- test_sf[[var]]
+
+      if (length(unique(train_vals)) <= 1) {
+        pred <- rep(mean(train_vals, na.rm = TRUE), nrow(test_sf))
+        return(list(
+          pred = pred,
+          RMSE = sqrt(mean((pred - test_vals)^2, na.rm = TRUE)),
+          R2 = safe_cor2(pred, test_vals)
+        ))
+      }
+
+      vgm_model <- tryCatch({
+        v_emp <- variogram(as.formula(paste(var, "~ 1")), train_sf)
+        fit.variogram(
+          v_emp,
+          vgm(
+            psill = stats::var(train_vals, na.rm = TRUE),
+            model = "Exp",
+            nugget = 0.1,
+            range = max(v_emp$dist, na.rm = TRUE) / 3
+          )
+        )
+      }, error = function(e) NULL)
+
+      if (is.null(vgm_model)) {
+        vgm_model <- vgm(
+          psill = stats::var(train_vals, na.rm = TRUE),
+          model = "Nug",
+          nugget = 0.1
+        )
+      }
+
+      ok_pred <- tryCatch({
+        krige(as.formula(paste(var, "~ 1")), train_sf, test_sf, model = vgm_model)
+      }, error = function(e) NULL)
+
+      pred <- if (!is.null(ok_pred) && "var1.pred" %in% names(ok_pred)) {
+        ok_pred$var1.pred
+      } else {
+        rep(mean(train_vals, na.rm = TRUE), nrow(test_sf))
+      }
+
+      list(
+        pred = pred,
+        RMSE = sqrt(mean((pred - test_vals)^2, na.rm = TRUE)),
+        R2 = safe_cor2(pred, test_vals)
+      )
+    })
+
+    results[[var]] <- boot_results
+  }
+
+  results
+}
+
+
+# --- Regression Kriging function with fallback ---
+run_RK_safe <- function(boot_list, covariates, soil_vars) {
+  results <- list()
+
+  for (var in soil_vars) {
+    boot_results <- map(boot_list, function(df) {
+      train_sf <- df %>%
+        filter(set == "train") %>%
+        mutate(.row_id = row_number())
+
+      test_sf <- df %>%
+        filter(set == "test") %>%
+        mutate(.row_id = row_number())
+
+      train_df <- st_drop_geometry(train_sf) %>%
+        select(.row_id, all_of(c(covariates, var))) %>%
+        na.omit()
+
+      test_df <- st_drop_geometry(test_sf) %>%
+        select(.row_id, all_of(c(covariates, var))) %>%
+        na.omit()
+
+      if (nrow(train_df) < 5 || nrow(test_df) < 5) {
+        return(list(RMSE = NA_real_, R2 = NA_real_))
+      }
+
+      train_sf2 <- train_sf %>% filter(.row_id %in% train_df$.row_id)
+      test_sf2  <- test_sf  %>% filter(.row_id %in% test_df$.row_id)
+
+      rf_model <- randomForest(
+        x = train_df[, covariates, drop = FALSE],
+        y = train_df[[var]],
+        ntree = 500
+      )
+
+      trend_train <- predict(rf_model, newdata = train_df[, covariates, drop = FALSE])
+      trend_test  <- predict(rf_model, newdata = test_df[, covariates, drop = FALSE])
+
+      residuals_train <- train_df[[var]] - trend_train
+      train_res_sf <- train_sf2 %>% mutate(residuals = residuals_train)
+
+      vgm_model <- tryCatch({
+        v_emp <- variogram(residuals ~ 1, train_res_sf)
+        fit.variogram(
+          v_emp,
+          vgm(
+            psill = stats::var(residuals_train, na.rm = TRUE),
+            model = "Exp",
+            nugget = 0.1,
+            range = max(v_emp$dist, na.rm = TRUE) / 3
+          )
+        )
+      }, error = function(e) NULL)
+
+      if (is.null(vgm_model)) {
+        vgm_model <- vgm(
+          psill = stats::var(residuals_train, na.rm = TRUE),
+          model = "Nug",
+          nugget = 0.1
+        )
+      }
+
+      rk_pred <- tryCatch({
+        krige(residuals ~ 1, train_res_sf, test_sf2, model = vgm_model)
+      }, error = function(e) NULL)
+
+      resid_test <- if (!is.null(rk_pred) && "var1.pred" %in% names(rk_pred)) {
+        rk_pred$var1.pred
+      } else {
+        rep(0, nrow(test_sf2))
+      }
+
+      final_pred <- trend_test + resid_test
+
+      list(
+        RMSE = sqrt(mean((final_pred - test_df[[var]])^2, na.rm = TRUE)),
+        R2 = safe_cor2(final_pred, test_df[[var]])
+      )
+    })
+
+    results[[var]] <- boot_results
+  }
+
+  results
+}
+
+# --- Run all methods ---
+RF_results_SP <- run_RF(boot_SP, covariates, soil_vars)
+RF_results_C  <- run_RF(boot_C, covariates, soil_vars)
+OK_results_SP <- run_OK_safe(boot_SP, soil_vars)
+OK_results_C  <- run_OK_safe(boot_C, soil_vars)
+RK_results_SP <- run_RK_safe(boot_SP, covariates, soil_vars)
+RK_results_C  <- run_RK_safe(boot_C, covariates, soil_vars)
+
+# --- Function to extract metrics ---
+extract_metrics <- function(results_list, dataset_name){
+  map_dfr(names(results_list), function(var){
+    res <- results_list[[var]]
+    tibble(variable=var, RMSE=map_dbl(res,"RMSE"), R2=map_dbl(res,"R2"))
+  }) %>% mutate(dataset=dataset_name)
+}
+rf_metrics_all <- bind_rows(extract_metrics(RF_results_SP, "SP"),
+                            extract_metrics(RF_results_C, "C"))
+ok_metrics_all <- bind_rows(extract_metrics(OK_results_SP, "SP"),
+                            extract_metrics(OK_results_C, "C"))
+rk_metrics_all <- bind_rows(extract_metrics(RK_results_SP, "SP"),
+                            extract_metrics(RK_results_C, "C"))
+
+# --- Combine all for plotting ---
+combined_metrics <- bind_rows(rf_metrics_all %>% mutate(method="RF"),
+                              ok_metrics_all %>% mutate(method="OK"),
+                              rk_metrics_all %>% mutate(method="RK")) %>%
+  pivot_longer(cols=c(RMSE,R2), names_to="metric", values_to="value")
+
+# --- Plot ---
+
+ggplot(combined_metrics, aes(x=variable, y=value, fill=dataset)) +
+  geom_violin(trim=FALSE, alpha=0.6) +
+  geom_boxplot(width=0.1, position=position_dodge(width=0.9), outlier.shape=NA) +
+  theme_minimal(base_size=13) +
+  labs(title="Distribution of RMSE and R² across nutrients - All Methods",
+       x="Nutrient", y="Value") +
+  scale_fill_brewer(palette="Set2") +
+  facet_grid(metric~method, scales="free_y")
+
+```
+
+```{r}
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+extract_metrics_iter <- function(results_list, dataset_name, method_name) {
+  map_dfr(names(results_list), function(var) {
+    res <- results_list[[var]]
+    tibble(
+      variable = var,
+      iteration = seq_along(res),
+      RMSE = map_dbl(res, ~ .x$RMSE %||% NA_real_),
+      R2   = map_dbl(res, ~ .x$R2   %||% NA_real_)
+    )
+  }) %>%
+    mutate(
+      dataset = dataset_name,
+      method = method_name
+    )
+}
+
+metrics_all <- bind_rows(
+  extract_metrics_iter(RF_results_SP, "SP", "RF"),
+  extract_metrics_iter(RF_results_C,  "C",  "RF"),
+  extract_metrics_iter(OK_results_SP, "SP", "OK"),
+  extract_metrics_iter(OK_results_C,  "C",  "OK"),
+  extract_metrics_iter(RK_results_SP, "SP", "RK"),
+  extract_metrics_iter(RK_results_C,  "C",  "RK")
+)
+
+
+select_best_iterations <- function(metrics_tbl, top_frac = 0.25, n_fallback = 5) {
+  
+  metrics_tbl %>%
+    filter(is.finite(RMSE), is.finite(R2)) %>%
+    group_by(dataset, variable, method) %>%
+    mutate(
+      r2_cut   = quantile(R2, probs = 1 - top_frac, na.rm = TRUE),
+      rmse_cut = quantile(RMSE, probs = top_frac, na.rm = TRUE)
+    ) %>%
+    mutate(
+      keep = R2 >= r2_cut & RMSE <= rmse_cut
+    ) %>%
+    mutate(
+      rmse_score = ifelse(
+        max(RMSE, na.rm = TRUE) == min(RMSE, na.rm = TRUE),
+        1,
+        (max(RMSE, na.rm = TRUE) - RMSE) /
+          (max(RMSE, na.rm = TRUE) - min(RMSE, na.rm = TRUE))
+      ),
+      r2_score = ifelse(
+        max(R2, na.rm = TRUE) == min(R2, na.rm = TRUE),
+        1,
+        (R2 - min(R2, na.rm = TRUE)) /
+          (max(R2, na.rm = TRUE) - min(R2, na.rm = TRUE))
+      ),
+      score = 0.5 * rmse_score + 0.5 * r2_score
+    ) %>%
+    arrange(dataset, variable, method, desc(score)) %>%
+    group_by(dataset, variable, method) %>%
+    mutate(
+      keep = ifelse(sum(keep, na.rm = TRUE) == 0 & row_number() <= n_fallback, TRUE, keep)
+    ) %>%
+    filter(keep) %>%
+    mutate(
+      weight = score / sum(score, na.rm = TRUE)
+    ) %>%
+    ungroup()
+}
+
+selected_iters <- select_best_iterations(metrics_all, top_frac = 0.25, n_fallback = 5)
+covariates_use <- intersect(covariates, names(covariate_stack))
+build_final_method_ensemble <- function(dataset_name, method_name, variable_name,
+                                        selected_iters, boot_SP, boot_C,
+                                        covariates_use, covariate_stack) {
+  
+  boot_list <- switch(
+    dataset_name,
+    "SP" = boot_SP,
+    "C"  = boot_C,
+    stop("dataset_name must be 'SP' or 'C'")
+  )
+  
+  sel <- selected_iters %>%
+    filter(dataset == dataset_name,
+           method == method_name,
+           variable == variable_name)
+  
+  if (nrow(sel) == 0) return(NULL)
+  
+  template_rast <- covariate_stack[[1]]
+  ensemble_rast <- NULL
+  
+  for (i in seq_len(nrow(sel))) {
+    iter_id <- sel$iteration[i]
+    w <- sel$weight[i]
+    df_boot <- boot_list[[iter_id]]
+    r_pred <- NULL
+    
+    if (method_name == "RF") {
+      train_df <- st_drop_geometry(df_boot %>% filter(set == "train")) %>%
+        select(all_of(c(covariates_use, variable_name))) %>%
+        na.omit()
+      
+      if (nrow(train_df) >= 5) {
+        rf_model <- randomForest(
+          x = train_df[, covariates_use, drop = FALSE],
+          y = train_df[[variable_name]],
+          ntree = 500
+        )
+        
+        r_pred <- terra::predict(
+          covariate_stack[[covariates_use]],
+          rf_model,
+          fun = function(model, data) {
+            data <- as.data.frame(data)
+            predict(model, newdata = data)
+          },
+          na.rm = TRUE
+        )
+      }
+    }
+    
+    if (method_name == "OK") {
+      train_sf <- df_boot %>%
+        filter(set == "train", is.finite(.data[[variable_name]]))
+      
+      vals <- train_sf[[variable_name]]
+      
+      if (nrow(train_sf) >= 5 && length(unique(vals)) > 1) {
+        vgm_model <- tryCatch({
+          v_emp <- variogram(as.formula(paste(variable_name, "~ 1")), train_sf)
+          fit.variogram(
+            v_emp,
+            vgm(
+              psill = stats::var(vals, na.rm = TRUE),
+              model = "Exp",
+              nugget = 0.1,
+              range = max(v_emp$dist, na.rm = TRUE) / 3
+            )
+          )
+        }, error = function(e) NULL)
+        
+        if (is.null(vgm_model)) {
+          vgm_model <- vgm(
+            psill = stats::var(vals, na.rm = TRUE),
+            model = "Nug",
+            nugget = 0.1
+          )
+        }
+        
+        grid_pts <- terra::as.points(template_rast, values = FALSE)
+        grid_sf  <- sf::st_as_sf(grid_pts)
+        
+        ok_pred <- tryCatch({
+          krige(as.formula(paste(variable_name, "~ 1")), train_sf, grid_sf, model = vgm_model)
+        }, error = function(e) NULL)
+        
+        if (!is.null(ok_pred) && "var1.pred" %in% names(ok_pred)) {
+          pred_vect <- terra::vect(ok_pred)
+          r_pred <- terra::rasterize(pred_vect, template_rast, field = "var1.pred")
+        }
+      }
+    }
+    
+    if (method_name == "RK") {
+      train_sf <- df_boot %>%
+        filter(set == "train") %>%
+        mutate(.row_id = row_number())
+      
+      train_df <- st_drop_geometry(train_sf) %>%
+        select(.row_id, all_of(c(covariates_use, variable_name))) %>%
+        na.omit()
+      
+      if (nrow(train_df) >= 5) {
+        train_sf2 <- train_sf %>% filter(.row_id %in% train_df$.row_id)
+        
+        rf_model <- randomForest(
+          x = train_df[, covariates_use, drop = FALSE],
+          y = train_df[[variable_name]],
+          ntree = 500
+        )
+        
+        trend_train <- predict(rf_model, newdata = train_df[, covariates_use, drop = FALSE])
+        residuals_train <- train_df[[variable_name]] - trend_train
+        
+        trend_rast <- terra::predict(
+          covariate_stack[[covariates_use]],
+          rf_model,
+          fun = function(model, data) {
+            data <- as.data.frame(data)
+            predict(model, newdata = data)
+          },
+          na.rm = TRUE
+        )
+        
+        train_res_sf <- train_sf2 %>% mutate(residuals = residuals_train)
+        
+        vgm_model <- tryCatch({
+          v_emp <- variogram(residuals ~ 1, train_res_sf)
+          fit.variogram(
+            v_emp,
+            vgm(
+              psill = stats::var(residuals_train, na.rm = TRUE),
+              model = "Exp",
+              nugget = 0.1,
+              range = max(v_emp$dist, na.rm = TRUE) / 3
+            )
+          )
+        }, error = function(e) NULL)
+        
+        if (is.null(vgm_model)) {
+          vgm_model <- vgm(
+            psill = stats::var(residuals_train, na.rm = TRUE),
+            model = "Nug",
+            nugget = 0.1
+          )
+        }
+        
+        grid_pts <- terra::as.points(template_rast, values = FALSE)
+        grid_sf  <- sf::st_as_sf(grid_pts)
+        
+        rk_resid <- tryCatch({
+          krige(residuals ~ 1, train_res_sf, grid_sf, model = vgm_model)
+        }, error = function(e) NULL)
+        
+        if (!is.null(rk_resid) && "var1.pred" %in% names(rk_resid)) {
+          resid_vect <- terra::vect(rk_resid)
+          resid_rast <- terra::rasterize(resid_vect, template_rast, field = "var1.pred")
+        } else {
+          resid_rast <- trend_rast * 0
+        }
+        
+        r_pred <- trend_rast + resid_rast
+      }
+    }
+    
+    if (!is.null(r_pred)) {
+      ensemble_rast <- if (is.null(ensemble_rast)) r_pred * w else ensemble_rast + (r_pred * w)
+    }
+  }
+  
+  if (!is.null(ensemble_rast)) {
+    names(ensemble_rast) <- paste(dataset_name, method_name, variable_name, "ensemble", sep = "_")
+  }
+  
+  ensemble_rast
+}
+final_ensemble_rasters <- list()
+
+for (ds in c("SP", "C")) {
+  final_ensemble_rasters[[ds]] <- list()
+  
+  for (meth in c("RF", "OK", "RK")) {
+    final_ensemble_rasters[[ds]][[meth]] <- list()
+    
+    for (v in soil_vars) {
+      cat("Building final ensemble:", ds, meth, v, "\n")
+      
+      final_ensemble_rasters[[ds]][[meth]][[v]] <- build_final_method_ensemble(
+        dataset_name = ds,
+        method_name = meth,
+        variable_name = v,
+        selected_iters = selected_iters,
+        boot_SP = boot_SP,
+        boot_C = boot_C,
+        covariates_use = covariates_use,
+        covariate_stack = covariate_stack
+      )
+    }
+  }
+}
+
+
+#plot all:
+par(mfrow = c(3, 3))
+
+for (ds in names(final_ensemble_rasters)) {
+  for (meth in names(final_ensemble_rasters[[ds]])) {
+    for (v in names(final_ensemble_rasters[[ds]][[meth]])) {
+      r <- final_ensemble_rasters[[ds]][[meth]][[v]]
+      if (!is.null(r)) {
+        plot(r, main = paste(ds, meth, v))
+      }
+    }
+  }
+}
+```
+```{r}
+# make output folder
+dir.create("../outputs/raw_ensemble_rasters", recursive = TRUE, showWarnings = FALSE)
+
+for (ds in names(final_ensemble_rasters)) {
+  for (meth in names(final_ensemble_rasters[[ds]])) {
+    for (v in names(final_ensemble_rasters[[ds]][[meth]])) {
+      
+      r_obj <- final_ensemble_rasters[[ds]][[meth]][[v]]
+      if (is.null(r_obj)) next
+      
+      out_file <- file.path(
+        "../outputs/raw_ensemble_rasters",
+        paste0(ds, "_", meth, "_", v, "_ensemble.tif")
+      )
+      
+      terra::writeRaster(r_obj, out_file, overwrite = TRUE)
+    }
+  }
+}
+```
+
+
+```{r}
+create_single_nutrient_zones <- function(r, var_name, k = 3, seed = 123, sample_n = 10000) {
+  if (is.null(r)) return(NULL)
+  
+  vals <- terra::values(r, na.rm = FALSE, mat = FALSE)
+  ok <- is.finite(vals)
+  
+  if (sum(ok) < k) return(NULL)
+  
+  v <- vals[ok]
+  
+  # skip constant rasters
+  if (length(unique(v)) < 2) return(NULL)
+  
+  k_use <- min(k, length(unique(v)))
+  if (k_use < 2) return(NULL)
+  
+  # fit kmeans on a sample, not all pixels
+  set.seed(seed)
+  if (length(v) > sample_n) {
+    v_fit <- sample(v, sample_n)
+  } else {
+    v_fit <- v
+  }
+  
+  km <- kmeans(matrix(v_fit, ncol = 1), centers = k_use, nstart = 25)
+  
+  # order clusters low -> high so zone 1 is always low
+  center_order <- order(km$centers[, 1])
+  ordered_centers <- km$centers[center_order, 1]
+  
+  # assign every valid pixel to nearest ordered center
+  dmat <- sapply(seq_along(ordered_centers), function(j) {
+    (v - ordered_centers[j])^2
+  })
+  dmat <- as.matrix(dmat)
+  if (is.vector(dmat)) dmat <- matrix(dmat, ncol = 1)
+  
+  zone_id <- max.col(-dmat, ties.method = "first")
+  
+  zone_vals <- rep(NA_integer_, length(vals))
+  zone_vals[ok] <- zone_id
+  
+  zone_r <- r
+  terra::values(zone_r) <- zone_vals
+  names(zone_r) <- paste0(var_name, "_zones")
+  
+  list(
+    raster = zone_r,
+    centers = ordered_centers,
+    model = km
+  )
+}
+
+single_nutrient_zones <- list()
+
+for (ds in c("SP", "C")) {
+  single_nutrient_zones[[ds]] <- list()
+  
+  for (meth in c("RF", "OK", "RK")) {
+    single_nutrient_zones[[ds]][[meth]] <- list()
+    
+    for (v in soil_vars) {
+      cat("Creating single-nutrient zones for", ds, meth, v, "\n")
+      
+      r <- final_ensemble_rasters[[ds]][[meth]][[v]]
+      
+      single_nutrient_zones[[ds]][[meth]][[v]] <- tryCatch({
+        create_single_nutrient_zones(
+          r = r,
+          var_name = v,
+          k = 3,
+          seed = 123,
+          sample_n = 10000
+        )
+      }, error = function(e) {
+        message("Failed for ", ds, " ", meth, " ", v, ": ", e$message)
+        NULL
+      })
+    }
+  }
+}
+
+plot_all_single_nutrient_zones <- function(zone_list, soil_vars,
+                                           datasets = c("SP", "C"),
+                                           methods = c("RF", "OK", "RK"),
+                                           ncol = 3, nrow = 3) {
+  
+  maps_per_page <- ncol * nrow
+  
+  plot_items <- list()
+  
+  for (ds in datasets) {
+    for (meth in methods) {
+      for (v in soil_vars) {
+        z <- zone_list[[ds]][[meth]][[v]]
+        if (!is.null(z) && !is.null(z$raster)) {
+          plot_items[[length(plot_items) + 1]] <- list(
+            raster = z$raster,
+            title = paste(ds, meth, v)
+          )
+        }
+      }
+    }
+  }
+  
+  if (length(plot_items) == 0) {
+    message("No zone rasters available to plot.")
+    return(invisible(NULL))
+  }
+  
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+  
+  for (i in seq(1, length(plot_items), by = maps_per_page)) {
+    idx <- i:min(i + maps_per_page - 1, length(plot_items))
+    
+    par(mfrow = c(nrow, ncol), mar = c(2, 2, 3, 4))
+    
+    for (j in idx) {
+      plot(plot_items[[j]]$raster, main = plot_items[[j]]$title)
+    }
+  }
+}
+
+plot_all_single_nutrient_zones(
+  zone_list = single_nutrient_zones,
+  soil_vars = soil_vars,
+  datasets = c("SP", "C"),
+  methods = c("RF", "OK", "RK"),
+  ncol = 3,
+  nrow = 3
+)
+```
+
+
+
+
+```{r}
+#umap multinutrient:
+build_method_stack <- function(final_ensemble_rasters, dataset_name, method_name, soil_vars) {
+  rast_list <- list()
+  
+  for (v in soil_vars) {
+    r <- final_ensemble_rasters[[dataset_name]][[method_name]][[v]]
+    if (!is.null(r)) rast_list[[v]] <- r
+  }
+  
+  if (length(rast_list) == 0) return(NULL)
+  
+  out <- rast(rast_list)
+  names(out) <- names(rast_list)
+  out
+}
+filter_stack_by_completeness <- function(r_stack, max_na_prop = 0.4) {
+  keep <- sapply(names(r_stack), function(nm) {
+    vals <- terra::values(r_stack[[nm]], mat = FALSE)
+    mean(is.na(vals)) <= max_na_prop
+  })
+  
+  r_stack[[names(r_stack)[keep]]]
+}
+
+mask_to_common_support <- function(r_stack) {
+  valid_sum <- sum(!is.na(r_stack))
+  common_mask <- valid_sum == nlyr(r_stack)
+  terra::mask(r_stack, common_mask, maskvalues = 0)
+}
+build_method_stack <- function(final_ensemble_rasters, dataset_name, method_name, soil_vars) {
+  rast_list <- list()
+  
+  for (v in soil_vars) {
+    r <- final_ensemble_rasters[[dataset_name]][[method_name]][[v]]
+    if (!is.null(r)) {
+      vals <- terra::values(r, mat = FALSE)
+      if (sum(!is.na(vals)) > 0) {
+        rast_list[[v]] <- r
+      } else {
+        message("Dropping ", dataset_name, " ", method_name, " ", v, " because it has 0 valid cells.")
+      }
+    }
+  }
+  
+  if (length(rast_list) == 0) return(NULL)
+  
+  out <- terra::rast(rast_list)
+  names(out) <- names(rast_list)
+  out
+}
+sample_raster_pixels <- function(r_stack, n = 20000, seed = 123) {
+  set.seed(seed)
+  
+  samp <- terra::spatSample(
+    r_stack,
+    size = n,
+    method = "random",
+    na.rm = TRUE,
+    as.df = TRUE,
+    warn = FALSE
+  )
+  
+  samp <- as.data.frame(samp)
+  
+  # keep only actual raster layer columns
+  samp <- samp[, names(r_stack), drop = FALSE]
+  
+  # remove incomplete rows
+  samp <- samp[complete.cases(samp), , drop = FALSE]
+  
+  samp
+}
+
+fit_sample_kmeans_zones <- function(sample_df, k = 4, seed = 123) {
+  sample_df <- as.data.frame(sample_df)
+  
+  if (nrow(sample_df) == 0) {
+    stop("No sampled pixels available after NA filtering.")
+  }
+  
+  # keep numeric columns only
+  sample_df <- sample_df[, vapply(sample_df, is.numeric, logical(1)), drop = FALSE]
+  
+  if (ncol(sample_df) == 0) {
+    stop("No numeric raster layers available for clustering.")
+  }
+  
+  # drop zero-variance columns
+  keep <- vapply(sample_df, function(x) {
+    sx <- sd(x, na.rm = TRUE)
+    is.finite(sx) && sx > 0
+  }, logical(1))
+  
+  sample_df <- sample_df[, keep, drop = FALSE]
+  
+  if (ncol(sample_df) == 0) {
+    stop("All sampled raster layers had zero variance.")
+  }
+  
+  # if too few rows, reduce k
+  k_use <- min(k, nrow(sample_df))
+  if (k_use < 2) {
+    stop("Too few sampled pixels to create 2 or more clusters.")
+  }
+  
+  x <- scale(sample_df)
+  
+  set.seed(seed)
+  km <- kmeans(x, centers = k_use, nstart = 25)
+  
+  list(
+    model = km,
+    centers = km$centers,
+    scale_center = attr(x, "scaled:center"),
+    scale_scale  = attr(x, "scaled:scale"),
+    kept_names = colnames(sample_df),
+    sample_scaled = x,
+    sample_cluster = km$cluster
+  )
+}
+
+assign_raster_to_centroids <- function(r_stack, zone_fit, filename = NULL, overwrite = TRUE) {
+  
+  centers <- as.matrix(zone_fit$centers)
+  scale_center <- zone_fit$scale_center
+  scale_scale  <- zone_fit$scale_scale
+  
+  zone_fun <- function(v) {
+    if (is.null(dim(v))) {
+      v <- matrix(v, ncol = length(scale_center), byrow = TRUE)
+    } else {
+      v <- as.matrix(v)
+    }
+    
+    out <- rep(NA_integer_, nrow(v))
+    ok <- complete.cases(v)
+    if (!any(ok)) return(out)
+    
+    x <- v[ok, , drop = FALSE]
+    x_scaled <- sweep(x, 2, scale_center, "-")
+    x_scaled <- sweep(x_scaled, 2, scale_scale, "/")
+    
+    dmat <- vapply(seq_len(nrow(centers)), function(j) {
+      rowSums((x_scaled - matrix(
+        centers[j, ],
+        nrow = nrow(x_scaled),
+        ncol = ncol(x_scaled),
+        byrow = TRUE
+      ))^2)
+    }, FUN.VALUE = numeric(nrow(x_scaled)))
+    
+    dmat <- as.matrix(dmat)
+    if (nrow(dmat) != nrow(x_scaled)) dmat <- t(dmat)
+    
+    out[ok] <- max.col(-dmat, ties.method = "first")
+    out
+  }
+  
+  if (is.null(filename)) {
+    z <- terra::app(
+      r_stack,
+      fun = zone_fun
+    )
+  } else {
+    z <- terra::app(
+      r_stack,
+      fun = zone_fun,
+      filename = filename,
+      overwrite = overwrite,
+      wopt = list(datatype = "INT2S")
+    )
+  }
+  
+  names(z) <- "management_zone"
+  z
+}
+
+management_zone_rasters <- list()
+
+for (ds in c("SP", "C")) {
+  management_zone_rasters[[ds]] <- list()
+  
+  for (meth in c("RF", "OK", "RK")) {
+    cat("Creating zones for", ds, meth, "\n")
+    
+    management_zone_rasters[[ds]][[meth]] <- tryCatch({
+      r_stack <- build_method_stack(final_ensemble_rasters, ds, meth, soil_vars)
+      if (is.null(r_stack)) stop("No usable layers in stack.")
+      
+      r_stack <- filter_stack_by_completeness(r_stack, max_na_prop = 0.4)
+      if (is.null(r_stack) || terra::nlyr(r_stack) < 2) {
+        stop("Fewer than 2 usable layers after completeness filtering.")
+      }
+      
+      r_stack <- mask_to_common_support(r_stack)
+      
+      samp <- sample_raster_pixels(r_stack, n = 10000, seed = 123)
+      if (nrow(samp) < 10) {
+        stop("Too few complete sampled pixels after filtering.")
+      }
+      
+      fit <- fit_sample_kmeans_zones(samp, k = 4, seed = 123)
+      r_stack_use <- r_stack[[fit$kept_names]]
+      
+      assign_raster_to_centroids(
+        r_stack = r_stack_use,
+        zone_fit = fit
+      )
+    }, error = function(e) {
+      message("Failed for ", ds, " ", meth, ": ", e$message)
+      NULL
+    })
+  }
+}
+
+zone_cols <- c("grey80", "#1b9e77", "#d95f02", "#7570b3", "#e7298a", "#66a61e")
+
+par(mfrow = c(2, 3), mar = c(3, 3, 3, 5))
+
+for (ds in c("SP", "C")) {
+  for (meth in c("RF", "OK", "RK")) {
+    z <- management_zone_rasters[[ds]][[meth]]
+    
+    if (!is.null(z)) {
+      plot(z, main = paste(ds, meth), col = zone_cols)
+    } else {
+      plot(NA, NA, main = paste(ds, meth), xlim = c(0, 1), ylim = c(0, 1))
+      text(0.5, 0.5, "No zones", cex = 1.5)
+    }  }  }
+
+```
+
+
+```{r}
+
+#validation
+
+#load validation data:
+  hz_0_15_wide <- read_csv("../LOCAL DATA DO NOT PUSH/Ap_hz_data/perry_Ap_hz_0_15cm_depth_func_02_10_2026.csv")
+# pick one zone raster just to grab CRS
+template_zone <- management_zone_rasters$SP$RF
+
+# validation points: likely EPSG:3857, then transform to raster CRS
+hz_0_15_sf <- hz_0_15_wide %>%
+  st_as_sf(coords = c("POINT_X", "POINT_Y"), crs = 3857) %>%
+  st_transform(crs(template_zone))
+st_crs(hz_0_15_sf)
+crs(template_zone)
+
+extract_zone_ids <- function(zone_raster, pts_sf, zone_name) {
+  vals <- terra::extract(zone_raster, terra::vect(pts_sf))
+  pts_sf[[zone_name]] <- vals[, 2]
+  pts_sf
+}
+
+hz_val <- hz_0_15_sf
+
+hz_val <- extract_zone_ids(management_zone_rasters$SP$RF, hz_val, "zone_SP_RF")
+hz_val <- extract_zone_ids(management_zone_rasters$SP$OK, hz_val, "zone_SP_OK")
+hz_val <- extract_zone_ids(management_zone_rasters$SP$RK, hz_val, "zone_SP_RK")
+
+hz_val <- extract_zone_ids(management_zone_rasters$C$RF, hz_val, "zone_C_RF")
+hz_val <- extract_zone_ids(management_zone_rasters$C$OK, hz_val, "zone_C_OK")
+hz_val <- extract_zone_ids(management_zone_rasters$C$RK, hz_val, "zone_C_RK")
+
+validate_zone_variable <- function(df, zone_col, var_col) {
+  dat <- df %>%
+    st_drop_geometry() %>%
+    select(all_of(c(zone_col, var_col))) %>%
+    filter(!is.na(.data[[zone_col]]), !is.na(.data[[var_col]]))
+  
+  if (nrow(dat) < 5 || dplyr::n_distinct(dat[[zone_col]]) < 2) {
+    return(tibble(
+      zone = zone_col,
+      variable = var_col,
+      n = nrow(dat),
+      n_zones = dplyr::n_distinct(dat[[zone_col]]),
+      p_value = NA_real_,
+      statistic = NA_real_
+    ))
+  }
+  
+  kw <- kruskal.test(dat[[var_col]] ~ as.factor(dat[[zone_col]]))
+  
+  tibble(
+    zone = zone_col,
+    variable = var_col,
+    n = nrow(dat),
+    n_zones = dplyr::n_distinct(dat[[zone_col]]),
+    p_value = kw$p.value,
+    statistic = as.numeric(kw$statistic)
+  )
+}
+
+zone_cols <- c("zone_SP_RF", "zone_SP_OK", "zone_SP_RK",
+               "zone_C_RF", "zone_C_OK", "zone_C_RK")
+
+val_vars <- c("Ca_0_15", "K_0_15", "Mg_0_15", "Mn_0_15", "P_0_15",
+              "Zn_0_15", "pH.2_0_15", "LBC.1_0_15", "LBCeq_0_15",
+              "C_pct_0_15", "N_pct_0_15")
+
+zone_validation_results <- purrr::map_dfr(zone_cols, function(zc) {
+  purrr::map_dfr(val_vars, function(vv) {
+    validate_zone_variable(hz_val, zc, vv)
+  })
+})
+
+zone_validation_results
+
+zone_validation_summary <- hz_val %>%
+  st_drop_geometry() %>%
+  pivot_longer(cols = all_of(val_vars), names_to = "variable", values_to = "value") %>%
+  pivot_longer(cols = all_of(zone_cols), names_to = "zone_map", values_to = "zone_id") %>%
+  filter(!is.na(zone_id), !is.na(value)) %>%
+  group_by(zone_map, variable, zone_id) %>%
+  summarise(
+    n = n(),
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+zone_validation_summary
+
+zone_validation_summary <- hz_val %>%
+  st_drop_geometry() %>%
+  pivot_longer(cols = all_of(val_vars), names_to = "variable", values_to = "value") %>%
+  pivot_longer(cols = all_of(zone_cols), names_to = "zone_map", values_to = "zone_id") %>%
+  filter(!is.na(zone_id), !is.na(value)) %>%
+  group_by(zone_map, variable, zone_id) %>%
+  summarise(
+    n = n(),
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+zone_validation_summary
+
+
+
+single_val_map <- c(
+  ca = "Ca_0_15",
+  k = "K_0_15",
+  mg = "Mg_0_15",
+  mn = "Mn_0_15",
+  p = "P_0_15",
+  zn = "Zn_0_15",
+  p_h_2 = "pH.2_0_15",
+  lbc_1 = "LBC.1_0_15",
+  lb_ceq = "LBCeq_0_15",
+  c = "C_pct_0_15",
+  n = "N_pct_0_15"
+)
+
+validate_single_zone <- function(zone_raster, pts_sf, value_col, zone_name) {
+  vals <- terra::extract(zone_raster, terra::vect(pts_sf))
+  
+  dat <- pts_sf %>%
+    st_drop_geometry() %>%
+    mutate(zone_id = vals[, 2]) %>%
+    select(zone_id, all_of(value_col)) %>%
+    filter(!is.na(zone_id), !is.na(.data[[value_col]]))
+  
+  if (nrow(dat) < 5 || dplyr::n_distinct(dat$zone_id) < 2) {
+    return(tibble(
+      zone_map = zone_name,
+      value_col = value_col,
+      n = nrow(dat),
+      n_zones = dplyr::n_distinct(dat$zone_id),
+      p_value = NA_real_,
+      statistic = NA_real_
+    ))
+  }
+  
+  kw <- kruskal.test(dat[[value_col]] ~ as.factor(dat$zone_id))
+  
+  tibble(
+    zone_map = zone_name,
+    value_col = value_col,
+    n = nrow(dat),
+    n_zones = dplyr::n_distinct(dat$zone_id),
+    p_value = kw$p.value,
+    statistic = as.numeric(kw$statistic)
+  )
+}
+
+single_zone_validation <- list()
+
+for (ds in c("SP", "C")) {
+  for (meth in c("RF", "OK", "RK")) {
+    for (nut in names(single_val_map)) {
+      
+      z_obj <- single_nutrient_zones[[ds]][[meth]][[nut]]
+      if (is.null(z_obj)) next
+      
+      single_zone_validation[[paste(ds, meth, nut, sep = "_")]] <-
+        validate_single_zone(
+          zone_raster = z_obj$raster,
+          pts_sf = hz_0_15_sf,
+          value_col = single_val_map[[nut]],
+          zone_name = paste(ds, meth, nut, sep = "_")
+        )
+    }
+  }
+}
+
+single_zone_validation_results <- bind_rows(single_zone_validation)
+
+
+
+single_zone_validation_results <- single_zone_validation_results %>%
+  mutate(p_adj_BH = p.adjust(p_value, method = "BH"))
+single_zone_validation_results
+
+single_zone_validation_results %>%
+  mutate(p_adj_BH = p.adjust(p_value, method = "BH")) %>%
+  separate(zone_map, into = c("dataset", "method", "nutrient"), sep = "_(?=[^_]+$)") %>%
+  group_by(dataset, method) %>%
+  summarise(
+    n_sig_raw = sum(p_value < 0.05, na.rm = TRUE),
+    n_sig_BH  = sum(p_adj_BH < 0.05, na.rm = TRUE),
+    mean_stat = mean(statistic, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_sig_raw), desc(mean_stat))
+
+single_zone_validation_results2 <- single_zone_validation_results %>%
+  mutate(p_adj_BH = p.adjust(p_value, method = "BH")) %>%
+  extract(
+    zone_map,
+    into = c("dataset", "method", "nutrient"),
+    regex = "^([^_]+)_([^_]+)_(.+)$",
+    remove = FALSE
+  )
+
+single_zone_validation_results2
+summary_by_dataset_method <- single_zone_validation_results2 %>%
+  group_by(dataset, method) %>%
+  summarise(
+    n_total = n(),
+    n_sig_raw = sum(p_value < 0.05, na.rm = TRUE),
+    n_sig_BH  = sum(p_adj_BH < 0.05, na.rm = TRUE),
+    mean_stat = mean(statistic, na.rm = TRUE),
+    median_stat = median(statistic, na.rm = TRUE),
+    sig_nutrients_raw = paste(nutrient[p_value < 0.05], collapse = ", "),
+    sig_nutrients_BH  = paste(nutrient[p_adj_BH < 0.05], collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_sig_raw), desc(n_sig_BH), desc(mean_stat))
+
+summary_by_dataset_method
+
+nutrient_summary <- single_zone_validation_results2 %>%
+  select(dataset, method, nutrient, value_col, p_value, p_adj_BH, statistic) %>%
+  arrange(dataset, method, p_value)
+
+nutrient_summary
+```
+
+```{r}
+zone_r2 <- function(df, zone_col, value_col) {
+  dat <- df %>%
+    sf::st_drop_geometry() %>%
+    dplyr::select(all_of(c(zone_col, value_col))) %>%
+    dplyr::filter(!is.na(.data[[zone_col]]), !is.na(.data[[value_col]]))
+  
+  if (nrow(dat) < 3 || dplyr::n_distinct(dat[[zone_col]]) < 2) return(NA_real_)
+  
+  y <- dat[[value_col]]
+  grand_mean <- mean(y)
+  
+  ss_total <- sum((y - grand_mean)^2)
+  
+  zone_means <- dat %>%
+    dplyr::group_by(.data[[zone_col]]) %>%
+    dplyr::summarise(zone_mean = mean(.data[[value_col]]), .groups = "drop")
+  
+  dat2 <- dat %>%
+    dplyr::left_join(zone_means, by = setNames(zone_col, zone_col))
+  
+  ss_within <- sum((dat2[[value_col]] - dat2$zone_mean)^2)
+  
+  1 - (ss_within / ss_total)
+}
+
+zone_cv_summary <- function(df, zone_col, value_col) {
+  df %>%
+    sf::st_drop_geometry() %>%
+    dplyr::select(all_of(c(zone_col, value_col))) %>%
+    dplyr::filter(!is.na(.data[[zone_col]]), !is.na(.data[[value_col]])) %>%
+    dplyr::group_by(.data[[zone_col]]) %>%
+    dplyr::summarise(
+      n = dplyr::n(),
+      mean = mean(.data[[value_col]], na.rm = TRUE),
+      sd = sd(.data[[value_col]], na.rm = TRUE),
+      cv = 100 * sd / mean,
+      .groups = "drop"
+    )
+}
+zone_cv_overall <- function(df, zone_col, value_col) {
+  zcv <- zone_cv_summary(df, zone_col, value_col)
+  
+  if (nrow(zcv) == 0) {
+    return(tibble(
+      mean_cv = NA_real_,
+      median_cv = NA_real_,
+      weighted_mean_cv = NA_real_
+    ))
+  }
+  
+  tibble(
+    mean_cv = mean(zcv$cv, na.rm = TRUE),
+    median_cv = median(zcv$cv, na.rm = TRUE),
+    weighted_mean_cv = weighted.mean(zcv$cv, w = zcv$n, na.rm = TRUE)
+  )
+}
+
+
+zone_cols <- c("zone_SP_RF", "zone_SP_OK", "zone_SP_RK",
+               "zone_C_RF", "zone_C_OK", "zone_C_RK")
+
+val_vars <- c("Ca_0_15", "K_0_15", "Mg_0_15", "Mn_0_15", "P_0_15",
+              "Zn_0_15", "pH.2_0_15", "LBC.1_0_15", "LBCeq_0_15",
+              "C_pct_0_15", "N_pct_0_15")
+
+zone_variance_cv_results <- purrr::map_dfr(zone_cols, function(zc) {
+  purrr::map_dfr(val_vars, function(vv) {
+    
+    r2_val <- zone_r2(hz_val, zc, vv)
+    cv_tab <- zone_cv_overall(hz_val, zc, vv)
+    
+    tibble(
+      zone_map = zc,
+      value_col = vv,
+      zone_r2 = r2_val,
+      mean_cv = cv_tab$mean_cv,
+      median_cv = cv_tab$median_cv,
+      weighted_mean_cv = cv_tab$weighted_mean_cv
+    )
+  })
+})
+
+zone_variance_cv_results
+zone_variance_cv_results2 <- zone_variance_cv_results %>%
+  tidyr::extract(
+    zone_map,
+    into = c("zone", "dataset", "method"),
+    regex = "^(zone)_([^_]+)_(.+)$",
+    remove = FALSE
+  )
+
+zone_variance_cv_results2
+
+variance_cv_summary_by_method <- zone_variance_cv_results2 %>%
+  group_by(dataset, method) %>%
+  summarise(
+    n_variables = n(),
+    mean_zone_r2 = mean(zone_r2, na.rm = TRUE),
+    median_zone_r2 = median(zone_r2, na.rm = TRUE),
+    mean_weighted_cv = mean(weighted_mean_cv, na.rm = TRUE),
+    median_weighted_cv = median(weighted_mean_cv, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(dataset, desc(mean_zone_r2), mean_weighted_cv)
+
+variance_cv_summary_by_method
+
+variance_cv_nutrient_table <- zone_variance_cv_results2 %>%
+  arrange(dataset, method, desc(zone_r2), weighted_mean_cv)
+
+variance_cv_nutrient_table
+
+single_val_map <- c(
+  ca = "Ca_0_15",
+  k = "K_0_15",
+  mg = "Mg_0_15",
+  mn = "Mn_0_15",
+  p = "P_0_15",
+  zn = "Zn_0_15",
+  p_h_2 = "pH.2_0_15",
+  lbc_1 = "LBC.1_0_15",
+  lb_ceq = "LBCeq_0_15",
+  c = "C_pct_0_15",
+  n = "N_pct_0_15"
+)
+
+single_zone_variance_cv <- list()
+
+for (ds in c("SP", "C")) {
+  for (meth in c("RF", "OK", "RK")) {
+    for (nut in names(single_val_map)) {
+      
+      z_obj <- single_nutrient_zones[[ds]][[meth]][[nut]]
+      if (is.null(z_obj)) next
+      
+      zone_vals <- terra::extract(z_obj$raster, terra::vect(hz_0_15_sf))
+      
+      dat <- hz_0_15_sf %>%
+        st_drop_geometry() %>%
+        mutate(zone_id = zone_vals[, 2]) %>%
+        filter(!is.na(zone_id))
+      
+      vv <- single_val_map[[nut]]
+      
+      single_zone_variance_cv[[paste(ds, meth, nut, sep = "_")]] <- tibble(
+        dataset = ds,
+        method = meth,
+        nutrient = nut,
+        value_col = vv,
+        zone_r2 = zone_r2(dat, "zone_id", vv),
+        mean_cv = zone_cv_overall(dat, "zone_id", vv)$mean_cv,
+        median_cv = zone_cv_overall(dat, "zone_id", vv)$median_cv,
+        weighted_mean_cv = zone_cv_overall(dat, "zone_id", vv)$weighted_mean_cv
+      )
+    }
+  }
+}
+
+single_zone_variance_cv_results <- bind_rows(single_zone_variance_cv)
+single_zone_variance_cv_results
+
+single_zone_variance_cv_summary <- single_zone_variance_cv_results %>%
+  group_by(dataset, method) %>%
+  summarise(
+    n_variables = n(),
+    mean_zone_r2 = mean(zone_r2, na.rm = TRUE),
+    median_zone_r2 = median(zone_r2, na.rm = TRUE),
+    mean_weighted_cv = mean(weighted_mean_cv, na.rm = TRUE),
+    median_weighted_cv = median(weighted_mean_cv, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(dataset, desc(mean_zone_r2), mean_weighted_cv)
+
+single_zone_variance_cv_summary
+
+single_zone_variance_cv_summary <- single_zone_variance_cv_summary %>%
+  mutate(
+    r2_rank = rank(-mean_zone_r2, ties.method = "average"),
+    cv_rank = rank(mean_weighted_cv, ties.method = "average"),
+    overall_rank_score = (r2_rank + cv_rank) / 2
+  ) %>%
+  arrange(overall_rank_score)
+
+single_zone_variance_cv_summary
+
+# Zone-based variance analysis indicated that multinutrient management zones explained a modest but meaningful proportion of independent 0–15 cm validation variability. In the single-point dataset, regression kriging produced the strongest overall multinutrient zone performance, whereas in the composite dataset, random forest produced the strongest overall performance, with regression kriging close behind. Across both datasets, the best-performing zones most consistently captured variation in phosphorus, manganese, calcium, and LBC-related properties, while potassium, magnesium, and pH showed weaker zone structure. Within-zone CV values indicated that some properties remained relatively heterogeneous within zones, particularly Zn and LBCeq, suggesting that even statistically supported zones may still contain substantial internal variability. 
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
