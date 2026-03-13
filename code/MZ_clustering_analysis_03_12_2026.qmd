@@ -2000,6 +2000,256 @@ single_raster_validation_summary
 ```
 
 
+```{r}
+hz_cluster_pts <- hz_0_15_sf
+
+for (ds in c("SP", "C")) {
+  for (meth in c("RF", "OK", "RK")) {
+    z <- relabeled_management_zone_rasters[[ds]][[meth]]
+    if (is.null(z)) next
+    
+    vals <- terra::extract(z, terra::vect(hz_0_15_sf))[, 2]
+    hz_cluster_pts[[paste0("cluster_", ds, "_", meth)]] <- vals
+  }
+}
+
+hz_var_map <- c(
+  ca = "Ca_0_15",
+  k = "K_0_15",
+  mg = "Mg_0_15",
+  mn = "Mn_0_15",
+  p = "P_0_15",
+  zn = "Zn_0_15",
+  p_h_2 = "pH.2_0_15"
+)
+
+keep_nutrients <- names(hz_var_map)
+
+extract_predicted_cluster_means <- function(cluster_summary_all, keep_nutrients) {
+  mean_cols <- paste0(rep(keep_nutrients, each = 1), "_mean")
+  mean_cols <- mean_cols[mean_cols %in% names(cluster_summary_all)]
+  
+  cluster_summary_all %>%
+    dplyr::select(dataset, method, zone, dplyr::all_of(mean_cols)) %>%
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(mean_cols),
+      names_to = "nutrient",
+      values_to = "pred_mean"
+    ) %>%
+    dplyr::mutate(
+      nutrient = sub("_mean$", "", nutrient)
+    )
+}
+
+pred_cluster_means <- extract_predicted_cluster_means(cluster_summary_all, keep_nutrients) %>%
+  dplyr::left_join(
+    cluster_order_lookup %>%
+      dplyr::select(dataset, method, zone, new_zone, availability_label) %>%
+      dplyr::mutate(zone = as.numeric(zone)),
+    by = c("dataset", "method", "zone")
+  ) %>%
+  dplyr::select(dataset, method, zone, nutrient, pred_mean, availability_label)
+pred_cluster_means
+
+extract_observed_cluster_means <- function(hz_cluster_pts, hz_var_map) {
+  res <- list()
+  
+  for (ds in c("SP", "C")) {
+    for (meth in c("RF", "OK", "RK")) {
+      cluster_col <- paste0("cluster_", ds, "_", meth)
+      if (!cluster_col %in% names(hz_cluster_pts)) next
+      
+      dat <- hz_cluster_pts %>%
+        sf::st_drop_geometry() %>%
+        dplyr::select(dplyr::all_of(cluster_col), dplyr::all_of(unname(hz_var_map))) %>%
+        dplyr::rename(availability_label = !!cluster_col) %>%
+        dplyr::mutate(availability_label = as.character(availability_label))
+      
+      for (nut in names(hz_var_map)) {
+        obs_col <- hz_var_map[[nut]]
+        
+        tmp <- dat %>%
+          dplyr::filter(!is.na(availability_label), !is.na(.data[[obs_col]])) %>%
+          dplyr::group_by(availability_label) %>%
+          dplyr::summarise(
+            obs_mean = mean(.data[[obs_col]], na.rm = TRUE),
+            obs_sd = sd(.data[[obs_col]], na.rm = TRUE),
+            n_points = dplyr::n(),
+            .groups = "drop"
+          ) %>%
+          dplyr::mutate(
+            dataset = ds,
+            method = meth,
+            nutrient = nut
+          ) %>%
+          dplyr::relocate(dataset, method, availability_label, nutrient)
+        
+        res[[paste(ds, meth, nut, sep = "_")]] <- tmp
+      }
+    }
+  }
+  
+  dplyr::bind_rows(res)
+}
+
+obs_cluster_means <- extract_observed_cluster_means(hz_cluster_pts, hz_var_map)
+obs_cluster_means
+
+cluster_profile_bias <- pred_cluster_means %>%
+  dplyr::left_join(
+    obs_cluster_means,
+    by = c("dataset", "method", "availability_label", "nutrient")
+  ) %>%
+  dplyr::mutate(
+    bias = pred_mean - obs_mean,
+    abs_bias = abs(bias)
+  ) %>%
+  dplyr::arrange(dataset, method, nutrient, availability_label)
+
+
+cluster_profile_bias
+
+
+cluster_profile_bias_summary <- cluster_profile_bias %>%
+  dplyr::group_by(dataset, method, nutrient) %>%
+  dplyr::summarise(
+    mean_abs_bias = mean(abs_bias, na.rm = TRUE),
+    mean_bias = mean(bias, na.rm = TRUE),
+    mean_n_points = mean(n_points, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dataset, method, mean_abs_bias)
+
+cluster_profile_bias_summary
+
+plot_cluster_bias_heatmap <- function(bias_df, ds, meth) {
+  dat <- bias_df %>%
+    dplyr::filter(dataset == ds, method == meth) %>%
+    dplyr::mutate(
+      availability_label = factor(
+        availability_label,
+        levels = c("Low", "Moderate-low", "Moderate-high", "High")
+      )
+    )
+  
+  ggplot(dat, aes(x = nutrient, y = availability_label, fill = bias)) +
+    geom_tile() +
+    scale_fill_gradient2(
+      low = "steelblue",
+      mid = "white",
+      high = "firebrick",
+      midpoint = 0
+    ) +
+    theme_minimal() +
+    labs(
+      title = paste(ds, meth, "cluster profile bias"),
+      x = "Nutrient",
+      y = "Availability class"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+plot_cluster_bias_heatmap(cluster_profile_bias, "SP", "RF")
+plot_cluster_bias_heatmap(cluster_profile_bias, "SP", "RK")
+plot_cluster_bias_heatmap(cluster_profile_bias, "C", "RF")
+
+
+ordered_trend_validation <- function(hz_cluster_pts, hz_var_map) {
+  res <- list()
+  
+  zone_levels <- c("Low", "Moderate-low", "Moderate-high", "High")
+  
+  for (ds in c("SP", "C")) {
+    for (meth in c("RF", "OK", "RK")) {
+      cluster_col <- paste0("cluster_", ds, "_", meth)
+      if (!cluster_col %in% names(hz_cluster_pts)) next
+      
+      dat <- hz_cluster_pts %>%
+        sf::st_drop_geometry()
+      
+      for (nut in names(hz_var_map)) {
+        obs_col <- hz_var_map[[nut]]
+        
+        tmp <- dat %>%
+          dplyr::select(dplyr::all_of(cluster_col), dplyr::all_of(obs_col)) %>%
+          dplyr::rename(zone = !!cluster_col, obs = !!obs_col) %>%
+          dplyr::filter(!is.na(zone), !is.na(obs)) %>%
+          dplyr::mutate(
+            zone = factor(as.character(zone), levels = zone_levels, ordered = TRUE),
+            zone_rank = as.numeric(zone)
+          )
+        
+        if (nrow(tmp) < 5 || dplyr::n_distinct(tmp$zone_rank) < 2) next
+        
+        ct <- suppressWarnings(
+          cor.test(tmp$zone_rank, tmp$obs, method = "spearman", exact = FALSE)
+        )
+        
+        res[[paste(ds, meth, nut, sep = "_")]] <- tibble::tibble(
+          dataset = ds,
+          method = meth,
+          nutrient = nut,
+          n = nrow(tmp),
+          spearman_rho = unname(ct$estimate),
+          p_value = ct$p.value
+        )
+      }
+    }
+  }
+  
+  dplyr::bind_rows(res)
+}
+
+ordered_trend_results <- ordered_trend_validation(hz_cluster_pts, hz_var_map)
+
+ordered_trend_results <- ordered_trend_results %>%
+  dplyr::mutate(
+    p_adj_BH = p.adjust(p_value, method = "BH")
+  ) %>%
+  dplyr::arrange(dataset, method, dplyr::desc(spearman_rho))
+
+ordered_trend_results
+
+ordered_trend_summary <- ordered_trend_results %>%
+  dplyr::group_by(dataset, method) %>%
+  dplyr::summarise(
+    n_nutrients = n(),
+    mean_rho = mean(spearman_rho, na.rm = TRUE),
+    n_sig_raw = sum(p_value < 0.05, na.rm = TRUE),
+    n_sig_BH = sum(p_adj_BH < 0.05, na.rm = TRUE),
+    sig_nutrients = paste(nutrient[p_value < 0.05], collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dataset, dplyr::desc(mean_rho))
+
+ordered_trend_summary
+
+plot_ordered_trend_boxplot <- function(hz_cluster_pts, ds, meth, obs_col, ylab = NULL) {
+  cluster_col <- paste0("cluster_", ds, "_", meth)
+  
+  dat <- hz_cluster_pts %>%
+    sf::st_drop_geometry() %>%
+    dplyr::select(dplyr::all_of(cluster_col), dplyr::all_of(obs_col)) %>%
+    dplyr::rename(zone = !!cluster_col, obs = !!obs_col) %>%
+    dplyr::filter(!is.na(zone), !is.na(obs))
+  
+  ggplot(dat, aes(x = factor(zone), y = obs)) +
+    geom_boxplot() +
+    theme_minimal() +
+    labs(
+      title = paste(ds, meth, obs_col, "by availability zone"),
+      x = "Availability zone (low → high)",
+      y = ylab %||% obs_col
+    )
+}
+
+plot_ordered_trend_boxplot(hz_cluster_pts, "SP", "RF", "P_0_15", "P (0-15 cm)")
+plot_ordered_trend_boxplot(hz_cluster_pts, "SP", "RK", "Ca_0_15", "Ca (0-15 cm)")
+plot_ordered_trend_boxplot(hz_cluster_pts, "C", "RF", "Mn_0_15", "Mn (0-15 cm)")
+
+# Ordered trend validation showed that the relabeled multinutrient management zones were supported most consistently by phosphorus, with additional support from manganese and pH in selected dataset-method combinations. Composite RF zones showed the broadest agreement with the independent Hz dataset, while single-point RK zones provided the strongest overall support among the single-point maps. However, the ordered zones did not represent a uniform increase across all nutrients, indicating that the mapped clusters reflect a more complex multinutrient soil chemistry gradient rather than a simple universal fertility gradient.
+
+```
 
 
 
