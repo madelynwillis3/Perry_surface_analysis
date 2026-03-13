@@ -1090,14 +1090,258 @@ for (ds in c("SP", "C")) {
     }  }  }
 
 ```
+```{r}
+#multinutrient umap clustering interps
+summarize_clusters <- function(zone_raster, nutrient_stack) {
+  zone_vals <- terra::values(zone_raster, mat = FALSE)
+  nut_vals  <- terra::as.data.frame(nutrient_stack, na.rm = FALSE)
+  
+  vals <- dplyr::bind_cols(
+    tibble::tibble(zone = zone_vals),
+    nut_vals
+  ) %>%
+    dplyr::filter(!is.na(zone)) %>%
+    dplyr::filter(dplyr::if_all(-1, ~ !is.na(.x)))
+  
+  nutrient_cols <- setdiff(names(vals), "zone")
+  
+  vals %>%
+    dplyr::group_by(zone) %>%
+    dplyr::summarise(
+      dplyr::across(
+        .cols = dplyr::all_of(nutrient_cols),
+        .fns = list(
+          mean = ~mean(.x, na.rm = TRUE),
+          median = ~median(.x, na.rm = TRUE),
+          sd = ~sd(.x, na.rm = TRUE)
+        ),
+        .names = "{.col}_{.fn}"
+      ),
+      n_cells = dplyr::n(),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(zone)
+}
 
+cluster_profile_zscores <- function(zone_raster, nutrient_stack) {
+  zone_vals <- terra::values(zone_raster, mat = FALSE)
+  nut_vals  <- terra::as.data.frame(nutrient_stack, na.rm = FALSE)
+  
+  vals <- dplyr::bind_cols(
+    tibble::tibble(zone = zone_vals),
+    nut_vals
+  ) %>%
+    dplyr::filter(!is.na(zone)) %>%
+    dplyr::filter(dplyr::if_all(-1, ~ !is.na(.x)))
+  
+  nutrient_cols <- setdiff(names(vals), "zone")
+  
+  vals_z <- vals
+  vals_z[nutrient_cols] <- lapply(vals_z[nutrient_cols], function(x) as.numeric(scale(x)))
+  
+  vals_z %>%
+    dplyr::group_by(zone) %>%
+    dplyr::summarise(
+      dplyr::across(
+        .cols = dplyr::all_of(nutrient_cols),
+        .fns = ~mean(.x, na.rm = TRUE)
+      ),
+      n_cells = dplyr::n(),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(zone)
+}
+cluster_summary_list <- list()
+cluster_profile_list <- list()
+
+for (ds in c("SP", "C")) {
+  for (meth in c("RF", "OK", "RK")) {
+    cat("Summarizing clusters for", ds, meth, "\n")
+    
+    z <- management_zone_rasters[[ds]][[meth]]
+    if (is.null(z)) next
+    
+    stack_i <- build_method_stack(final_ensemble_rasters, ds, meth, soil_vars)
+    if (is.null(stack_i)) next
+    
+    stack_i <- filter_stack_by_completeness(stack_i, max_na_prop = 0.4)
+    stack_i <- mask_to_common_support(stack_i)
+    
+    cl_sum <- summarize_clusters(z, stack_i) %>%
+      dplyr::mutate(dataset = ds, method = meth) %>%
+      dplyr::relocate(dataset, method)
+    
+    cl_prof <- cluster_profile_zscores(z, stack_i) %>%
+      dplyr::mutate(dataset = ds, method = meth) %>%
+      dplyr::relocate(dataset, method)
+    
+    cluster_summary_list[[paste(ds, meth, sep = "_")]] <- cl_sum
+    cluster_profile_list[[paste(ds, meth, sep = "_")]] <- cl_prof
+  }
+}
+
+cluster_summary_all <- dplyr::bind_rows(cluster_summary_list)
+cluster_profile_all <- dplyr::bind_rows(cluster_profile_list)
+
+keep_nutrients <- c("ca", "k", "mg", "mn", "p", "zn", "p_h_2")
+
+cluster_profile_all_clean <- cluster_profile_all %>%
+  dplyr::select(dataset, method, zone, dplyr::all_of(keep_nutrients), n_cells)
+
+cluster_profile_all_clean
+
+plot_cluster_heatmap <- function(profile_df, title = "Cluster nutrient profiles") {
+  nutrient_cols <- setdiff(names(profile_df), c("dataset", "method", "zone", "n_cells"))
+  
+  profile_long <- profile_df %>%
+    dplyr::select(zone, dplyr::all_of(nutrient_cols)) %>%
+    tidyr::pivot_longer(
+      cols = -zone,
+      names_to = "nutrient",
+      values_to = "z_mean"
+    )
+  
+  ggplot(profile_long, aes(x = nutrient, y = factor(zone), fill = z_mean)) +
+    geom_tile() +
+    scale_fill_gradient2(
+      low = "steelblue",
+      mid = "white",
+      high = "firebrick",
+      midpoint = 0
+    ) +
+    theme_minimal() +
+    labs(title = title, x = "Nutrient", y = "Cluster") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+#plot all 6 heatmaps together
+
+plot_cluster_heatmap(cluster_profile_all_clean %>% dplyr::filter(dataset == "SP", method == "RF"), "SP RF")
+plot_cluster_heatmap(cluster_profile_all_clean %>% dplyr::filter(dataset == "SP", method == "OK"), "SP OK")
+plot_cluster_heatmap(cluster_profile_all_clean %>% dplyr::filter(dataset == "SP", method == "RK"), "SP RK")
+plot_cluster_heatmap(cluster_profile_all_clean %>% dplyr::filter(dataset == "C", method == "RF"), "C RF")
+plot_cluster_heatmap(cluster_profile_all_clean %>% dplyr::filter(dataset == "C", method == "OK"), "C OK")
+plot_cluster_heatmap(cluster_profile_all_clean %>% dplyr::filter(dataset == "C", method == "RK"), "C RK")
+```
+```{r}
+#corrected clustering nutrient plotting:
+availability_vars <- c("ca", "k", "mg", "mn", "p", "zn")
+
+cluster_order_lookup <- cluster_profile_all_clean %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    availability_score = mean(c_across(all_of(availability_vars)), na.rm = TRUE)
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(dataset, method) %>%
+  dplyr::arrange(availability_score, .by_group = TRUE) %>%
+  dplyr::mutate(
+    new_zone = dplyr::row_number(),
+    n_zones_map = dplyr::n(),
+    availability_label = dplyr::case_when(
+      n_zones_map == 2 & new_zone == 1 ~ "Low",
+      n_zones_map == 2 & new_zone == 2 ~ "High",
+      
+      n_zones_map == 3 & new_zone == 1 ~ "Low",
+      n_zones_map == 3 & new_zone == 2 ~ "Moderate",
+      n_zones_map == 3 & new_zone == 3 ~ "High",
+      
+      n_zones_map == 4 & new_zone == 1 ~ "Low",
+      n_zones_map == 4 & new_zone == 2 ~ "Moderate-low",
+      n_zones_map == 4 & new_zone == 3 ~ "Moderate-high",
+      n_zones_map == 4 & new_zone == 4 ~ "High",
+      
+      TRUE ~ paste("Zone", new_zone)
+    )
+  ) %>%
+  dplyr::ungroup()
+
+cluster_order_lookup
+
+relabel_zone_raster <- function(zone_raster, lookup_df, ds, meth) {
+  lut <- lookup_df %>%
+    dplyr::filter(dataset == ds, method == meth) %>%
+    dplyr::select(zone, new_zone, availability_label)
+  
+  if (nrow(lut) == 0) return(NULL)
+  
+  vals <- terra::values(zone_raster, mat = FALSE)
+  new_vals <- vals
+  
+  for (i in seq_len(nrow(lut))) {
+    new_vals[vals == lut$zone[i]] <- lut$new_zone[i]
+  }
+  
+  out <- zone_raster
+  terra::values(out) <- new_vals
+  names(out) <- paste0(ds, "_", meth, "_availability_zone")
+  
+  # make categorical labels
+  out <- terra::as.factor(out)
+  lv <- data.frame(
+    value = lut$new_zone,
+    label = lut$availability_label
+  )
+  levels(out) <- lv
+  
+  out
+}
+relabeled_management_zone_rasters <- list()
+
+for (ds in c("SP", "C")) {
+  relabeled_management_zone_rasters[[ds]] <- list()
+  
+  for (meth in c("RF", "OK", "RK")) {
+    z <- management_zone_rasters[[ds]][[meth]]
+    if (is.null(z)) {
+      relabeled_management_zone_rasters[[ds]][[meth]] <- NULL
+      next
+    }
+    
+    relabeled_management_zone_rasters[[ds]][[meth]] <- relabel_zone_raster(
+      zone_raster = z,
+      lookup_df = cluster_order_lookup,
+      ds = ds,
+      meth = meth
+    )
+  }
+}
+cluster_order_lookup %>%
+  dplyr::select(dataset, method, zone, new_zone, availability_label, availability_score, all_of(availability_vars)) %>%
+  dplyr::arrange(dataset, method, new_zone)
+
+zone_cols_bg <- c("#2166AC", "#67A9CF", "#A6DBA0", "#1A9850")
+par(mfrow = c(2, 3), mar = c(3, 3, 3, 5))
+
+for (ds in c("SP", "C")) {
+  for (meth in c("RF", "OK", "RK")) {
+    z <- relabeled_management_zone_rasters[[ds]][[meth]]
+    
+    if (!is.null(z)) {
+      plot(
+        z,
+        main = paste(ds, meth, "\nlow → high nutrient availability"),
+        col = zone_cols_bg,
+        type = "classes"
+      )
+    } else {
+      plot(NA, NA, main = paste(ds, meth), xlim = c(0, 1), ylim = c(0, 1))
+      text(0.5, 0.5, "No zones", cex = 1.2)
+    }
+  }
+}
+
+
+```
+
+
+### Validation
 
 ```{r}
 
 #validation
 
 #load validation data:
-  hz_0_15_wide <- read_csv("../LOCAL DATA DO NOT PUSH/Ap_hz_data/perry_Ap_hz_0_15cm_depth_func_02_10_2026.csv")
+  hz_0_15_wide <- read_csv("../LOCAL DATA DO NOT PUSH/Ap_hz_data/hz_0_15_wide_03_13_2026.csv")
 # pick one zone raster just to grab CRS
 template_zone <- management_zone_rasters$SP$RF
 
@@ -1507,11 +1751,253 @@ single_zone_variance_cv_summary <- single_zone_variance_cv_summary %>%
 
 single_zone_variance_cv_summary
 
-# Zone-based variance analysis indicated that multinutrient management zones explained a modest but meaningful proportion of independent 0–15 cm validation variability. In the single-point dataset, regression kriging produced the strongest overall multinutrient zone performance, whereas in the composite dataset, random forest produced the strongest overall performance, with regression kriging close behind. Across both datasets, the best-performing zones most consistently captured variation in phosphorus, manganese, calcium, and LBC-related properties, while potassium, magnesium, and pH showed weaker zone structure. Within-zone CV values indicated that some properties remained relatively heterogeneous within zones, particularly Zn and LBCeq, suggesting that even statistically supported zones may still contain substantial internal variability. 
+
 ```
 
 
 
+```{r}
+extract_pred_obs_single <- function(pred_raster, pts_sf, obs_col,
+                                    zone_raster = NULL,
+                                    dataset = NA_character_,
+                                    method = NA_character_,
+                                    nutrient = NA_character_) {
+  
+  pred_vals <- terra::extract(pred_raster, terra::vect(pts_sf))[, 2]
+  
+  if (!is.null(zone_raster)) {
+    zone_vals <- terra::extract(zone_raster, terra::vect(pts_sf))[, 2]
+  } else {
+    zone_vals <- NA
+  }
+  
+  pts_sf %>%
+    sf::st_drop_geometry() %>%
+    mutate(
+      dataset = dataset,
+      method = method,
+      nutrient = nutrient,
+      obs = .data[[obs_col]],
+      pred = pred_vals,
+      zone_id = zone_vals
+    ) %>%
+    filter(!is.na(obs), !is.na(pred))
+}
+
+extract_pred_obs_single <- function(pred_raster, pts_sf, obs_col,
+                                    zone_raster = NULL,
+                                    dataset = NA_character_,
+                                    method = NA_character_,
+                                    nutrient = NA_character_) {
+  
+  pred_vals <- terra::extract(pred_raster, terra::vect(pts_sf))[, 2]
+  
+  if (!is.null(zone_raster)) {
+    zone_vals <- terra::extract(zone_raster, terra::vect(pts_sf))[, 2]
+  } else {
+    zone_vals <- NA
+  }
+  
+  pts_sf %>%
+    sf::st_drop_geometry() %>%
+    mutate(
+      dataset = dataset,
+      method = method,
+      nutrient = nutrient,
+      obs = .data[[obs_col]],
+      pred = pred_vals,
+      zone_id = zone_vals
+    ) %>%
+    filter(!is.na(obs), !is.na(pred))
+}
+
+agreement_metrics <- function(df) {
+  if (nrow(df) < 3) {
+    return(tibble(
+      n = nrow(df),
+      me = NA_real_,
+      mae = NA_real_,
+      rmse = NA_real_,
+      r2 = NA_real_
+    ))
+  }
+  
+  tibble(
+    n = nrow(df),
+    me = mean(df$pred - df$obs, na.rm = TRUE),
+    mae = mean(abs(df$pred - df$obs), na.rm = TRUE),
+    rmse = sqrt(mean((df$pred - df$obs)^2, na.rm = TRUE)),
+    r2 = ifelse(stats::var(df$pred, na.rm = TRUE) > 0 &&
+                  stats::var(df$obs, na.rm = TRUE) > 0,
+                cor(df$pred, df$obs, use = "complete.obs")^2,
+                NA_real_)
+  )
+}
+
+zone_summary_compare <- function(df) {
+  dat <- df %>% filter(!is.na(zone_id))
+  
+  if (nrow(dat) < 3 || dplyr::n_distinct(dat$zone_id) < 2) {
+    return(tibble())
+  }
+  
+  dat %>%
+    group_by(zone_id) %>%
+    summarise(
+      n = n(),
+      pred_mean = mean(pred, na.rm = TRUE),
+      obs_mean = mean(obs, na.rm = TRUE),
+      bias = pred_mean - obs_mean,
+      abs_bias = abs(bias),
+      pred_sd = sd(pred, na.rm = TRUE),
+      obs_sd = sd(obs, na.rm = TRUE),
+      sd_ratio = ifelse(is.finite(pred_sd) && pred_sd > 0, obs_sd / pred_sd, NA_real_),
+      pred_var = var(pred, na.rm = TRUE),
+      obs_var = var(obs, na.rm = TRUE),
+      var_ratio = ifelse(is.finite(pred_var) && pred_var > 0, obs_var / pred_var, NA_real_),
+      .groups = "drop"
+    )
+}
+
+zone_summary_metrics <- function(df) {
+  zsum <- zone_summary_compare(df)
+  
+  if (nrow(zsum) == 0) {
+    return(tibble(
+      n_zones = NA_integer_,
+      mean_abs_bias = NA_real_,
+      mean_sd_ratio = NA_real_,
+      mean_var_ratio = NA_real_
+    ))
+  }
+  
+  tibble(
+    n_zones = nrow(zsum),
+    mean_abs_bias = mean(zsum$abs_bias, na.rm = TRUE),
+    mean_sd_ratio = mean(zsum$sd_ratio, na.rm = TRUE),
+    mean_var_ratio = mean(zsum$var_ratio, na.rm = TRUE)
+  )
+}
+
+residual_bias_test <- function(df) {
+  res <- df$pred - df$obs
+  
+  if (length(res) < 3) {
+    return(tibble(
+      bias_p_value = NA_real_,
+      bias_statistic = NA_real_
+    ))
+  }
+  
+  wt <- wilcox.test(res, mu = 0, exact = FALSE)
+  
+  tibble(
+    bias_p_value = wt$p.value,
+    bias_statistic = as.numeric(wt$statistic)
+  )
+}
+
+single_raster_validation_results <- list()
+single_raster_zone_summaries <- list()
+
+for (ds in c("SP", "C")) {
+  for (meth in c("RF", "OK", "RK")) {
+    for (nut in names(single_val_map)) {
+      
+      pred_raster <- final_ensemble_rasters[[ds]][[meth]][[nut]]
+      if (is.null(pred_raster)) next
+      
+      zone_obj <- single_nutrient_zones[[ds]][[meth]][[nut]]
+      zone_raster <- if (!is.null(zone_obj)) zone_obj$raster else NULL
+      
+      obs_col <- single_val_map[[nut]]
+      
+      dat <- extract_pred_obs_single(
+        pred_raster = pred_raster,
+        pts_sf = hz_0_15_sf,
+        obs_col = obs_col,
+        zone_raster = zone_raster,
+        dataset = ds,
+        method = meth,
+        nutrient = nut
+      )
+      
+      if (nrow(dat) == 0) next
+      
+      single_raster_validation_results[[paste(ds, meth, nut, sep = "_")]] <-
+        bind_cols(
+          tibble(
+            dataset = ds,
+            method = meth,
+            nutrient = nut,
+            value_col = obs_col
+          ),
+          agreement_metrics(dat),
+          residual_bias_test(dat),
+          zone_summary_metrics(dat)
+        )
+      
+      zsum <- zone_summary_compare(dat)
+      if (nrow(zsum) > 0) {
+        single_raster_zone_summaries[[paste(ds, meth, nut, sep = "_")]] <-
+          zsum %>%
+          mutate(
+            dataset = ds,
+            method = meth,
+            nutrient = nut,
+            value_col = obs_col
+          ) %>%
+          relocate(dataset, method, nutrient, value_col)
+      }
+    }
+  }
+}
+
+single_raster_validation_table <- bind_rows(single_raster_validation_results)
+single_raster_zone_summary_table <- bind_rows(single_raster_zone_summaries)
+
+
+core_nutrients <- c("ca", "k", "mg", "mn", "p", "zn", "p_h_2")
+
+#filter to core nutrients:
+single_raster_validation_table %>%
+  arrange(dataset, method, rmse) %>%
+  filter(nutrient %in% core_nutrients)
+
+single_raster_validation_summary_core <- single_raster_validation_table %>%
+  filter(nutrient %in% core_nutrients) %>%
+  group_by(dataset, method) %>%
+  summarise(
+    n_variables = n(),
+    mean_mae = mean(mae, na.rm = TRUE),
+    mean_rmse = mean(rmse, na.rm = TRUE),
+    mean_r2 = mean(r2, na.rm = TRUE),
+    mean_abs_bias = mean(mean_abs_bias, na.rm = TRUE),
+    mean_sd_ratio_dev = mean(abs(mean_sd_ratio - 1), na.rm = TRUE),
+    mean_var_ratio_dev = mean(abs(mean_var_ratio - 1), na.rm = TRUE),
+    n_bias_nonsig = sum(bias_p_value >= 0.05, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(dataset, desc(mean_r2), mean_rmse)
+
+
+single_raster_validation_summary
+
+#The strongest agreement between predicted rasters and independent 0–15 cm validation data was observed for phosphorus, followed by calcium and manganese. Random forest and regression kriging produced the most defensible nutrient maps overall, while ordinary kriging was generally weaker. Potassium, magnesium, and zinc showed weak point-level agreement across methods, suggesting these properties were less well represented by the current raster prediction workflow. Overall, the maps appear more useful for relative zoning and ranking of field conditions than for precise absolute prediction.
+
+#all of these nutrients can be affected by a combination of:
+  # nutrient mobility
+  # 
+  # soil chemical retention
+  # 
+  # fertilizer/manure/liming history
+  # 
+  # crop uptake patterns from peanuts, etc.
+  # 
+  # redistribution by erosion or deposition
+  # 
+  # how strongly the nutrient is tied to terrain and soil-forming processes
+```
 
 
 

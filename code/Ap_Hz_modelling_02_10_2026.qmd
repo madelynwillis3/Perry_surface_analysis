@@ -17,12 +17,11 @@ library(tidyr)
 ```
 
 ```{r}
-#pull in full Ap hz data:
+# pull in full Ap hz data
 Ap_hz_perry <- read.csv("../LOCAL DATA DO NOT PUSH/Ap_hz_data/perry_Ap_data_full_02_10_2026.csv")
 
-#depth weighting function
 # -----------------------------
-# 1) Clean depths
+# 1) Clean depths + remove duplicated depth intervals
 # -----------------------------
 Ap_hz_clean <- Ap_hz_perry %>%
   mutate(
@@ -40,33 +39,32 @@ Ap_hz_clean <- Ap_hz_perry %>%
     is.finite(top_cm),
     is.finite(bottom_cm),
     bottom_cm > top_cm
-  )
+  ) %>%
+  distinct(Point, top_cm, bottom_cm, .keep_all = TRUE)
 
 # -----------------------------
 # 2) Depth-weighting function (0–15 cm)
 # -----------------------------
 depth_weighted_0_15 <- function(df, value_col,
-                               id_col = "Point",
-                               top_col = "top_cm",
-                               bot_col = "bottom_cm",
-                               zmax = 15) {
-
+                                id_col = "Point",
+                                top_col = "top_cm",
+                                bot_col = "bottom_cm",
+                                zmax = 15) {
+  
   df %>%
     mutate(
       z_top = .data[[top_col]],
       z_bot = .data[[bot_col]],
-      val   = as.numeric(.data[[value_col]])
-    ) %>%
-    filter(is.finite(val)) %>%
-    mutate(
+      val   = as.numeric(.data[[value_col]]),
       thick = pmax(0, pmin(z_bot, zmax) - pmax(z_top, 0))
     ) %>%
+    filter(is.finite(val), thick > 0) %>%
     group_by(.data[[id_col]]) %>%
     summarise(
       cover_cm = sum(thick, na.rm = TRUE),
       value_0_15 = ifelse(
         cover_cm >= zmax,
-        sum(val * thick, na.rm = TRUE) / zmax,
+        sum(val * thick, na.rm = TRUE) / cover_cm,
         NA_real_
       ),
       .groups = "drop"
@@ -75,11 +73,8 @@ depth_weighted_0_15 <- function(df, value_col,
 
 # -----------------------------
 # 3) Choose nutrient columns to depth-weight
-#    (edit this vector if you want)
 # -----------------------------
 nutrients <- c("Ca","K","Mg","Mn","P","Zn","pH.2","LBC.1","LBCeq","C_pct","N_pct")
-
-# keep only nutrients that actually exist in your dataframe
 nutrients <- nutrients[nutrients %in% names(Ap_hz_clean)]
 print(nutrients)
 
@@ -94,12 +89,13 @@ hz_0_15_list <- map(nutrients, ~{
 names(hz_0_15_list) <- nutrients
 
 # -----------------------------
-# 5) Combine into ONE WIDE dataset (1 row per Point)
+# 5) Combine into ONE WIDE dataset
 # -----------------------------
 hz_0_15_wide <- reduce(hz_0_15_list, full_join, by = "Point")
 
 # quick checks
 cat("\nRows (Points):", nrow(hz_0_15_wide), "\n")
+
 na_summary <- hz_0_15_wide %>%
   summarise(across(-Point, ~sum(is.na(.x)))) %>%
   pivot_longer(everything(), names_to = "var", values_to = "n_NA") %>%
@@ -107,7 +103,7 @@ na_summary <- hz_0_15_wide %>%
 print(na_summary)
 
 # -----------------------------
-# 6) ALSO make a LONG dataset (good for distributions/plots)
+# 6) Long version for summaries
 # -----------------------------
 hz_0_15_long <- hz_0_15_wide %>%
   pivot_longer(
@@ -116,7 +112,6 @@ hz_0_15_long <- hz_0_15_wide %>%
     values_to = "value_0_15"
   )
 
-# Example: distribution summaries by nutrient
 dist_summary <- hz_0_15_long %>%
   group_by(nutrient) %>%
   summarise(
@@ -132,24 +127,21 @@ dist_summary <- hz_0_15_long %>%
 print(dist_summary)
 
 # -----------------------------
-# 7) Optional: save
+# 7) Add point coordinates
 # -----------------------------
 hz_0_15_wide <- hz_0_15_wide %>%
-#remove  columns with .x or .y
-  dplyr::select(Point, ends_with("_0_15")) %>%
-  #remove na rows
+  select(Point, ends_with("_0_15")) %>%
   filter(if_any(-Point, ~is.finite(.x))) %>%
-  #add point locs
   left_join(
     Ap_hz_clean %>%
-      dplyr::select(Point, POINT_X, POINT_Y) %>%
+      select(Point, POINT_X, POINT_Y) %>%
       distinct(),
     by = "Point"
-  ) 
+  )
 
 
 
-write.csv("../LOCAL DATA DO NOT PUSH/Ap_hz_data/perry_Ap_hz_0_15cm_depth_func_03_12_2026.csv", row.names = FALSE)
+write.csv(hz_0_15_wide, "../LOCAL DATA DO NOT PUSH/Ap_hz_data/hz_0_15_wide_03_13_2026.csv", row.names = FALSE)
 
 ```
 
