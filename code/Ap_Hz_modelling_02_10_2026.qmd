@@ -12,6 +12,8 @@ format: html
 library(terra)
 library(dplyr)
 library(stringr)
+library(purrr)
+library(tidyr)
 ```
 
 ```{r}
@@ -147,7 +149,7 @@ hz_0_15_wide <- hz_0_15_wide %>%
 
 
 
-write.csv("../LOCAL DATA DO NOT PUSH/Ap_hz_data/perry_Ap_hz_0_15cm_depth_func_02_10_2026.csv", row.names = FALSE)
+write.csv("../LOCAL DATA DO NOT PUSH/Ap_hz_data/perry_Ap_hz_0_15cm_depth_func_03_12_2026.csv", row.names = FALSE)
 
 ```
 
