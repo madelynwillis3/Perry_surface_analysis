@@ -1,0 +1,786 @@
+---
+title: "Perry_analysis_03_26_2026"
+format: html
+---
+
+```{r}
+#load libraries
+# libraries
+library(terra)
+library(tidyverse)
+library(janitor)
+library(sf)
+library(sp)
+library(gstat)
+library(randomForest)
+library(corrplot)
+library(spdep)
+library(beepr)
+
+```
+
+
+```{r}
+# data
+soil_points_nutrients <- read.csv("../LOCAL DATA DO NOT PUSH/soil/perry_soil_points_surface_03_2026.csv") %>%
+  clean_names()
+
+covariate_stack <- rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
+
+soil_vars <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn")
+cov_names <- names(covariate_stack)
+soil_prop_SP <- soil_points_nutrients %>%
+  filter(type == "SPID") %>%
+  st_as_sf(coords = c("x", "y"), crs = 4326) %>%
+  st_transform(26917)
+
+soil_prop_COMP <- soil_points_nutrients %>%
+  filter(type == "CID") %>%
+  st_as_sf(coords = c("x", "y"), crs = 4326) %>%
+  st_transform(26917)
+
+add_xy <- function(dat) {
+  coords <- st_coordinates(dat)
+  dat %>%
+    mutate(
+      X = coords[,1],
+      Y = coords[,2]
+    )
+}
+
+extract_covariates <- function(dat_sf, covariate_stack) {
+  vect_pts <- terra::vect(dat_sf)
+  cov_vals <- terra::extract(covariate_stack, vect_pts)
+
+  bind_cols(
+    dat_sf %>% st_drop_geometry(),
+    cov_vals %>% dplyr::select(-ID)
+  ) %>%
+    bind_cols(geometry = st_geometry(dat_sf)) %>%
+    st_as_sf()
+}
+
+soil_SP_cov <- soil_prop_SP %>%
+  add_xy() %>%
+  extract_covariates(covariate_stack)
+
+soil_COMP_cov <- soil_prop_COMP %>%
+  add_xy() %>%
+  extract_covariates(covariate_stack)
+
+add_xy <- function(dat) {
+  coords <- st_coordinates(dat)
+  dat %>%
+    mutate(
+      X = coords[,1],
+      Y = coords[,2]
+    )
+}
+
+extract_covariates <- function(dat_sf, covariate_stack) {
+  vect_pts <- terra::vect(dat_sf)
+  cov_vals <- terra::extract(covariate_stack, vect_pts)
+
+  bind_cols(
+    dat_sf %>% st_drop_geometry(),
+    cov_vals %>% dplyr::select(-ID)
+  ) %>%
+    bind_cols(geometry = st_geometry(dat_sf)) %>%
+    st_as_sf()
+}
+
+soil_SP_cov <- soil_prop_SP %>%
+  add_xy() %>%
+  extract_covariates(covariate_stack)
+
+soil_COMP_cov <- soil_prop_COMP %>%
+  add_xy() %>%
+  extract_covariates(covariate_stack)
+```
+
+```{r model, warning=FALSE}
+coords_SP <- st_coordinates(soil_prop_SP)
+coords_COMP <- st_coordinates(soil_prop_COMP)
+
+cutoff_SP <- max(dist(coords_SP)) / 2
+cutoff_COMP <- max(dist(coords_COMP)) / 2
+
+width_SP <- 100
+width_COMP <- 100
+
+make_resamples <- function(sf_data, n_iter = 100, train_frac = 0.7, base_seed = 20260326) {
+  ids <- seq_len(nrow(sf_data))
+  seeds <- base_seed + seq_len(n_iter)
+
+  resamples <- vector("list", n_iter)
+
+  for (i in seq_len(n_iter)) {
+    set.seed(seeds[i])
+
+    n_train <- floor(train_frac * length(ids))
+    train_ids <- sort(sample(ids, size = n_train, replace = FALSE))
+    test_ids <- setdiff(ids, train_ids)
+
+    resamples[[i]] <- list(
+      iteration = i,
+      seed = seeds[i],
+      train_ids = train_ids,
+      test_ids = test_ids
+    )
+  }
+
+  resamples
+}
+
+
+resamples_SP <- make_resamples(soil_SP_cov, n_iter = 100, train_frac = 0.7, base_seed = 20260326)
+resamples_COMP <- make_resamples(soil_COMP_cov, n_iter = 100, train_frac = 0.7, base_seed = 20261326)
+
+calc_metrics <- function(obs, pred) {
+  tibble(
+    n = length(obs),
+    RMSE = sqrt(mean((obs - pred)^2, na.rm = TRUE)),
+    MAE = mean(abs(obs - pred), na.rm = TRUE),
+    R2 = cor(obs, pred, use = "complete.obs")^2,
+    mean_error = mean(obs - pred, na.rm = TRUE)
+  )
+}
+
+tune_rf_oob <- function(train_df, response, predictors, ntree = 500) {
+  x_train <- train_df %>% select(all_of(predictors))
+  y_train <- train_df[[response]]
+
+  p <- length(predictors)
+  mtry_grid <- unique(pmax(1, c(
+    floor(sqrt(p)),
+    floor(p / 4),
+    floor(p / 3),
+    floor(p / 2)
+  )))
+
+  fits <- purrr::map(mtry_grid, function(m) {
+    set.seed(sample.int(1e6, 1))
+    rf <- randomForest(
+      x = x_train,
+      y = y_train,
+      ntree = ntree,
+      mtry = m,
+      importance = TRUE
+    )
+
+    tibble(
+      mtry = m,
+      oob_mse = tail(rf$mse, 1)
+    )
+  }) %>%
+    bind_rows()
+
+  best_mtry <- fits %>%
+    slice_min(oob_mse, n = 1) %>%
+    pull(mtry)
+
+  list(
+    best_mtry = best_mtry,
+    tuning_table = fits
+  )
+}
+
+fit_variogram_models <- function(vg) {
+  vg_df <- as.data.frame(vg)
+
+  init_nugget <- max(0, min(vg_df$gamma, na.rm = TRUE) * 0.5)
+  init_sill <- max(vg_df$gamma, na.rm = TRUE)
+  init_psill <- max(init_sill - init_nugget, 1e-6)
+  init_range <- max(vg_df$dist, na.rm = TRUE) / 3
+
+  candidate_models <- c("Sph", "Exp")
+
+  fits <- purrr::map(candidate_models, function(m) {
+    tryCatch({
+      fit <- fit.variogram(
+        vg,
+        model = vgm(
+          psill = init_psill,
+          model = m,
+          range = init_range,
+          nugget = init_nugget
+        )
+      )
+
+      if (any(!is.finite(fit$psill))) return(NULL)
+      if (any(!is.finite(fit$range))) return(NULL)
+      if (any(fit$range[fit$model != "Nug"] <= 0)) return(NULL)
+
+      fit
+    }, error = function(e) NULL)
+  })
+
+  fits <- fits[!sapply(fits, is.null)]
+  if (length(fits) == 0) return(NULL)
+
+  sse <- sapply(fits, function(f) attr(f, "SSErr"))
+  fits[[which.min(sse)]]
+}
+
+run_rf_model <- function(train_sf, test_sf, response, predictors, ntree = 500) {
+  train_df <- train_sf %>% st_drop_geometry() %>% select(all_of(c(response, predictors))) %>% na.omit()
+  test_df  <- test_sf %>% st_drop_geometry() %>% select(all_of(c(response, predictors))) %>% na.omit()
+
+  tuning <- tune_rf_oob(train_df, response, predictors, ntree = ntree)
+
+  rf_fit <- randomForest(
+    x = train_df %>% select(all_of(predictors)),
+    y = train_df[[response]],
+    ntree = ntree,
+    mtry = tuning$best_mtry,
+    importance = TRUE
+  )
+
+  preds <- predict(rf_fit, newdata = test_df %>% select(all_of(predictors)))
+  mets <- calc_metrics(test_df[[response]], preds)
+
+  list(
+    model = rf_fit,
+    predictions = tibble(obs = test_df[[response]], pred = preds),
+    metrics = mets,
+    best_mtry = tuning$best_mtry,
+    tuning_table = tuning$tuning_table
+  )
+}
+
+run_ok_model <- function(train_sf, test_sf, response, cutoff, width) {
+  train_sp <- as(train_sf, "Spatial")
+  test_sp <- as(test_sf, "Spatial")
+
+  f <- as.formula(paste(response, "~ 1"))
+  vg <- variogram(f, data = train_sp, cutoff = cutoff, width = width)
+  fit <- fit_variogram_models(vg)
+
+  if (is.null(fit)) return(NULL)
+
+  kr <- krige(f, locations = train_sp, newdata = test_sp, model = fit)
+  pred <- kr$var1.pred
+
+  obs <- test_sf %>% st_drop_geometry() %>% pull(.data[[response]])
+  mets <- calc_metrics(obs, pred)
+
+  list(
+    variogram = vg,
+    fit = fit,
+    predictions = tibble(obs = obs, pred = pred),
+    metrics = mets
+  )
+}
+run_rk_model <- function(train_sf, test_sf, response, predictors, cutoff, width, ntree = 500) {
+  train_df <- train_sf %>% st_drop_geometry() %>% select(all_of(c(response, predictors))) %>% na.omit()
+  test_df  <- test_sf %>% st_drop_geometry() %>% select(all_of(c(response, predictors))) %>% na.omit()
+
+  # keep matched sf rows
+  train_sf2 <- train_sf %>% filter(complete.cases(st_drop_geometry(select(., all_of(c(response, predictors))))))
+  test_sf2  <- test_sf %>% filter(complete.cases(st_drop_geometry(select(., all_of(c(response, predictors))))))
+
+  tuning <- tune_rf_oob(train_df, response, predictors, ntree = ntree)
+
+  rf_fit <- randomForest(
+    x = train_df %>% select(all_of(predictors)),
+    y = train_df[[response]],
+    ntree = ntree,
+    mtry = tuning$best_mtry,
+    importance = TRUE
+  )
+
+  trend_train <- predict(rf_fit, newdata = train_df %>% select(all_of(predictors)))
+  trend_test  <- predict(rf_fit, newdata = test_df %>% select(all_of(predictors)))
+
+  train_sf2$residual <- train_df[[response]] - trend_train
+
+  train_sp <- as(train_sf2, "Spatial")
+  test_sp <- as(test_sf2, "Spatial")
+
+  vg_resid <- variogram(residual ~ 1, data = train_sp, cutoff = cutoff, width = width)
+  fit_resid <- fit_variogram_models(vg_resid)
+
+  if (is.null(fit_resid)) {
+    # fallback to trend-only
+    pred <- trend_test
+    obs <- test_df[[response]]
+
+    return(list(
+      rf_model = rf_fit,
+      residual_variogram = vg_resid,
+      residual_fit = NULL,
+      predictions = tibble(obs = obs, pred = pred),
+      metrics = calc_metrics(obs, pred),
+      best_mtry = tuning$best_mtry,
+      used_residual_kriging = FALSE
+    ))
+  }
+
+  kr_resid <- krige(residual ~ 1, locations = train_sp, newdata = test_sp, model = fit_resid)
+  pred <- trend_test + kr_resid$var1.pred
+  obs <- test_df[[response]]
+
+  list(
+    rf_model = rf_fit,
+    residual_variogram = vg_resid,
+    residual_fit = fit_resid,
+    predictions = tibble(obs = obs, pred = pred),
+    metrics = calc_metrics(obs, pred),
+    best_mtry = tuning$best_mtry,
+    used_residual_kriging = TRUE
+  )
+}
+
+
+run_one_iteration <- function(sf_data, split, response, predictors, dataset_name, cutoff, width, ntree = 500) {
+  train_sf <- sf_data[split$train_ids, ]
+  test_sf  <- sf_data[split$test_ids, ]
+
+  rf_res <- run_rf_model(train_sf, test_sf, response, predictors, ntree = ntree)
+  ok_res <- run_ok_model(train_sf, test_sf, response, cutoff = cutoff, width = width)
+  rk_res <- run_rk_model(train_sf, test_sf, response, predictors, cutoff = cutoff, width = width, ntree = ntree)
+
+  bind_rows(
+    rf_res$metrics %>%
+      mutate(
+        dataset = dataset_name,
+        variable = response,
+        method = "RF",
+        iteration = split$iteration,
+        seed = split$seed,
+        best_mtry = rf_res$best_mtry
+      ),
+
+    if (!is.null(ok_res)) {
+      ok_res$metrics %>%
+        mutate(
+          dataset = dataset_name,
+          variable = response,
+          method = "OK",
+          iteration = split$iteration,
+          seed = split$seed,
+          best_mtry = NA_real_
+        )
+    },
+
+    rk_res$metrics %>%
+      mutate(
+        dataset = dataset_name,
+        variable = response,
+        method = "RK",
+        iteration = split$iteration,
+        seed = split$seed,
+        best_mtry = rk_res$best_mtry,
+        used_residual_kriging = rk_res$used_residual_kriging
+      )
+  )
+}
+
+test_res <- run_one_iteration(
+  sf_data = soil_SP_cov,
+  split = resamples_SP[[1]],
+  response = "p",
+  predictors = cov_names,
+  dataset_name = "SP",
+  cutoff = cutoff_SP,
+  width = width_SP,
+  ntree = 500
+)
+
+test_res
+
+results_SP_all <- purrr::map_dfr(
+  soil_vars,
+  function(v) {
+    purrr::map_dfr(
+      resamples_SP,
+      function(split_obj) {
+        run_one_iteration(
+          sf_data = soil_SP_cov,
+          split = split_obj,
+          response = v,
+          predictors = cov_names,
+          dataset_name = "SP",
+          cutoff = cutoff_SP,
+          width = width_SP,
+          ntree = 500
+        )
+      }
+    )
+  }
+)
+
+results_COMP_all <- purrr::map_dfr(
+  soil_vars,
+  function(v) {
+    purrr::map_dfr(
+      resamples_COMP,
+      function(split_obj) {
+        run_one_iteration(
+          sf_data = soil_COMP_cov,
+          split = split_obj,
+          response = v,
+          predictors = cov_names,
+          dataset_name = "COMP",
+          cutoff = cutoff_COMP,
+          width = width_COMP,
+          ntree = 500
+        )
+      }
+    )
+  }
+)
+
+results_all <- bind_rows(results_SP_all, results_COMP_all)
+saveRDS(results_all, "../outputs/perry_model_results_03_26_2026.rds")
+saveRDS(resamples_SP, "../outputs/resamples_SP_03_26_2026.rds")
+saveRDS(resamples_COMP, "../outputs/resamples_COMP_03_26_2026.rds")
+#save results_all as .csv
+write.csv(results_all, "../outputs/perry_model_results_03_26_2026.csv", row.names = FALSE)
+beep("wilhelm")
+```
+
+
+```{r}
+#ensemble mapping:
+select_best_iterations <- function(results_tbl, top_frac = 0.25, n_fallback = 5) {
+  
+  results_tbl %>%
+    filter(is.finite(RMSE), is.finite(R2)) %>%
+    group_by(dataset, variable, method) %>%
+    mutate(
+      r2_cut   = quantile(R2, probs = 1 - top_frac, na.rm = TRUE),
+      rmse_cut = quantile(RMSE, probs = top_frac, na.rm = TRUE)
+    ) %>%
+    mutate(
+      keep = R2 >= r2_cut & RMSE <= rmse_cut
+    ) %>%
+    mutate(
+      rmse_score = ifelse(
+        max(RMSE, na.rm = TRUE) == min(RMSE, na.rm = TRUE),
+        1,
+        (max(RMSE, na.rm = TRUE) - RMSE) /
+          (max(RMSE, na.rm = TRUE) - min(RMSE, na.rm = TRUE))
+      ),
+      r2_score = ifelse(
+        max(R2, na.rm = TRUE) == min(R2, na.rm = TRUE),
+        1,
+        (R2 - min(R2, na.rm = TRUE)) /
+          (max(R2, na.rm = TRUE) - min(R2, na.rm = TRUE))
+      ),
+      score = 0.5 * rmse_score + 0.5 * r2_score
+    ) %>%
+    arrange(dataset, variable, method, desc(score)) %>%
+    group_by(dataset, variable, method) %>%
+    mutate(
+      keep = ifelse(sum(keep, na.rm = TRUE) == 0 & row_number() <= n_fallback, TRUE, keep)
+    ) %>%
+    filter(keep) %>%
+    mutate(
+      weight = score / sum(score, na.rm = TRUE)
+    ) %>%
+    ungroup()
+}
+
+selected_iters <- select_best_iterations(results_all, top_frac = 0.25, n_fallback = 5)
+
+get_dataset_objects <- function(dataset_name) {
+  if (dataset_name == "SP") {
+    list(
+      sf_data = soil_SP_cov,
+      resamples = resamples_SP,
+      cutoff = cutoff_SP,
+      width = width_SP
+    )
+  } else if (dataset_name == "COMP") {
+    list(
+      sf_data = soil_COMP_cov,
+      resamples = resamples_COMP,
+      cutoff = cutoff_COMP,
+      width = width_COMP
+    )
+  } else {
+    stop("dataset_name must be 'SP' or 'COMP'")
+  }
+}
+
+covariates_use <- cov_names
+template_rast <- covariate_stack[[1]]
+
+weighted_sd_rasters <- function(rast_stack, weights) {
+  w <- weights / sum(weights)
+  mu <- sum(rast_stack * w)
+  var_r <- sum(((rast_stack - mu)^2) * w)
+  sqrt(var_r)
+}
+
+build_one_prediction <- function(dataset_name, method_name, variable_name, iter_row,
+                                 covariates_use, covariate_stack) {
+  
+  objs <- get_dataset_objects(dataset_name)
+  sf_data <- objs$sf_data
+  resamples <- objs$resamples
+  cutoff <- objs$cutoff
+  width <- objs$width
+  
+  split <- resamples[[iter_row$iteration]]
+  train_sf <- sf_data[split$train_ids, ]
+  
+  # keep only complete cases for the modeled variable + predictors
+  train_df <- train_sf %>%
+    st_drop_geometry() %>%
+    select(all_of(c(variable_name, covariates_use))) %>%
+    na.omit()
+  
+  if (nrow(train_df) < 5) return(NULL)
+  
+  train_sf2 <- train_sf %>%
+    filter(complete.cases(st_drop_geometry(select(., all_of(c(variable_name, covariates_use))))))
+  
+  if (nrow(train_sf2) < 5) return(NULL)
+  
+  # RF
+  if (method_name == "RF") {
+    set.seed(iter_row$seed)
+    
+    mtry_use <- iter_row$best_mtry
+    if (!is.finite(mtry_use)) {
+      mtry_use <- max(1, floor(sqrt(length(covariates_use))))
+    }
+    
+    rf_model <- randomForest(
+      x = train_df[, covariates_use, drop = FALSE],
+      y = train_df[[variable_name]],
+      ntree = 500,
+      mtry = mtry_use,
+      importance = TRUE
+    )
+    
+    r_pred <- terra::predict(
+      covariate_stack[[covariates_use]],
+      rf_model,
+      fun = function(model, data) {
+        data <- as.data.frame(data)
+        predict(model, newdata = data)
+      },
+      na.rm = TRUE
+    )
+    
+    return(r_pred)
+  }
+  
+  # OK
+  if (method_name == "OK") {
+    vals <- train_sf2[[variable_name]]
+    if (length(unique(vals)) <= 1) return(NULL)
+    
+    train_sp <- as(train_sf2, "Spatial")
+    f <- as.formula(paste(variable_name, "~ 1"))
+    
+    vg <- tryCatch(
+      variogram(f, data = train_sp, cutoff = cutoff, width = width),
+      error = function(e) NULL
+    )
+    if (is.null(vg)) return(NULL)
+    
+    fit <- fit_variogram_models(vg)
+    if (is.null(fit)) return(NULL)
+    
+    grid_pts <- terra::as.points(template_rast, values = FALSE)
+    grid_sf <- sf::st_as_sf(grid_pts)
+    
+    ok_pred <- tryCatch(
+      krige(f, train_sp, as(grid_sf, "Spatial"), model = fit),
+      error = function(e) NULL
+    )
+    if (is.null(ok_pred)) return(NULL)
+    
+    pred_vect <- terra::vect(ok_pred)
+    r_pred <- terra::rasterize(pred_vect, template_rast, field = "var1.pred")
+    return(r_pred)
+  }
+  
+  # RK = RF trend + kriged residuals
+  if (method_name == "RK") {
+    set.seed(iter_row$seed)
+    
+    mtry_use <- iter_row$best_mtry
+    if (!is.finite(mtry_use)) {
+      mtry_use <- max(1, floor(sqrt(length(covariates_use))))
+    }
+    
+    rf_model <- randomForest(
+      x = train_df[, covariates_use, drop = FALSE],
+      y = train_df[[variable_name]],
+      ntree = 500,
+      mtry = mtry_use,
+      importance = TRUE
+    )
+    
+    trend_train <- predict(rf_model, newdata = train_df[, covariates_use, drop = FALSE])
+    residuals_train <- train_df[[variable_name]] - trend_train
+    
+    trend_rast <- terra::predict(
+      covariate_stack[[covariates_use]],
+      rf_model,
+      fun = function(model, data) {
+        data <- as.data.frame(data)
+        predict(model, newdata = data)
+      },
+      na.rm = TRUE
+    )
+    
+    if (isTRUE(iter_row$used_residual_kriging)) {
+      train_res_sf <- train_sf2 %>% mutate(residual = residuals_train)
+      train_res_sp <- as(train_res_sf, "Spatial")
+      
+      vg_resid <- tryCatch(
+        variogram(residual ~ 1, data = train_res_sp, cutoff = cutoff, width = width),
+        error = function(e) NULL
+      )
+      
+      if (!is.null(vg_resid)) {
+        fit_resid <- fit_variogram_models(vg_resid)
+        
+        if (!is.null(fit_resid)) {
+          grid_pts <- terra::as.points(template_rast, values = FALSE)
+          grid_sf <- sf::st_as_sf(grid_pts)
+          
+          rk_resid <- tryCatch(
+            krige(residual ~ 1, train_res_sp, as(grid_sf, "Spatial"), model = fit_resid),
+            error = function(e) NULL
+          )
+          
+          if (!is.null(rk_resid)) {
+            resid_vect <- terra::vect(rk_resid)
+            resid_rast <- terra::rasterize(resid_vect, template_rast, field = "var1.pred")
+            return(trend_rast + resid_rast)
+          }
+        }
+      }
+    }
+    
+    # fallback: trend-only
+    return(trend_rast)
+  }
+  
+  NULL
+}
+
+build_final_method_ensemble <- function(dataset_name, method_name, variable_name,
+                                        selected_iters, covariates_use, covariate_stack) {
+  
+  sel <- selected_iters %>%
+    filter(
+      dataset == dataset_name,
+      method == method_name,
+      variable == variable_name
+    ) %>%
+    arrange(desc(weight))
+  
+  if (nrow(sel) == 0) return(NULL)
+  
+  member_rasters <- list()
+  member_weights <- c()
+  member_meta <- list()
+  
+  for (i in seq_len(nrow(sel))) {
+    r_pred <- build_one_prediction(
+      dataset_name = dataset_name,
+      method_name = method_name,
+      variable_name = variable_name,
+      iter_row = sel[i, ],
+      covariates_use = covariates_use,
+      covariate_stack = covariate_stack
+    )
+    
+    if (!is.null(r_pred)) {
+      member_rasters[[length(member_rasters) + 1]] <- r_pred
+      member_weights <- c(member_weights, sel$weight[i])
+      member_meta[[length(member_meta) + 1]] <- sel[i, ]
+    }
+  }
+  
+  if (length(member_rasters) == 0) return(NULL)
+  
+  rast_stack <- rast(member_rasters)
+  member_weights <- member_weights / sum(member_weights)
+  
+  ens_mean <- sum(rast_stack * member_weights)
+  ens_sd <- weighted_sd_rasters(rast_stack, member_weights)
+  
+  names(ens_mean) <- paste(dataset_name, method_name, variable_name, "ensemble_mean", sep = "_")
+  names(ens_sd)   <- paste(dataset_name, method_name, variable_name, "ensemble_sd", sep = "_")
+  
+  list(
+    mean = ens_mean,
+    sd = ens_sd,
+    members = rast_stack,
+    weights = member_weights,
+    selected_rows = bind_rows(member_meta)
+  )
+}
+  # test_ensemble <- build_final_method_ensemble(
+  #   dataset_name = "SP",
+  #   method_name = "RK",
+  #   variable_name = "p",
+  #   selected_iters = selected_iters,
+  #   covariates_use = covariates_use,
+  #   covariate_stack = covariate_stack
+  # )
+  # 
+  # plot(test_ensemble$mean)
+  # plot(test_ensemble$sd)
+final_ensemble_rasters <- list()
+
+for (ds in c("SP", "COMP")) {
+  final_ensemble_rasters[[ds]] <- list()
+  
+  for (meth in c("RF", "OK", "RK")) {
+    final_ensemble_rasters[[ds]][[meth]] <- list()
+    
+    for (v in soil_vars) {
+      cat("Building final ensemble:", ds, meth, v, "\n")
+      
+      final_ensemble_rasters[[ds]][[meth]][[v]] <- build_final_method_ensemble(
+        dataset_name = ds,
+        method_name = meth,
+        variable_name = v,
+        selected_iters = selected_iters,
+        covariates_use = covariates_use,
+        covariate_stack = covariate_stack
+      )
+    }
+  }
+}
+
+par(mfrow = c(3, 3))
+
+for (ds in names(final_ensemble_rasters)) {
+  for (meth in names(final_ensemble_rasters[[ds]])) {
+    for (v in names(final_ensemble_rasters[[ds]][[meth]])) {
+      obj <- final_ensemble_rasters[[ds]][[meth]][[v]]
+      if (!is.null(obj)) {
+        plot(obj$mean, main = paste(ds, meth, v))
+      }
+    }
+  }
+}
+
+par(mfrow = c(3, 3))
+
+for (ds in names(final_ensemble_rasters)) {
+  for (meth in names(final_ensemble_rasters[[ds]])) {
+    for (v in names(final_ensemble_rasters[[ds]][[meth]])) {
+      obj <- final_ensemble_rasters[[ds]][[meth]][[v]]
+      if (!is.null(obj)) {
+        plot(obj$sd, main = paste(ds, meth, v, "SD"))
+      }
+    }
+  }
+}
+
+
+```
+
+

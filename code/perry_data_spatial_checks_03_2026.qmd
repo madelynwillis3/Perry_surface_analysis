@@ -1,0 +1,1463 @@
+---
+title: "Perry_surface_analysis_03_26_2026"
+format: html
+---
+
+```{r}
+#load libraries:
+library(sf)
+library(terra)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(GGally)
+library(e1071)      
+library(spdep)      
+library(gstat)      
+library(units)
+library(corrplot)
+library(randomForest)
+library(janitor)
+```
+
+```{r bad, eval = FALSE}
+# --- Load data ---
+covariate_stack <- rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
+
+#raw soil data
+soil_SP_raw <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_SP.csv")
+soil_C_raw  <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_C.csv")
+
+# Load carbon + nitrogen dataset
+soil_with_CN <- read_csv("../LOCAL DATA DO NOT PUSH/carbon/soil_data_with_CN.csv") %>%
+  rename(
+    c = leco_carbon_average,
+    n = leco_nitrogen_average
+  )
+
+# Split by sampling type
+SP_soil_with_CN <- soil_with_CN %>% filter(type == "SPID")
+C_soil_with_CN  <- soil_with_CN %>% filter(type == "CID")
+
+# Merge CN into point tables
+soil_SP_full <- soil_SP_raw %>%
+  select(x, y, lbc_1, lb_ceq, p_h_2, ca, k, mg, mn, p, zn) %>%
+  left_join(SP_soil_with_CN %>% select(x, y, c, n), by = c("x", "y"))
+
+soil_C_full <- soil_C_raw %>%
+  select(x, y, lbc_1, lb_ceq, p_h_2, ca, k, mg, mn, p, zn) %>%
+  left_join(C_soil_with_CN %>% select(x, y, c, n), by = c("x", "y"))
+
+# Convert to sf in same CRS as raster
+soil_sf_SP <- st_as_sf(soil_SP_full, coords = c("x","y"), crs = 4326) %>%
+  st_transform(crs(covariate_stack))
+
+soil_sf_C <- st_as_sf(soil_C_full, coords = c("x","y"), crs = 4326) %>%
+  st_transform(crs(covariate_stack))
+
+# Extract raster covariates directly at sample points
+extract_covariates_to_sf <- function(sf_obj, rast_obj) {
+  vals <- terra::extract(rast_obj, terra::vect(sf_obj))
+  vals <- vals %>% dplyr::select(-ID)
+  bind_cols(sf_obj, vals)
+}
+#extracted covs per point
+soil_sf_SP <- extract_covariates_to_sf(soil_sf_SP, covariate_stack)
+soil_sf_C  <- extract_covariates_to_sf(soil_sf_C,  covariate_stack)
+
+# Define covariates from raster names only
+covariates <- names(covariate_stack)
+
+# Keep only numeric covariates that exist in both sf tables
+# covariates <- covariates[covariates %in% names(soil_sf_SP)]
+soil_vars <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn","c","n")
+
+covariates <- c(
+  "elevation", "Slope", "Profile Curvature", "Plan Curvature",
+  "Total Curvature", "General Curvature", "Topographic Wetness Index_USGS",
+  "Topographic Position Index", "Flow Accumulation_USGS", "Stream Power Index",
+  "MRVBF", "MRRTF", "Direct Insolation", "Diffuse Insolation",
+  "Vertical Distance to Channel Network", "Overland Flow Distance",
+  "Horizontal Overland Flow Distance", "Vertical Overland Flow Distance",
+  "NDVI_sept_2022", "coastal_blue", "blue", "green_i", "green",
+  "yellow", "red", "rededge", "nir")
+```
+
+```{r redo}
+#crap. I think some of my data is messed up. I have missing points. Lets pull in the rawest data and plot it:
+#load soil points with soil data:
+
+soil_points_nutrients <- read.csv("../LOCAL DATA DO NOT PUSH/soil/perry_soil_points_surface_03_2026.csv")
+soil_points_nutrients <- soil_points_nutrients %>%
+  clean_names()
+# soil_prop_SP <- soil_points_nutrients %>%
+#   filter(type == "SPID")
+# 
+# soil_prop_COMP <- soil_points_nutrients %>%
+#   filter(type == "CID")
+
+covariate_stack <- rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
+# names(soil_points_nutrients)
+#  [1] "ID"         "OBJECTID_1" "Label"      "Row"        "PointLabel" "x"          "y"          "RowNUM"     "one"       
+# [10] "Plbsac"     "type"       "LBC.1"      "LBCeq"      "pH.2"       "Ca"         "K"          "Mg"         "Mn"        
+# [19] "P"          "Zn"         "geometry"  
+soil_vars <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn")
+
+#plot points (each separately for SPID and CID for type) with ID labelled
+soil_points_nutrients %>%
+  filter(type == "SPID") %>%
+  ggplot() +
+  geom_point(aes(x = x, y = y), color = "blue", size = 3) +
+  geom_text(aes(x = x, y = y, label = point_label), vjust = -1, size = 3) +
+  labs(title = "SPID points with IDs")
+
+soil_points_nutrients %>%
+  filter(type == "CID") %>%
+  ggplot() +
+  geom_point(aes(x = x, y = y), color = "red", size = 3) +
+  geom_text(aes(x = x, y = y, label = point_label), vjust = -1, size = 3) +
+  labs(title = "CID points with IDs")
+
+```
+
+```{r checks}
+#checks: 
+
+  #coordinate accuracy
+
+soil_prop_SP <- soil_points_nutrients %>%
+  filter(type == "SPID") %>%
+  st_as_sf(coords = c("x", "y"), crs = 4326) %>%
+  st_transform(26917)
+
+soil_prop_COMP <- soil_points_nutrients %>%
+  filter(type == "CID") %>%
+  st_as_sf(coords = c("x", "y"), crs = 4326) %>%
+  st_transform(26917)
+add_xy <- function(dat) {
+  coords <- st_coordinates(dat)
+  dat %>%
+    mutate(
+      X = coords[,1],
+      Y = coords[,2]
+    )
+}
+
+soil_prop_SP_xy <- add_xy(soil_prop_SP)
+soil_prop_COMP_xy <- add_xy(soil_prop_COMP)
+  # relabel current geometry correctly as lon/lat
+   
+  #duplicate points
+      qa_basic <- function(dat, soil_vars) {
+      
+      coords <- st_coordinates(dat)
+      
+      dat2 <- dat %>%
+        mutate(
+          X = coords[,1],
+          Y = coords[,2]
+        )
+      
+      # duplicate coordinates
+      dup_coords <- dat2 %>%
+        st_drop_geometry() %>%
+        count(X, Y) %>%
+        filter(n > 1)
+      
+      # missing values
+      missing_tbl <- dat2 %>%
+        st_drop_geometry() %>%
+        summarise(across(all_of(soil_vars), ~sum(is.na(.)))) %>%
+        pivot_longer(everything(), names_to = "variable", values_to = "n_missing")
+      
+      # basic coordinate summary
+      coord_summary <- dat2 %>%
+        st_drop_geometry() %>%
+        summarise(
+          n_points = n(),
+          x_min = min(X, na.rm = TRUE),
+          x_max = max(X, na.rm = TRUE),
+          y_min = min(Y, na.rm = TRUE),
+          y_max = max(Y, na.rm = TRUE)
+        )
+      
+      # nutrient summary
+      nutrient_summary <- dat2 %>%
+        st_drop_geometry() %>%
+        summarise(across(all_of(soil_vars),
+                         list(
+                           mean = ~mean(.x, na.rm = TRUE),
+                           sd = ~sd(.x, na.rm = TRUE),
+                           min = ~min(.x, na.rm = TRUE),
+                           max = ~max(.x, na.rm = TRUE)
+                         ))) %>%
+        pivot_longer(everything(),
+                     names_to = c("variable", ".value"),
+                     names_sep = "_")
+      
+      # IQR outliers
+      outlier_tbl <- map_dfr(soil_vars, function(v) {
+        x <- st_drop_geometry(dat2)[[v]]
+        q1 <- quantile(x, 0.25, na.rm = TRUE)
+        q3 <- quantile(x, 0.75, na.rm = TRUE)
+        iqr <- q3 - q1
+        lower <- q1 - 1.5 * iqr
+        upper <- q3 + 1.5 * iqr
+        
+        tibble(
+          variable = v,
+          n_outliers = sum(x < lower | x > upper, na.rm = TRUE),
+          lower_bound = lower,
+          upper_bound = upper
+        )
+      })
+      
+      list(
+        duplicate_coords = dup_coords,
+        missing_tbl = missing_tbl,
+        coord_summary = coord_summary,
+        nutrient_summary = nutrient_summary,
+        outlier_tbl = outlier_tbl
+      )
+      }
+      
+      qa_SP <- qa_basic(soil_prop_SP, soil_vars)
+      qa_COMP <- qa_basic(soil_prop_COMP, soil_vars)
+      
+      qa_SP$duplicate_coords
+      qa_SP$missing_tbl
+      qa_SP$coord_summary
+      qa_SP$outlier_tbl
+      
+      qa_COMP$duplicate_coords
+      qa_COMP$missing_tbl
+      qa_COMP$coord_summary
+      qa_COMP$outlier_tbl
+  #raw plot
+          plot_points_map <- function(dat, var) {
+      ggplot(dat) +
+        geom_sf(aes(color = .data[[var]]), size = 2) +
+        labs(title = paste("Raw point map:", var), color = var) +
+        theme_minimal()
+    }
+        
+    # for (v in soil_vars) {
+    #     print(plot_points_map(soil_prop_SP, v))
+    #   }
+    # for (v in soil_vars) {
+    #     print(plot_points_map(soil_prop_COMP, v))
+    #   }
+
+  #normality #skewness
+  #outliers
+    distribution_checks <- function(dat, soil_vars) {
+  
+      dat_df <- st_drop_geometry(dat)
+      
+      skew_tbl <- map_dfr(soil_vars, function(v) {
+        x <- dat_df[[v]]
+        tibble(
+          variable = v,
+          n = sum(!is.na(x)),
+          skewness = e1071::skewness(x, na.rm = TRUE, type = 2),
+          shapiro_p = if (sum(!is.na(x)) >= 3 && sum(!is.na(x)) <= 5000) {
+            shapiro.test(x[!is.na(x)])$p.value
+          } else {
+            NA_real_
+          }
+        )
+      })
+      
+      skew_tbl
+    }
+    
+    dist_SP <- distribution_checks(soil_prop_SP, soil_vars)
+    dist_COMP <- distribution_checks(soil_prop_COMP, soil_vars)
+    
+    dist_SP
+    dist_COMP
+    plot_histograms <- function(dat, soil_vars) {
+      dat %>%
+        st_drop_geometry() %>%
+        pivot_longer(all_of(soil_vars), names_to = "variable", values_to = "value") %>%
+        ggplot(aes(x = value)) +
+        geom_histogram(bins = 20) +
+        facet_wrap(~variable, scales = "free") +
+        theme_minimal()
+    }
+    
+    plot_histograms(soil_prop_SP, soil_vars)
+    plot_histograms(soil_prop_COMP, soil_vars)
+    
+    plot_qq <- function(dat, soil_vars) {
+    dat %>%
+        st_drop_geometry() %>%
+        pivot_longer(all_of(soil_vars), names_to = "variable", values_to = "value") %>%
+        ggplot(aes(sample = value)) +
+        stat_qq() +
+        stat_qq_line() +
+        facet_wrap(~variable, scales = "free") +
+        theme_minimal()
+    }
+    
+    plot_qq(soil_prop_SP, soil_vars)
+    plot_qq(soil_prop_COMP, soil_vars)
+    
+    #drift:
+    
+    plot_xy_trends <- function(dat, soil_vars) {
+  
+      plot_dat <- dat %>%
+        st_drop_geometry() %>%
+        mutate(
+          X = as.numeric(X),
+          Y = as.numeric(Y)
+        ) %>%
+        pivot_longer(all_of(soil_vars), names_to = "variable", values_to = "value") %>%
+        pivot_longer(c(X, Y), names_to = "coord", values_to = "coord_value") %>%
+        mutate(
+          value = as.numeric(value),
+          coord_value = as.numeric(coord_value)
+        ) %>%
+        filter(!is.na(value), !is.na(coord_value))
+      
+      ggplot(plot_dat, aes(x = coord_value, y = value)) +
+        geom_point(alpha = 0.6) +
+        geom_smooth(method = "lm", se = FALSE) +
+        facet_grid(variable ~ coord, scales = "free") +
+        theme_minimal()
+    }
+        
+    plot_xy_trends(soil_prop_SP_xy, soil_vars)
+    plot_xy_trends(soil_prop_COMP_xy, soil_vars)
+#residual behavior
+
+#sampling density:
+        distance_checks <- function(dat) {
+      coords <- st_coordinates(dat)
+      dmat <- as.matrix(dist(coords))
+      diag(dmat) <- NA
+      
+      nn_dist <- apply(dmat, 1, min, na.rm = TRUE)
+      
+      tibble(
+        n_points = nrow(coords),
+        mean_nn_dist = mean(nn_dist, na.rm = TRUE),
+        median_nn_dist = median(nn_dist, na.rm = TRUE),
+        min_nn_dist = min(nn_dist, na.rm = TRUE),
+        max_nn_dist = max(nn_dist, na.rm = TRUE)
+      )
+    }
+    
+    distance_checks(soil_prop_SP)
+    distance_checks(soil_prop_COMP)
+    
+    plot_nn_dist <- function(dat) {
+      coords <- st_coordinates(dat)
+      dmat <- as.matrix(dist(coords))
+      diag(dmat) <- NA
+      nn_dist <- apply(dmat, 1, min, na.rm = TRUE)
+      
+      tibble(nn_dist = nn_dist) %>%
+        ggplot(aes(x = nn_dist)) +
+        geom_histogram(bins = 20) +
+        theme_minimal() +
+        labs(title = "Nearest-neighbor distances", x = "Distance", y = "Count")
+    }
+    
+    plot_nn_dist(soil_prop_SP)
+    plot_nn_dist(soil_prop_COMP)
+    
+    
+  #enough points overall?
+  #enough short-distance pairs for a stable variogram?
+    #lol
+    
+  #enough coverage across the whole field?
+
+#Anisotropy check 
+  #x coord
+  #y coord
+  #response vs covariates
+
+#spatial autocorrelation check
+  #semivariogram
+    soil_prop_SP_sp <- as(soil_prop_SP, "Spatial")
+    soil_prop_COMP_sp <- as(soil_prop_COMP, "Spatial")
+    
+    make_variograms <- function(dat_sp, soil_vars, cutoff, width) {
+      purrr::map(soil_vars, function(v) {
+        f <- as.formula(paste(v, "~ 1"))
+        gstat::variogram(f, data = dat_sp, cutoff = cutoff, width = width)
+      }) |> rlang::set_names(soil_vars)
+    }
+    
+    coords_SP <- sp::coordinates(soil_prop_SP_sp)
+    max_dist_SP <- max(dist(coords_SP))
+    cutoff_SP <- max_dist_SP / 2
+    width_SP <- cutoff_SP / 12
+    
+    coords_COMP <- sp::coordinates(soil_prop_COMP_sp)
+    max_dist_COMP <- max(dist(coords_COMP))
+    cutoff_COMP <- max_dist_COMP / 2
+    width_COMP <- cutoff_COMP / 12
+    
+    vg_SP <- make_variograms(soil_prop_SP_sp, soil_vars, cutoff_SP, width_SP)
+    vg_COMP <- make_variograms(soil_prop_COMP_sp, soil_vars, cutoff_COMP, width_COMP)
+    #plot variograms for all variables:
+    plot_variograms <- function(vg_list) {
+      purrr::imap(vg_list, function(vg, var) {
+        plot(vg, main = paste("Variogram:", var))
+      })
+    }
+    plot_variograms(vg_SP)
+    plot_variograms(vg_COMP)
+  #nugget
+  #range
+  #sill
+  #nugget to sill ratio
+
+  #moran's I
+    moran_check <- function(dat, var, k = 5) {
+      coords <- st_coordinates(dat)
+      knn <- knearneigh(coords, k = k)
+      nb <- knn2nb(knn)
+      lw <- nb2listw(nb, style = "W")
+      
+      x <- st_drop_geometry(dat)[[var]]
+      valid <- !is.na(x)
+      
+      moran.test(x[valid], nb2listw(knn2nb(knearneigh(coords[valid, ], k = k)), style = "W"))
+    }
+    moran_all <- function(dat, soil_vars, k = 5) {
+      map_dfr(soil_vars, function(v) {
+        res <- moran_check(dat, v, k = k)
+        tibble(
+          variable = v,
+          moran_I = unname(res$estimate[1]),
+          expectation = unname(res$estimate[2]),
+          variance = unname(res$estimate[3]),
+          p_value = res$p.value
+        )
+      })
+    }
+    
+    moran_SP <- moran_all(soil_prop_SP, soil_vars)
+    moran_COMP <- moran_all(soil_prop_COMP, soil_vars)
+    
+    moran_SP
+    moran_COMP
+    
+    
+#directional semivariograms
+  #does range change by direction?
+  #does sill change by direction?
+  #does nugget change by direction?
+  #directional behavior in response vs covariates?
+  #anisotropy in residuals?
+    directional_variogram <- function(dat_sp, var, alpha_vals = c(0, 45, 90, 135), tol.hor = 22.5) {
+  f <- as.formula(paste(var, "~ 1"))
+  variogram(f, data = dat_sp, alpha = alpha_vals, tol.hor = tol.hor)
+    }
+    
+    #plot for all:
+    plot_directional_variograms <- function(dat_sp, soil_vars) {
+      map(soil_vars, function(v) {
+        vg_dir <- directional_variogram(dat_sp, v)
+        plot(vg_dir, main = paste("Directional variogram:", v))
+      })
+    }
+    plot_directional_variograms(soil_prop_SP_sp, soil_vars)
+#covariate checks
+    extract_covariates <- function(dat_sf, covariate_stack) {
+      vect_pts <- vect(dat_sf)
+      cov_vals <- terra::extract(covariate_stack, vect_pts)
+      
+      bind_cols(
+        dat_sf %>% st_drop_geometry(),
+        cov_vals %>% select(-ID)
+      ) %>%
+        bind_cols(geometry = st_geometry(dat_sf)) %>%
+        st_as_sf()
+    }
+    
+    soil_SP_cov <- extract_covariates(soil_prop_SP, covariate_stack)
+    soil_COMP_cov <- extract_covariates(soil_prop_COMP, covariate_stack)
+    
+    
+  #did every point inherit raster values?
+    
+    cov_missing_check <- function(dat, cov_names) {
+      dat %>%
+        st_drop_geometry() %>%
+        summarise(across(all_of(cov_names), ~sum(is.na(.)))) %>%
+        pivot_longer(everything(), names_to = "covariate", values_to = "n_missing")
+    }
+    
+    cov_names <- names(covariate_stack)
+    
+    cov_missing_SP <- cov_missing_check(soil_SP_cov, cov_names)
+    cov_missing_COMP <- cov_missing_check(soil_COMP_cov, cov_names)
+    
+    cov_missing_SP
+    cov_missing_COMP
+  #are there any missing covariate values?
+  #are there any outliers in covariate values?
+  #are covariate values correlated with each other?
+    cov_summary <- function(dat, cov_names) {
+      dat %>%
+        st_drop_geometry() %>%
+        summarise(across(all_of(cov_names),
+                         list(min = ~min(.x, na.rm = TRUE),
+                              max = ~max(.x, na.rm = TRUE),
+                              mean = ~mean(.x, na.rm = TRUE),
+                              sd = ~sd(.x, na.rm = TRUE)))) %>%
+        pivot_longer(everything(),
+                     names_to = c("covariate", ".value"),
+                     names_sep = "_")
+    }
+    
+    cov_summary(soil_SP_cov, cov_names)
+    
+    cov_cor_mat <- soil_SP_cov %>%
+      st_drop_geometry() %>%
+      select(all_of(cov_names)) %>%
+      cor(use = "pairwise.complete.obs", method = "spearman")
+    
+    corrplot(cov_cor_mat, method = "color", tl.cex = 0.6)
+    
+    high_cor_pairs <- function(cor_mat, cutoff = 0.8) {
+      cor_df <- as.data.frame(as.table(cor_mat)) %>%
+        rename(var1 = Var1, var2 = Var2, cor = Freq) %>%
+        filter(var1 != var2) %>%
+        mutate(pair = map2_chr(var1, var2, ~paste(sort(c(.x, .y)), collapse = "___"))) %>%
+        distinct(pair, .keep_all = TRUE) %>%
+        filter(abs(cor) >= cutoff)
+      
+      cor_df
+    }
+    
+    high_cor_pairs(cov_cor_mat, cutoff = 0.8)
+    
+    plot_response_covariate <- function(dat, response, covariate) {
+      ggplot(st_drop_geometry(dat), aes(x = .data[[covariate]], y = .data[[response]])) +
+        geom_point(alpha = 0.6) +
+        geom_smooth(method = "loess", se = FALSE) +
+        theme_minimal() +
+        labs(title = paste(response, "vs", covariate))
+    }
+    
+    #plot for all covariates:
+    for (cov in cov_names) {
+      print(plot_response_covariate(soil_SP_cov, "p", cov))
+    }
+
+```
+
+
+```{r}
+#checks on residuals after RF (for RK)
+#residual checks from RF model
+  #skew
+  #outliers
+  #heavy tails?
+  run_rf_residuals <- function(dat, response, cov_names, ntree = 500, seed = 123) {
+  
+  set.seed(seed)
+  
+  # keep only needed columns and complete cases
+  df <- dat %>%
+    st_drop_geometry() %>%
+    select(all_of(c(response, cov_names))) %>%
+    na.omit()
+  
+  # keep matching geometry rows
+  dat_complete <- dat %>%
+    filter(complete.cases(st_drop_geometry(select(., all_of(c(response, cov_names))))))
+  
+      rf_mod <- randomForest(
+        x = df %>% select(all_of(cov_names)),
+        y = df[[response]],
+        ntree = ntree,
+        importance = TRUE
+      )
+      
+      preds <- predict(rf_mod, newdata = df %>% select(all_of(cov_names)))
+      residuals <- df[[response]] - preds
+      
+      out_sf <- dat_complete %>%
+        mutate(
+          observed = df[[response]],
+          predicted = preds,
+          residual = residuals
+        )
+      
+      list(
+        model = rf_mod,
+        data = out_sf
+      )
+    }
+        rf_P_SP <- run_rf_residuals(
+      dat = soil_SP_cov,
+      response = "p",
+      cov_names = cov_names,
+      ntree = 500
+    )
+    
+    rf_P_COMP <- run_rf_residuals(
+      dat = soil_COMP_cov,
+      response = "p",
+      cov_names = cov_names,
+      ntree = 500
+    )
+    rf_model_summary <- function(rf_obj) {
+      dat <- rf_obj$data %>% st_drop_geometry()
+      
+      tibble(
+        n = nrow(dat),
+        RMSE = sqrt(mean((dat$observed - dat$predicted)^2, na.rm = TRUE)),
+        MAE = mean(abs(dat$observed - dat$predicted), na.rm = TRUE),
+        R2 = cor(dat$observed, dat$predicted, use = "complete.obs")^2,
+        mean_error = mean(dat$residual, na.rm = TRUE)
+      )
+    }
+    
+    rf_model_summary(rf_P_SP)
+    rf_model_summary(rf_P_COMP)
+      varImpPlot(rf_P_SP$model, main = "RF Variable Importance - SP P")
+      varImpPlot(rf_P_COMP$model, main = "RF Variable Importance - COMP P")
+      
+      rf_residual_summary <- function(rf_obj) {
+      r <- rf_obj$data %>%
+        st_drop_geometry() %>%
+        pull(residual)
+      
+      q1 <- quantile(r, 0.25, na.rm = TRUE)
+      q3 <- quantile(r, 0.75, na.rm = TRUE)
+      iqr <- q3 - q1
+      
+      tibble(
+        n = sum(!is.na(r)),
+        mean_resid = mean(r, na.rm = TRUE),
+        sd_resid = sd(r, na.rm = TRUE),
+        skewness = e1071::skewness(r, na.rm = TRUE, type = 2),
+        shapiro_p = if (sum(!is.na(r)) >= 3 && sum(!is.na(r)) <= 5000) 
+          shapiro.test(r)$p.value else NA_real_,
+        n_iqr_outliers = sum(r < (q1 - 1.5 * iqr) | r > (q3 + 1.5 * iqr), na.rm = TRUE)
+      )
+    }
+    
+    rf_residual_summary(rf_P_SP)
+    rf_residual_summary(rf_P_COMP)
+    
+    plot_rf_resid_hist <- function(rf_obj, title = "RF residuals") {
+      rf_obj$data %>%
+        st_drop_geometry() %>%
+        ggplot(aes(x = residual)) +
+        geom_histogram(bins = 20) +
+        theme_minimal() +
+        labs(title = title, x = "Residual", y = "Count")
+    }
+    
+    plot_rf_resid_hist(rf_P_SP, "SP P RF residuals")
+    plot_rf_resid_hist(rf_P_COMP, "COMP P RF residuals")
+    plot_rf_resid_qq <- function(rf_obj, title = "RF residual QQ plot") {
+      rf_obj$data %>%
+        st_drop_geometry() %>%
+        ggplot(aes(sample = residual)) +
+        stat_qq() +
+        stat_qq_line() +
+        theme_minimal() +
+        labs(title = title)
+    }
+    
+    plot_rf_resid_qq(rf_P_SP, "SP P RF residual QQ plot")
+    plot_rf_resid_qq(rf_P_COMP, "COMP P RF residual QQ plot")
+    
+    plot_obs_pred <- function(rf_obj, title = "Observed vs Predicted") {
+      rf_obj$data %>%
+        st_drop_geometry() %>%
+        ggplot(aes(x = observed, y = predicted)) +
+        geom_point(alpha = 0.7) +
+        geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+        geom_smooth(method = "lm", se = FALSE) +
+        theme_minimal() +
+        labs(title = title, x = "Observed", y = "Predicted")
+    }
+    
+    plot_obs_pred(rf_P_SP, "SP P Observed vs Predicted")
+    plot_obs_pred(rf_P_COMP, "COMP P Observed vs Predicted")
+    
+    plot_rf_resid_map <- function(rf_obj, title = "RF residual map") {
+      ggplot(rf_obj$data) +
+        geom_sf(aes(color = residual), size = 2) +
+        theme_minimal() +
+        labs(title = title, color = "Residual")
+    }
+    
+    plot_rf_resid_map(rf_P_SP, "SP P RF residual map")
+    plot_rf_resid_map(rf_P_COMP, "COMP P RF residual map")
+    
+    
+    rf_residual_moran <- function(rf_obj, k = 5) {
+      coords <- st_coordinates(rf_obj$data)
+      r <- rf_obj$data %>%
+        st_drop_geometry() %>%
+        pull(residual)
+      
+      knn <- knearneigh(coords, k = k)
+      nb <- knn2nb(knn)
+      lw <- nb2listw(nb, style = "W")
+      
+      moran.test(r, lw)
+    }
+    
+    rf_residual_moran(rf_P_SP, k = 5)
+    rf_residual_moran(rf_P_COMP, k = 5)
+    
+       rf_residual_variogram <- function(rf_obj, cutoff, width) {
+      dat_sp <- as(rf_obj$data, "Spatial")
+      variogram(residual ~ 1, data = dat_sp, cutoff = cutoff, width = width)
+    }
+    
+    vg_rf_resid_SP <- rf_residual_variogram(rf_P_SP)
+    vg_rf_resid_COMP <- rf_residual_variogram(rf_P_COMP)
+    
+    plot(vg_rf_resid_SP, main = "SP P RF residual variogram")
+    plot(vg_rf_resid_COMP, main = "COMP P RF residual variogram")
+    
+    rf_residual_dir_variogram <- function(rf_obj, alpha_vals = c(0, 45, 90, 135), tol.hor = 22.5) {
+      dat_sp <- as(rf_obj$data, "Spatial")
+      variogram(residual ~ 1, data = dat_sp, alpha = alpha_vals, tol.hor = tol.hor)
+    }
+    
+    vg_rf_resid_dir_SP <- rf_residual_dir_variogram(rf_P_SP)
+    vg_rf_resid_dir_COMP <- rf_residual_dir_variogram(rf_P_COMP)
+    
+    plot(vg_rf_resid_dir_SP, main = "SP P directional RF residual variogram")
+    plot(vg_rf_resid_dir_COMP, main = "COMP P directional RF residual variogram")
+    
+    run_rf_all <- function(dat, soil_vars, cov_names, ntree = 500, seed = 123) {
+      map(soil_vars, ~run_rf_residuals(dat, response = .x, cov_names = cov_names, ntree = ntree,
+                                       seed = seed)) %>%
+        set_names(soil_vars)}
+    
+    rf_all_SP <- run_rf_all(soil_SP_cov, soil_vars, cov_names)
+    rf_all_COMP <- run_rf_all(soil_COMP_cov, soil_vars, cov_names)
+    
+    rf_all_summary <- function(rf_list) {
+      map_dfr(names(rf_list), function(v) {
+        s <- rf_model_summary(rf_list[[v]])
+        rs <- rf_residual_summary(rf_list[[v]])
+        
+        tibble(
+          variable = v,
+          n = s$n,
+          RMSE = s$RMSE,
+          MAE = s$MAE,
+          R2 = s$R2,
+          mean_error = s$mean_error,
+          resid_skewness = rs$skewness,
+          resid_shapiro_p = rs$shapiro_p,
+          resid_n_iqr_outliers = rs$n_iqr_outliers
+        )
+      })
+    }
+    
+    rf_summary_SP <- rf_all_summary(rf_all_SP)
+    rf_summary_COMP <- rf_all_summary(rf_all_COMP)
+    
+    rf_summary_SP
+    rf_summary_COMP
+    rf_all_moran <- function(rf_list, k = 5) {
+      map_dfr(names(rf_list), function(v) {
+        mt <- rf_residual_moran(rf_list[[v]], k = k)
+        
+        tibble(
+          variable = v,
+          moran_I = unname(mt$estimate[1]),
+          expectation = unname(mt$estimate[2]),
+          variance = unname(mt$estimate[3]),
+          p_value = mt$p.value
+        )
+      })
+    }
+    
+    rf_moran_SP <- rf_all_moran(rf_all_SP, k = 5)
+    rf_moran_COMP <- rf_all_moran(rf_all_COMP, k = 5)
+    
+    rf_moran_SP
+    rf_moran_COMP
+    #Random forest provided strong predictive performance for phosphorus, with low bias and high explained variance. However, residual spatial autocorrelation differed by sampling method. For the single-point dataset, RF residuals remained significantly spatially autocorrelated (Moran’s I = 0.181, p < 0.001), indicating that RF alone did not fully capture spatial structure and that residual kriging may be warranted. In contrast, composite-sample residuals showed no significant spatial autocorrelation (Moran’s I = 0.002, p = 0.401), suggesting that RF captured most of the structured variation in that dataset.....
+```
+```{r}
+#weird point:
+
+inspect_close_pairs <- function(dat, response, max_dist = 100) {
+  
+  coords <- st_coordinates(dat)
+  vals <- dat %>% st_drop_geometry() %>% pull(.data[[response]])
+  ids <- seq_len(nrow(dat))
+  
+  dmat <- as.matrix(dist(coords))
+  
+  pair_idx <- which(upper.tri(dmat) & dmat <= max_dist, arr.ind = TRUE)
+  
+  if (nrow(pair_idx) == 0) {
+    return(tibble())
+  }
+  
+  tibble(
+    i = pair_idx[,1],
+    j = pair_idx[,2],
+    id_i = ids[pair_idx[,1]],
+    id_j = ids[pair_idx[,2]],
+    dist = dmat[pair_idx],
+    z_i = vals[pair_idx[,1]],
+    z_j = vals[pair_idx[,2]],
+    diff = z_i - z_j,
+    abs_diff = abs(diff),
+    semivariance_contribution = 0.5 * (diff^2)
+  ) %>%
+    arrange(desc(semivariance_contribution))
+}
+
+close_pairs_p <- inspect_close_pairs(soil_prop_SP, "p", max_dist = 100)
+head(close_pairs_p, 20)
+
+find_repeat_offenders <- function(close_pairs_tbl) {
+  bind_rows(
+    close_pairs_tbl %>% count(id_i, wt = semivariance_contribution, name = "total_sv") %>% rename(id = id_i),
+    close_pairs_tbl %>% count(id_j, wt = semivariance_contribution, name = "total_sv") %>% rename(id = id_j)
+  ) %>%
+    group_by(id) %>%
+    summarise(total_sv = sum(total_sv), .groups = "drop") %>%
+    arrange(desc(total_sv))
+}
+
+repeat_offenders_p <- find_repeat_offenders(close_pairs_p)
+head(repeat_offenders_p, 10)
+
+suspect_ids <- repeat_offenders_p$id[1:3]
+
+soil_prop_SP %>%
+  mutate(flag = row_number() %in% suspect_ids) %>%
+  ggplot() +
+  geom_sf(aes(color = flag), size = 2) +
+  theme_minimal()
+
+library(ggrepel)
+
+coords_df <- soil_prop_SP %>%
+  mutate(row_id = row_number()) %>%
+  cbind(st_coordinates(.)) %>%
+  st_drop_geometry()
+
+ggplot(coords_df, aes(X, Y)) +
+  geom_point() +
+  geom_text_repel(
+    data = subset(coords_df, row_id %in% suspect_ids),
+    aes(label = row_id)
+  ) +
+  coord_equal() +
+  theme_minimal()
+
+suspect_ids <- repeat_offenders_p$id[1:5]
+
+soil_prop_SP %>%
+  mutate(row_id = row_number()) %>%
+  st_drop_geometry() %>%
+  filter(row_id %in% suspect_ids) %>%
+  select(row_id, point_label, p, zn, mn, mg, ca, everything())
+
+inspect_neighbors <- function(dat, response, focal_id, radius = 100) {
+  coords <- st_coordinates(dat)
+  vals <- dat %>% st_drop_geometry() %>% pull(.data[[response]])
+  
+  d <- as.matrix(dist(coords))
+  
+  tibble(
+    focal_id = focal_id,
+    neighbor_id = seq_len(nrow(dat)),
+    dist = d[focal_id, ],
+    value = vals,
+    focal_value = vals[focal_id]
+  ) %>%
+    filter(dist <= radius, neighbor_id != focal_id) %>%
+    arrange(dist)
+}
+
+#inspect_neighbors(soil_prop_SP, "p", focal_id = suspect_ids[1], radius = 100)
+
+vg_p_classic <- variogram(p ~ 1, data = as(soil_prop_SP, "Spatial"))
+vg_p_robust  <- variogram(p ~ 1, data = as(soil_prop_SP, "Spatial"), cressie = TRUE)
+
+plot(vg_p_classic, main = "Classic variogram - P")
+plot(vg_p_robust, main = "Robust variogram - P")
+
+soil_prop_SP <- soil_prop_SP %>%
+  mutate(
+    log_p = log1p(p),
+    log_zn = log1p(zn),
+    log_mg = log1p(mg)
+  )
+
+vg_logp <- variogram(log_p ~ 1, data = as(soil_prop_SP, "Spatial"))
+plot(vg_logp, main = "Log-transformed variogram - P")
+
+soil_prop_SP$row_id <- seq_len(nrow(soil_prop_SP))
+
+vg_full <- variogram(p ~ 1, data = as(soil_prop_SP, "Spatial"))
+vg_minus2 <- variogram(p ~ 1, data = as(filter(soil_prop_SP, row_id != 2), "Spatial"))
+
+plot(vg_full, main = "Full P variogram")
+plot(vg_minus2, main = "P variogram without point 2")
+
+inspect_neighbors <- function(dat, response, focal_id, radius = 100) {
+  coords <- st_coordinates(dat)
+  vals <- dat %>% st_drop_geometry() %>% pull(.data[[response]])
+  
+  d <- as.matrix(dist(coords))
+  dd <- as.numeric(d[focal_id, ])
+  
+  tibble(
+    focal_id = focal_id,
+    neighbor_id = seq_len(nrow(dat)),
+    dist = dd,
+    value = vals,
+    focal_value = vals[focal_id]
+  ) %>%
+    filter(dist <= radius, neighbor_id != focal_id) %>%
+    arrange(dist)
+}
+inspect_neighbors(soil_prop_SP, "p", focal_id = 2, radius = 100)
+inspect_neighbors(soil_prop_SP, "p", focal_id = 51, radius = 100)
+inspect_neighbors(soil_prop_SP, "p", focal_id = 93, radius = 100)
+
+
+#sensitivity analysis by removing points with highest semivariance contributions:
+soil_prop_SP$row_id <- seq_len(nrow(soil_prop_SP))
+
+soil_prop_SP %>%
+  st_drop_geometry() %>%
+  select(row_id, point_label, p, zn, mg, ca)
+soil_prop_SP %>%
+  st_drop_geometry() %>%
+  filter(row_id %in% c(2, 3, 12, 51, 93)) %>%
+  select(row_id, point_label, p, zn, mg, ca)
+
+soil_prop_SP %>%
+  st_drop_geometry() %>%
+  filter(row_id %in% c(2, 3, 12, 51, 93)) %>%
+  select(row_id, point_label, p, zn, mg, ca)
+
+bad_labels <- c("2A", "3A", "12B", "51E", "93H")
+
+soil_minus_top <- soil_prop_SP %>%
+  filter(!(point_label %in% bad_labels))
+
+soil_minus_top %>%
+  st_drop_geometry() %>%
+  filter(point_label %in% bad_labels)
+
+ggplot(soil_minus_top) +
+  geom_sf() +
+  theme_minimal()
+
+ggplot(soil_prop_SP %>% filter(point_label %in% bad_labels)) +
+  geom_sf(color = "red", size = 3) +
+  theme_minimal()
+
+vg_full <- variogram(p ~ 1, data = as(soil_prop_SP, "Spatial"))
+vg_minus <- variogram(p ~ 1, data = as(soil_minus_top, "Spatial"))
+
+head(vg_full, 3)
+head(vg_minus, 3)
+
+close_pairs_p_minus <- inspect_close_pairs(soil_minus_top, "p", max_dist = 100)
+head(close_pairs_p_minus, 20)
+
+bad_labels <- c("2A", "3A", "12B", "51E", "93H")
+
+soil_minus_top <- soil_prop_SP %>%
+  filter(!(point_label %in% bad_labels))
+
+nrow(soil_prop_SP)
+nrow(soil_minus_top)
+
+soil_minus_top %>%
+  st_drop_geometry() %>%
+  filter(point_label %in% bad_labels)
+
+bad_labels <- c("2A", "3A", "12B", "51E", "93H")
+
+soil_minus_top <- soil_prop_SP %>%
+  filter(!(point_label %in% bad_labels))
+
+nrow(soil_prop_SP)
+nrow(soil_minus_top)
+
+soil_minus_top %>%
+  st_drop_geometry() %>%
+  filter(point_label %in% bad_labels)
+
+close_pairs_p_minus <- inspect_close_pairs(soil_minus_top, "p", max_dist = 100)
+head(close_pairs_p_minus, 20)
+
+#There is real short-range heterogeneity in P
+  # Not because of one obvious bad point or because of only the first set of hotspot points.
+  # bc multiple different local neighborhoods contain abrupt changes.
+
+soil_prop_SP %>%
+  st_drop_geometry() %>%
+  mutate(row_id = row_number()) %>%
+  filter(row_id %in% c(78, 79, 88, 94, 95))
+
+close_pairs_p_minus %>%
+  filter(dist < 70)
+#The first lag class was elevated because it contained only three very short-distance pairs... meaning that it shouldn't be interpreted too much.
+vg_p_rebin <- variogram(
+  p ~ 1,
+  data = as(soil_prop_SP, "Spatial"),
+  cutoff = cutoff_SP,
+  width = 90
+)
+
+plot(vg_p_rebin)
+head(vg_p_rebin, 5)
+
+vg_p_w75 <- variogram(p ~ 1, data = as(soil_prop_SP, "Spatial"), cutoff = cutoff_SP, width = 75)
+vg_p_w90 <- variogram(p ~ 1, data = as(soil_prop_SP, "Spatial"), cutoff = cutoff_SP, width = 90)
+vg_p_w100 <- variogram(p ~ 1, data = as(soil_prop_SP, "Spatial"), cutoff = cutoff_SP, width = 100)
+
+plot(vg_p_w75, main = "P variogram - width 75")
+plot(vg_p_w90, main = "P variogram - width 90")
+plot(vg_p_w100, main = "P variogram - width 100")
+vg_p <- variogram(p ~ 1, data = as(soil_prop_SP, "Spatial"))
+
+vg_p_no1 <- vg_p[-1, ]
+
+fit_full <- fit.variogram(vg_p, model = vgm("Exp"))
+fit_no1  <- fit.variogram(vg_p_no1, model = vgm("Exp"))
+
+fit_full
+fit_no1
+
+#plot variogram with and without the first lag class
+plot(vg_p, main = "P variogram with all lags")
+plot(vg_p_no1, main = "P variogram without first lag class")
+#first lag class an unstable first semivariogram bin with too few pairs
+
+
+
+
+identical(vg_p, vg_SP$p)
+
+as.data.frame(vg_p)[1:6, ]
+as.data.frame(vg_SP$p)[1:6, ]
+as.data.frame(vg_p_no1)[1:6, ]
+
+plot(vg_p, main = "vg_p")
+plot(vg_SP$p, main = "vg_SP$p")
+plot(vg_p_no1, main = "vg_p_no1")
+
+vg_SP$p
+
+
+vg_drop_first_if_low_np <- function(vg, frac_cutoff = 0.1, abs_cutoff = 10) {
+  vg_df <- as.data.frame(vg)
+  
+  first_np <- vg_df$np[1]
+  med_np <- median(vg_df$np[-1], na.rm = TRUE)
+  
+  drop_first <- first_np < abs_cutoff || first_np < frac_cutoff * med_np
+  
+  list(
+    drop_first = drop_first,
+    first_np = first_np,
+    median_other_np = med_np,
+    vg_out = if (drop_first) vg[-1, ] else vg
+  )
+}
+
+res_p <- vg_drop_first_if_low_np(vg_SP$p)
+
+res_p$drop_first
+res_p$first_np
+res_p$median_other_np
+
+plot(res_p$vg_out, main = "P variogram (first lag dropped if weakly supported)")
+
+vg_SP_adj <- lapply(vg_SP, vg_drop_first_if_low_np)
+
+# adjusted variogram objects
+vg_SP_adj_only <- lapply(vg_SP_adj, `[[`, "vg_out")
+
+# summary table
+vg_SP_adj_summary <- tibble(
+  variable = names(vg_SP_adj),
+  drop_first = sapply(vg_SP_adj, `[[`, "drop_first"),
+  first_np = sapply(vg_SP_adj, `[[`, "first_np"),
+  median_other_np = sapply(vg_SP_adj, `[[`, "median_other_np")
+)
+
+vg_SP_adj_summary
+
+
+#removing the first lag as a sensitivity-adjusted variogram is justified here.
+#we can either use sensitivity adjusted variograms or just higher bins...
+
+
+# The first lag class in the empirical semivariogram was supported by only two point pairs, whereas the remaining lag classes were supported by hundreds of pairs (median = 702). Because this first bin was highly unstable and disproportionately influential, it was treated cautiously in interpretation. Sensitivity analyses using a wider lag width and excluding the first lag produced a more stable representation of the broader spatial structure.
+
+
+```
+```{r}
+
+coords_SP <- sf::st_coordinates(soil_prop_SP)
+coords_COMP <- sf::st_coordinates(soil_prop_COMP)
+
+max_dist_SP <- max(dist(coords_SP))
+max_dist_COMP <- max(dist(coords_COMP))
+
+cutoff_SP <- max_dist_SP / 2
+cutoff_COMP <- max_dist_COMP / 2
+
+width_SP <- 100
+width_COMP <- 100
+make_variograms <- function(dat_sp, soil_vars, cutoff, width) {
+  purrr::map(soil_vars, function(v) {
+    f <- as.formula(paste(v, "~ 1"))
+    gstat::variogram(f, data = dat_sp, cutoff = cutoff, width = width)
+  }) |> rlang::set_names(soil_vars)
+}
+
+vg_SP <- make_variograms(soil_prop_SP_sp, soil_vars, cutoff_SP, width_SP)
+vg_COMP <- make_variograms(soil_prop_COMP_sp, soil_vars, cutoff_COMP, width_COMP)
+
+drop_first_lag <- function(vg) {
+  if (nrow(vg) > 1) vg[-1, ] else vg
+}
+
+vg_SP_no1 <- purrr::map(vg_SP, drop_first_lag)
+vg_COMP_no1 <- purrr::map(vg_COMP, drop_first_lag)
+
+plot_variograms <- function(vg_list, title_prefix = "") {
+  for (nm in names(vg_list)) {
+    plot(vg_list[[nm]], main = paste(title_prefix, nm))
+  }
+}
+
+plot_variograms(vg_SP, "SP")
+plot_variograms(vg_SP_no1, "SP no first lag")
+plot_variograms(vg_COMP, "COMP")
+plot_variograms(vg_COMP_no1, "COMP no first lag")
+
+fit_variogram_models <- function(vg) {
+  
+  vg_df <- as.data.frame(vg)
+  
+  init_nugget <- max(0, min(vg_df$gamma, na.rm = TRUE) * 0.5)
+  init_sill   <- max(vg_df$gamma, na.rm = TRUE)
+  init_psill  <- max(init_sill - init_nugget, 1e-6)
+  init_range  <- max(vg_df$dist, na.rm = TRUE) / 3
+  
+  candidate_models <- c("Sph", "Exp", "Gau")
+  
+  fits <- purrr::map(candidate_models, function(m) {
+    tryCatch({
+      fit <- fit.variogram(
+        vg,
+        model = vgm(
+          psill  = init_psill,
+          model  = m,
+          range  = init_range,
+          nugget = init_nugget
+        )
+      )
+      
+      # reject bad fits
+      if (any(!is.finite(fit$psill))) return(NULL)
+      if (any(!is.finite(fit$range))) return(NULL)
+      if (any(fit$range[fit$model != "Nug"] <= 0)) return(NULL)
+      if (sum(fit$psill, na.rm = TRUE) <= 0) return(NULL)
+      
+      fit
+    }, error = function(e) NULL)
+  })
+  
+  fits <- fits[!sapply(fits, is.null)]
+  
+  if (length(fits) == 0) return(NULL)
+  
+  sse <- sapply(fits, function(f) attr(f, "SSErr"))
+  fits[[which.min(sse)]]
+}
+
+calc_nugget_ratio <- function(vgm_model) {
+  if (is.null(vgm_model)) return(NA_real_)
+  
+  nugget <- vgm_model$psill[vgm_model$model == "Nug"]
+  if (length(nugget) == 0) nugget <- 0
+  
+  total_sill <- sum(vgm_model$psill, na.rm = TRUE)
+  if (total_sill <= 0) return(NA_real_)
+  
+  nugget / total_sill
+}
+plot_vg_with_fit <- function(vg, fit = NULL, title = "") {
+  
+  vg_df <- as.data.frame(vg)
+  
+  # draw the empirical variogram explicitly
+  graphics::plot(
+    vg_df$dist, vg_df$gamma,
+    main = title,
+    xlab = "Distance",
+    ylab = "Semivariance",
+    pch = 16
+  )
+  
+  # add fitted line only if the fit is valid
+  if (!is.null(fit)) {
+    good_range <- all(is.finite(fit$range[fit$model != "Nug"])) &&
+      all(fit$range[fit$model != "Nug"] > 0)
+    
+    good_psill <- all(is.finite(fit$psill)) &&
+      sum(fit$psill, na.rm = TRUE) > 0
+    
+    if (good_range && good_psill) {
+      vline <- variogramLine(fit, maxdist = max(vg_df$dist))
+      
+      graphics::lines(vline$dist, vline$gamma, col = "red", lwd = 2)
+      
+      ratio <- calc_nugget_ratio(fit)
+      
+      graphics::legend(
+        "topright",
+        legend = paste0(
+          "Model: ", fit$model[fit$model != "Nug"][1],
+          "\nNugget:Sill = ", round(ratio, 2)
+        ),
+        bty = "n"
+      )
+    } else {
+      graphics::legend("topright", legend = "Invalid fit", bty = "n")
+    }
+  } else {
+    graphics::legend("topright", legend = "No valid fit", bty = "n")
+  }
+}
+fit_SP <- purrr::map(vg_SP, fit_variogram_models)
+fit_COMP <- purrr::map(vg_COMP, fit_variogram_models)
+
+fit_SP_no1 <- purrr::map(vg_SP_no1, fit_variogram_models)
+fit_COMP_no1 <- purrr::map(vg_COMP_no1, fit_variogram_models)
+op <- par(mfrow = c(3, 3))
+for (v in soil_vars) {
+  plot_vg_with_fit(vg_SP[[v]], fit_SP[[v]], paste("SP:", v))
+}
+par(op)
+
+op <- par(mfrow = c(3, 3))
+for (v in soil_vars) {
+  plot_vg_with_fit(vg_COMP[[v]], fit_COMP[[v]], paste("COMP:", v))
+}
+par(op)
+extract_vg_metrics <- function(fit, var_name) {
+  
+  if (is.null(fit)) return(NULL)
+  
+  nugget <- fit$psill[fit$model == "Nug"]
+  if (length(nugget) == 0) nugget <- 0
+  
+  sill <- sum(fit$psill)
+  range <- fit$range[2]
+  
+  tibble(
+    variable = var_name,
+    model = fit$model[2],
+    nugget = nugget,
+    sill = sill,
+    range = range,
+    nugget_ratio = nugget / sill
+  )
+}
+
+vg_metrics_SP <- purrr::map_dfr(names(fit_SP), ~extract_vg_metrics(fit_SP[[.x]], .x))
+vg_metrics_COMP <- purrr::map_dfr(names(fit_COMP), ~extract_vg_metrics(fit_COMP[[.x]], .x))
+
+#plot all residual semivariograms with fits:
+make_residuals_xy <- function(dat, soil_vars) {
+  
+  dat_out <- dat
+  
+  model_list <- purrr::map(soil_vars, function(v) {
+    f <- as.formula(paste(v, "~ X + Y"))
+    lm(f, data = sf::st_drop_geometry(dat_out))
+  }) |> rlang::set_names(soil_vars)
+  
+  for (v in soil_vars) {
+    resid_name <- paste0(v, "_resid")
+    dat_out[[resid_name]] <- residuals(model_list[[v]])
+  }
+  
+  list(
+    data = dat_out,
+    models = model_list
+  )
+}
+
+make_residuals_xy <- function(dat, soil_vars) {
+  
+  dat_out <- dat
+  
+  model_list <- purrr::map(soil_vars, function(v) {
+    f <- as.formula(paste(v, "~ X + Y"))
+    lm(f, data = sf::st_drop_geometry(dat_out))
+  }) |> rlang::set_names(soil_vars)
+  
+  for (v in soil_vars) {
+    resid_name <- paste0(v, "_resid")
+    dat_out[[resid_name]] <- residuals(model_list[[v]])
+  }
+  
+  list(
+    data = dat_out,
+    models = model_list
+  )
+}
+resid_SP <- make_residuals_xy(soil_prop_SP_xy, soil_vars)
+resid_COMP <- make_residuals_xy(soil_prop_COMP_xy, soil_vars)
+
+soil_prop_SP_resid <- resid_SP$data
+soil_prop_COMP_resid <- resid_COMP$data
+extract_lm_metrics <- function(model, variable, dataset) {
+  s <- summary(model)
+  
+  tibble(
+    dataset = dataset,
+    variable = variable,
+    r2 = s$r.squared,
+    adj_r2 = s$adj.r.squared,
+    p_X = coef(s)["X", "Pr(>|t|)"],
+    p_Y = coef(s)["Y", "Pr(>|t|)"]
+  )
+}
+lm_metrics_SP <- purrr::map_dfr(
+  names(resid_SP$models),
+  ~extract_lm_metrics(resid_SP$models[[.x]], .x, "SP")
+)
+
+lm_metrics_COMP <- purrr::map_dfr(
+  names(resid_COMP$models),
+  ~extract_lm_metrics(resid_COMP$models[[.x]], .x, "COMP")
+)
+
+lm_metrics_all <- bind_rows(lm_metrics_SP, lm_metrics_COMP)
+lm_metrics_all
+
+resid_vars <- paste0(soil_vars, "_resid")
+
+soil_prop_SP_resid_sp <- as(soil_prop_SP_resid, "Spatial")
+soil_prop_COMP_resid_sp <- as(soil_prop_COMP_resid, "Spatial")
+
+vg_SP_resid <- make_variograms(
+  soil_prop_SP_resid_sp,
+  resid_vars,
+  cutoff = cutoff_SP,
+  width = width_SP
+)
+
+vg_COMP_resid <- make_variograms(
+  soil_prop_COMP_resid_sp,
+  resid_vars,
+  cutoff = cutoff_COMP,
+  width = width_COMP
+)
+
+vg_SP_resid_no1 <- purrr::map(vg_SP_resid, drop_first_lag)
+vg_COMP_resid_no1 <- purrr::map(vg_COMP_resid, drop_first_lag)
+
+op <- par(mfrow = c(3, 3))
+for (v in resid_vars) {
+  plot_vg_with_fit(vg_SP_resid[[v]], NULL, paste("SP residual:", v))
+}
+par(op)
+
+op <- par(mfrow = c(3, 3))
+for (v in resid_vars) {
+  plot_vg_with_fit(vg_COMP_resid[[v]], NULL, paste("COMP residual:", v))
+}
+par(op)
+
+op <- par(mfrow = c(3, 3))
+for (v in resid_vars) {
+  plot_vg_with_fit(vg_SP_resid_no1[[v]], NULL, paste("SP residual no1:", v))
+}
+par(op)
+
+op <- par(mfrow = c(3, 3))
+for (v in resid_vars) {
+  plot_vg_with_fit(vg_COMP_resid_no1[[v]], NULL, paste("COMP residual no1:", v))
+}
+par(op)
+
+fit_SP_resid <- purrr::map(vg_SP_resid, fit_variogram_models)
+fit_COMP_resid <- purrr::map(vg_COMP_resid, fit_variogram_models)
+
+fit_SP_resid_no1 <- purrr::map(vg_SP_resid_no1, fit_variogram_models)
+fit_COMP_resid_no1 <- purrr::map(vg_COMP_resid_no1, fit_variogram_models)
+
+op <- par(mfrow = c(3, 3))
+for (v in resid_vars) {
+  plot_vg_with_fit(vg_SP_resid[[v]], fit_SP_resid[[v]], paste("SP residual:", v))
+}
+par(op)
+
+op <- par(mfrow = c(3, 3))
+for (v in resid_vars) {
+  plot_vg_with_fit(vg_COMP_resid[[v]], fit_COMP_resid[[v]], paste("COMP residual:", v))
+}
+par(op)
+
+extract_vg_metrics <- function(fit, var_name, dataset, stage) {
+  if (is.null(fit)) {
+    return(tibble(
+      variable = var_name,
+      dataset = dataset,
+      stage = stage,
+      model = NA_character_,
+      nugget = NA_real_,
+      sill = NA_real_,
+      range = NA_real_,
+      nugget_ratio = NA_real_,
+      SSErr = NA_real_
+    ))
+  }
+  
+  nugget <- fit$psill[fit$model == "Nug"]
+  if (length(nugget) == 0) nugget <- 0
+  
+  sill <- sum(fit$psill, na.rm = TRUE)
+  range <- fit$range[fit$model != "Nug"][1]
+  
+  tibble(
+    variable = var_name,
+    dataset = dataset,
+    stage = stage,
+    model = fit$model[fit$model != "Nug"][1],
+    nugget = nugget,
+    sill = sill,
+    range = range,
+    nugget_ratio = nugget / sill,
+    SSErr = attr(fit, "SSErr")
+  )
+}
+```
+
+
+
+
+
