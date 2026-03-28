@@ -16,11 +16,11 @@ library(randomForest)
 library(corrplot)
 library(spdep)
 library(beepr)
-
+library(broom)
 ```
 
 
-```{r}
+```{r setup, warning=FALSE}
 # data
 soil_points_nutrients <- read.csv("../LOCAL DATA DO NOT PUSH/soil/perry_soil_points_surface_03_2026.csv") %>%
   clean_names()
@@ -108,7 +108,7 @@ cutoff_COMP <- max(dist(coords_COMP)) / 2
 width_SP <- 100
 width_COMP <- 100
 
-make_resamples <- function(sf_data, n_iter = 100, train_frac = 0.7, base_seed = 20260326) {
+make_resamples <- function(sf_data, n_iter = 50, train_frac = 0.7, base_seed = 20260326) {
   ids <- seq_len(nrow(sf_data))
   seeds <- base_seed + seq_len(n_iter)
 
@@ -133,8 +133,8 @@ make_resamples <- function(sf_data, n_iter = 100, train_frac = 0.7, base_seed = 
 }
 
 
-resamples_SP <- make_resamples(soil_SP_cov, n_iter = 100, train_frac = 0.7, base_seed = 20260326)
-resamples_COMP <- make_resamples(soil_COMP_cov, n_iter = 100, train_frac = 0.7, base_seed = 20261326)
+resamples_SP <- make_resamples(soil_SP_cov, n_iter = 50, train_frac = 0.7, base_seed = 20260326)
+resamples_COMP <- make_resamples(soil_COMP_cov, n_iter = 50, train_frac = 0.7, base_seed = 20261326)
 
 calc_metrics <- function(obs, pred) {
   tibble(
@@ -432,16 +432,16 @@ results_COMP_all <- purrr::map_dfr(
 )
 
 results_all <- bind_rows(results_SP_all, results_COMP_all)
-saveRDS(results_all, "../outputs/perry_model_results_03_26_2026.rds")
-saveRDS(resamples_SP, "../outputs/resamples_SP_03_26_2026.rds")
-saveRDS(resamples_COMP, "../outputs/resamples_COMP_03_26_2026.rds")
+saveRDS(results_all, "../outputs/perry_model_results_03_28_2026.rds")
+saveRDS(resamples_SP, "../outputs/resamples_SP_03_28_2026.rds")
+saveRDS(resamples_COMP, "../outputs/resamples_COMP_03_28_2026.rds")
 #save results_all as .csv
-write.csv(results_all, "../outputs/perry_model_results_03_26_2026.csv", row.names = FALSE)
+write.csv(results_all, "../outputs/perry_model_results_03_28_2026.csv", row.names = FALSE)
 beep("wilhelm")
 ```
 
 
-```{r}
+```{r ensemble, warning=FALSE}
 #ensemble mapping:
 select_best_iterations <- function(results_tbl, top_frac = 0.25, n_fallback = 5) {
   
@@ -780,7 +780,478 @@ for (ds in names(final_ensemble_rasters)) {
   }
 }
 
+beep("wilhelm")
 
 ```
+```{r comparison}
+
+#not ensemble: original repeated resampling results in results_all:
+    # one row per iteration × dataset × nutrient × method
+    # metric computed on the held-out test set for that iteration
+    # 
+    # Then the p-tests compare those per-iteration metrics in a paired way.
+
+
+compare_methods_paired <- function(results_tbl, metric = "RMSE") {
+  
+  method_pairs <- list(
+    c("RF", "OK"),
+    c("RK", "RF"),
+    c("RK", "OK")
+  )
+  
+  out <- list()
+  k <- 1
+  
+  for (ds in unique(results_tbl$dataset)) {
+    for (v in unique(results_tbl$variable)) {
+      
+      sub <- results_tbl %>%
+        filter(dataset == ds, variable == v) %>%
+        select(iteration, method, all_of(metric)) %>%
+        pivot_wider(names_from = method, values_from = all_of(metric))
+      
+      for (pair in method_pairs) {
+        m1 <- pair[1]
+        m2 <- pair[2]
+        
+        if (all(c(m1, m2) %in% names(sub))) {
+          dat <- sub %>%
+            select(iteration, all_of(c(m1, m2))) %>%
+            drop_na()
+          
+          if (nrow(dat) >= 3) {
+            test <- wilcox.test(dat[[m1]], dat[[m2]], paired = TRUE, exact = FALSE)
+            
+            out[[k]] <- tibble(
+              dataset = ds,
+              variable = v,
+              comparison = paste0(m1, "_vs_", m2),
+              metric = metric,
+              n_pairs = nrow(dat),
+              median_diff = median(dat[[m1]] - dat[[m2]], na.rm = TRUE),
+              p_value = test$p.value
+            )
+            k <- k + 1
+          }
+        }
+      }
+    }
+  }
+  
+  bind_rows(out)
+}
+
+rmse_tests <- compare_methods_paired(results_all, metric = "RMSE")
+mae_tests  <- compare_methods_paired(results_all, metric = "MAE")
+r2_tests   <- compare_methods_paired(results_all, metric = "R2")
+
+method_p_tests <- bind_rows(rmse_tests, mae_tests, r2_tests)
+method_p_tests <- method_p_tests %>%
+  group_by(metric) %>%
+  mutate(p_adj_BH = p.adjust(p_value, method = "BH")) %>%
+  ungroup()
+
+compare_sampling_paired <- function(results_tbl, metric = "RMSE") {
+  
+  out <- list()
+  k <- 1
+  
+  for (m in unique(results_tbl$method)) {
+    for (v in unique(results_tbl$variable)) {
+      
+      sub <- results_tbl %>%
+        filter(method == m, variable == v) %>%
+        select(iteration, dataset, all_of(metric)) %>%
+        pivot_wider(names_from = dataset, values_from = all_of(metric))
+      
+      if (all(c("SP", "COMP") %in% names(sub))) {
+        dat <- sub %>%
+          select(iteration, SP, COMP) %>%
+          drop_na()
+        
+        if (nrow(dat) >= 3) {
+          test <- wilcox.test(dat$SP, dat$COMP, paired = TRUE, exact = FALSE)
+          
+          out[[k]] <- tibble(
+            method = m,
+            variable = v,
+            metric = metric,
+            n_pairs = nrow(dat),
+            median_diff = median(dat$SP - dat$COMP, na.rm = TRUE),
+            p_value = test$p.value
+          )
+          k <- k + 1
+        }
+      }
+    }
+  }
+  
+  bind_rows(out)
+}
+
+spcomp_rmse_tests <- compare_sampling_paired(results_all, metric = "RMSE")
+spcomp_mae_tests  <- compare_sampling_paired(results_all, metric = "MAE")
+spcomp_r2_tests   <- compare_sampling_paired(results_all, metric = "R2")
+
+spcomp_p_tests <- bind_rows(spcomp_rmse_tests, spcomp_mae_tests, spcomp_r2_tests) %>%
+  group_by(metric) %>%
+  mutate(p_adj_BH = p.adjust(p_value, method = "BH")) %>%
+  ungroup()
+
+spcomp_p_tests
+
+readr::write_csv(method_p_tests, "../outputs/ensemble_map_diffs/method_comparison_p_tests_03_28_2026.csv")
+readr::write_csv(spcomp_p_tests, "../outputs/ensemble_map_diffs/sampling_comparison_p_tests_03_28_2026.csv")
+
+#what this answers: under the bootstrap workflow, does a method tend to produce lower RMSE / MAE or higher R^2 than another, often enough to be unlikely by chance?
+
+#SP vs COMP:
+  #comp did better in everything but P, SP did better in P. COMP overall reduced error: lower RMSE and MAE
+  #for all modelling methods. 
+  #however, SP R^2 was often higher for several RF RK cases when error was also higher
+  # P is better in error and R^2 in SP
+
+#OK vs RF vs RK:
+  #SP:
+      #RF and RK better than OK. RK had best for P. 
+  #COMP:
+      #COMP reduces the advantage or RF and RK relative to SP, but does not eliminate the issue of OK. RK refines a lot of RF            advantages. 
+
+#overall:
+    # These p-tests support real differences in predictive performance
+    # COMP usually predicts better than SP, except for P
+    # SP P is the clearest case where SP + RK really matters
+    # SP benefits more from RF/RK over OK than COMP does
+    # buffer variables and Ca are especially method-sensitive
+    # P is especially sampling-sensitive
+
+#nutrients:
+    #pH, Zn are more spatially coherent
+    #sensitive vars:P, Ca, Mg, K, Mn, and especially LBC / LBCeq in some comparisons
+    #COMP smooths broad behavior (expected)
+    #P is weird: SP did better, RK best, short range heterogeneity, RK shows leftover spatial stuff after kriging resids
+    #RK did well for SP P, possibly Ca and Mn... meaning that there was leftover spatial continuity that RF did not pick up. 
+    #OK did well for pH, Zn, and mg, in COMP especially.
+```
+
+```{r differences}
+#analyse the differences in SP and COMP for all variables and methods:
+
+
+
+collect_ensemble_means <- function(final_ensemble_rasters) {
+  out <- list()
+  k <- 1
+  
+  for (ds in names(final_ensemble_rasters)) {
+    for (meth in names(final_ensemble_rasters[[ds]])) {
+      for (v in names(final_ensemble_rasters[[ds]][[meth]])) {
+        
+        obj <- final_ensemble_rasters[[ds]][[meth]][[v]]
+        
+        if (!is.null(obj) && !is.null(obj$mean)) {
+          out[[k]] <- tibble(
+            dataset = ds,
+            method = meth,
+            variable = v,
+            raster = list(obj$mean),
+            sd_raster = list(obj$sd)
+          )
+          k <- k + 1
+        }
+      }
+    }
+  }
+  
+  bind_rows(out)
+}
+
+ensemble_tbl <- collect_ensemble_means(final_ensemble_rasters)
+ensemble_tbl
+
+summarize_raster <- function(r) {
+  vals <- terra::values(r, na.rm = TRUE)
+  vals <- vals[is.finite(vals)]
+  
+  tibble(
+    mean = mean(vals, na.rm = TRUE),
+    median = median(vals, na.rm = TRUE),
+    sd = sd(vals, na.rm = TRUE),
+    min = min(vals, na.rm = TRUE),
+    max = max(vals, na.rm = TRUE),
+    cv = ifelse(mean(vals, na.rm = TRUE) == 0, NA_real_, sd(vals, na.rm = TRUE) / mean(vals, na.rm = TRUE))
+  )
+}
+
+ensemble_summary <- ensemble_tbl %>%
+  mutate(stats = map(raster, summarize_raster)) %>%
+  unnest(stats)
+
+ensemble_summary
+
+make_sp_comp_diffs <- function(ensemble_tbl) {
+  out <- list()
+  k <- 1
+  
+  vars <- sort(unique(ensemble_tbl$variable))
+  meths <- sort(unique(ensemble_tbl$method))
+  
+  for (v in vars) {
+    for (m in meths) {
+      sp_row <- ensemble_tbl %>% filter(dataset == "SP", method == m, variable == v)
+      comp_row <- ensemble_tbl %>% filter(dataset == "COMP", method == m, variable == v)
+      
+      if (nrow(sp_row) == 1 && nrow(comp_row) == 1) {
+        diff_r <- sp_row$raster[[1]] - comp_row$raster[[1]]
+        
+        out[[k]] <- tibble(
+          comparison = "SP_minus_COMP",
+          method = m,
+          variable = v,
+          raster = list(diff_r)
+        )
+        k <- k + 1
+      }
+    }
+  }
+  
+  bind_rows(out)
+}
+
+sp_comp_diff_tbl <- make_sp_comp_diffs(ensemble_tbl)
+sp_comp_diff_tbl
+
+make_method_diffs <- function(ensemble_tbl) {
+  out <- list()
+  k <- 1
+  
+  datasets <- sort(unique(ensemble_tbl$dataset))
+  vars <- sort(unique(ensemble_tbl$variable))
+  
+  method_pairs <- list(
+    c("RF", "OK"),
+    c("RK", "RF"),
+    c("RK", "OK")
+  )
+  
+  for (ds in datasets) {
+    for (v in vars) {
+      for (pair in method_pairs) {
+        m1 <- pair[1]
+        m2 <- pair[2]
+        
+        row1 <- ensemble_tbl %>% filter(dataset == ds, method == m1, variable == v)
+        row2 <- ensemble_tbl %>% filter(dataset == ds, method == m2, variable == v)
+        
+        if (nrow(row1) == 1 && nrow(row2) == 1) {
+          diff_r <- row1$raster[[1]] - row2$raster[[1]]
+          
+          out[[k]] <- tibble(
+            comparison = paste0(m1, "_minus_", m2),
+            dataset = ds,
+            variable = v,
+            raster = list(diff_r)
+          )
+          k <- k + 1
+        }
+      }
+    }
+  }
+  
+  bind_rows(out)
+}
+
+method_diff_tbl <- make_method_diffs(ensemble_tbl)
+method_diff_tbl
+
+summarize_diff_raster <- function(r) {
+  vals <- terra::values(r, na.rm = TRUE)
+  vals <- vals[is.finite(vals)]
+  
+  tibble(
+    mean_diff = mean(vals, na.rm = TRUE),
+    median_diff = median(vals, na.rm = TRUE),
+    sd_diff = sd(vals, na.rm = TRUE),
+    min_diff = min(vals, na.rm = TRUE),
+    max_diff = max(vals, na.rm = TRUE),
+    mean_abs_diff = mean(abs(vals), na.rm = TRUE),
+    median_abs_diff = median(abs(vals), na.rm = TRUE)
+  )
+}
+
+sp_comp_diff_summary <- sp_comp_diff_tbl %>%
+  mutate(stats = map(raster, summarize_diff_raster)) %>%
+  unnest(stats)
+
+sp_comp_diff_summary
+
+method_diff_summary <- method_diff_tbl %>%
+  mutate(stats = map(raster, summarize_diff_raster)) %>%
+  unnest(stats)
+
+method_diff_summary
+
+map_correlation <- function(r1, r2) {
+  vals <- cbind(terra::values(r1), terra::values(r2))
+  vals <- vals[complete.cases(vals), , drop = FALSE]
+  
+  tibble(
+    pearson_r = cor(vals[,1], vals[,2], method = "pearson"),
+    spearman_r = cor(vals[,1], vals[,2], method = "spearman")
+  )
+}
+
+#SP vs COMP:
+make_sp_comp_correlations <- function(ensemble_tbl) {
+  out <- list()
+  k <- 1
+  
+  vars <- sort(unique(ensemble_tbl$variable))
+  meths <- sort(unique(ensemble_tbl$method))
+  
+  for (v in vars) {
+    for (m in meths) {
+      sp_row <- ensemble_tbl %>% filter(dataset == "SP", method == m, variable == v)
+      comp_row <- ensemble_tbl %>% filter(dataset == "COMP", method == m, variable == v)
+      
+      if (nrow(sp_row) == 1 && nrow(comp_row) == 1) {
+        cor_tbl <- map_correlation(sp_row$raster[[1]], comp_row$raster[[1]])
+        
+        out[[k]] <- tibble(
+          comparison = "SP_vs_COMP",
+          method = m,
+          variable = v
+        ) %>%
+          bind_cols(cor_tbl)
+        
+        k <- k + 1
+      }
+    }
+  }
+  
+  bind_rows(out)
+}
+
+sp_comp_cor_tbl <- make_sp_comp_correlations(ensemble_tbl)
+sp_comp_cor_tbl
+
+make_method_correlations <- function(ensemble_tbl) {
+  out <- list()
+  k <- 1
+  
+  datasets <- sort(unique(ensemble_tbl$dataset))
+  vars <- sort(unique(ensemble_tbl$variable))
+  
+  method_pairs <- list(
+    c("RF", "OK"),
+    c("RK", "RF"),
+    c("RK", "OK")
+  )
+  
+  for (ds in datasets) {
+    for (v in vars) {
+      for (pair in method_pairs) {
+        m1 <- pair[1]
+        m2 <- pair[2]
+        
+        row1 <- ensemble_tbl %>% filter(dataset == ds, method == m1, variable == v)
+        row2 <- ensemble_tbl %>% filter(dataset == ds, method == m2, variable == v)
+        
+        if (nrow(row1) == 1 && nrow(row2) == 1) {
+          cor_tbl <- map_correlation(row1$raster[[1]], row2$raster[[1]])
+          
+          out[[k]] <- tibble(
+            dataset = ds,
+            variable = v,
+            comparison = paste0(m1, "_vs_", m2)
+          ) %>%
+            bind_cols(cor_tbl)
+          
+          k <- k + 1
+        }
+      }
+    }
+  }
+  
+  bind_rows(out)
+}
+
+method_cor_tbl <- make_method_correlations(ensemble_tbl)
+method_cor_tbl
+
+#plot
+plot_diff_maps <- function(diff_tbl, title_cols) {
+  n_maps <- nrow(diff_tbl)
+  ncol_plot <- 3
+  nrow_plot <- ceiling(n_maps / ncol_plot)
+  
+  op <- par(mfrow = c(nrow_plot, ncol_plot))
+  
+  for (i in seq_len(n_maps)) {
+    ttl <- paste(diff_tbl[i, title_cols] %>% as.character(), collapse = " | ")
+    plot(diff_tbl$raster[[i]], main = ttl)
+  }
+  
+  par(op)
+}
+png("../outputs/sp_comp_diff_maps_3_28_2026.png", width = 2400, height = 1800, res = 200)
+par(mfrow = c(3, 3), mar = c(3, 3, 2, 1))
+plot_diff_maps(sp_comp_diff_tbl[1:9, ], c("method", "variable"))
+dev.off()
+
+plot_diff_maps_chunked <- function(diff_tbl, title_cols, n_per_page = 9, ncol_plot = 3) {
+  idx <- split(seq_len(nrow(diff_tbl)), ceiling(seq_len(nrow(diff_tbl)) / n_per_page))
+  
+  for (ii in idx) {
+    sub_tbl <- diff_tbl[ii, ]
+    n_maps <- nrow(sub_tbl)
+    nrow_plot <- ceiling(n_maps / ncol_plot)
+    
+    op <- par(mfrow = c(nrow_plot, ncol_plot), mar = c(3, 3, 2, 1))
+    
+    for (i in seq_len(n_maps)) {
+      ttl <- paste(sub_tbl[i, title_cols] %>% as.character(), collapse = " | ")
+      plot(sub_tbl$raster[[i]], main = ttl)
+    }
+    
+    par(op)
+  }
+}
+
+plot_diff_maps_chunked(sp_comp_diff_tbl, c("method", "variable"))
+plot_diff_maps_chunked(method_diff_tbl, c("dataset", "comparison", "variable"))
+
+#OK is the most different from RF and RK, RF and RK are not dissimilar. Ca, Mg, K, lbc are more different athan other nutrients such as pH, p, etc... RK is the most different in SP vs COMP...
+
+
+#comparison results indicate that both sampling strategy and modeling method affect the spatial representation of soil properties, but their influence is nutrient-dependent. The strongest SP-versus-COMP differences occurred for Mg, LBC.1, and LBCeq, particularly under ordinary kriging... compositing may substantially alter the spatial expression of these variables. In contrast, pH and Zn were comparatively stable across sampling methods and model types. Method comparisons showed that RF and RK maps were generally much more similar to one another than either was to OK, indicating that the main methodological contrast is between pure geostatistical interpolation and covariate-assisted prediction. The largest method-based discrepancies occurred for Ca and the lime buffer variables, suggesting that these properties are especially sensitive to whether environmental covariates are incorporated into the modeling framework.
+
+
+sp_comp_compare_tbl <- sp_comp_diff_summary %>%
+  left_join(sp_comp_cor_tbl, by = c("method", "variable"))
+
+sp_comp_compare_tbl
+method_compare_tbl <- method_diff_summary %>%
+  left_join(method_cor_tbl, by = c("dataset", "variable", "comparison"))
+
+method_compare_tbl
+readr::write_csv(sp_comp_compare_tbl,
+                 "../outputs/ensemble_map_diffs/sp_comp_compare_tbl_03_28_2026.csv")
+
+readr::write_csv(method_compare_tbl,
+                 "../outputs/ensemble_map_diffs/method_compare_tbl_03_28_2026.csv")
+
+
+```
+
+
+
+```{r}
+
+```
+
+
+
 
 
