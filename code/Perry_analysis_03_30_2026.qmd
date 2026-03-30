@@ -1,0 +1,57 @@
+---
+title: "Perry_analysis_03_30_2026"
+format: html
+---
+```{r}
+
+library(terra)
+library(tidyverse)
+library(sf)
+library(gstat)
+library(randomForest)
+library(irr)
+```
+
+```{r}
+
+soil_vars <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn")
+
+results_all <- readRDS("../outputs/checkpoints/tables/results_all.rds")
+resamples_SP <- readRDS("../outputs/checkpoints/tables/resamples_SP.rds")
+resamples_COMP <- readRDS("../outputs/checkpoints/tables/resamples_COMP.rds")
+selected_iters <- readRDS("../outputs/checkpoints/tables/selected_iters.rds")
+
+method_p_tests <- readRDS("../outputs/checkpoints/tables/method_p_tests.rds")
+spcomp_p_tests <- readRDS("../outputs/checkpoints/tables/spcomp_p_tests.rds")
+
+sp_comp_compare_tbl <- readRDS("../outputs/checkpoints/tables/sp_comp_compare_tbl.rds")
+method_compare_tbl <- readRDS("../outputs/checkpoints/tables/method_compare_tbl.rds")
+
+continuous_val_tbl <- readRDS("../outputs/checkpoints/tables/continuous_val_tbl.rds")
+continuous_val_metrics <- readRDS("../outputs/checkpoints/tables/continuous_val_metrics.rds")
+continuous_val_ranked2 <- readRDS("../outputs/checkpoints/tables/continuous_val_ranked2.rds")
+continuous_spcomp_tests <- readRDS("../outputs/checkpoints/tables/continuous_spcomp_tests.rds")
+continuous_method_tests <- readRDS("../outputs/checkpoints/tables/continuous_method_tests.rds")
+
+zone_val_tbl <- readRDS("../outputs/checkpoints/tables/zone_val_tbl.rds")
+zone_val_summary <- readRDS("../outputs/checkpoints/tables/zone_val_summary.rds")
+zone_kw_tbl <- readRDS("../outputs/checkpoints/tables/zone_kw_tbl.rds")
+zone_trend_tbl <- readRDS("../outputs/checkpoints/tables/zone_trend_tbl.rds")
+zone_r2_tbl <- readRDS("../outputs/checkpoints/tables/zone_r2_tbl.rds")
+
+sp_comp_zone_metrics <- readRDS("../outputs/checkpoints/tables/sp_comp_zone_metrics.rds")
+method_zone_metrics <- readRDS("../outputs/checkpoints/tables/method_zone_metrics.rds")
+
+vg_metrics_combined <- readRDS("../outputs/checkpoints/tables/vg_metrics_combined.rds")
+cluster_priority_lookup <- readRDS("../outputs/checkpoints/tables/cluster_priority_lookup.rds")
+zone_area_tbl <- readRDS("../outputs/checkpoints/tables/zone_area_tbl.rds")
+ensemble_check_tbl <- readRDS("../outputs/checkpoints/tables/ensemble_check_tbl.rds")
+
+soil_SP_cov <- sf::st_read("../outputs/checkpoints/vectors/soil_SP_cov.gpkg", quiet = TRUE)
+soil_COMP_cov <- sf::st_read("../outputs/checkpoints/vectors/soil_COMP_cov.gpkg", quiet = TRUE)
+ap_val_sf <- sf::st_read("../outputs/checkpoints/vectors/ap_val_sf.gpkg", quiet = TRUE)
+sp_plus_val <- sf::st_read("../outputs/checkpoints/vectors/sp_plus_val.gpkg", quiet = TRUE)
+comp_plus_val <- sf::st_read("../outputs/checkpoints/vectors/comp_plus_val.gpkg", quiet = TRUE)
+
+```
+

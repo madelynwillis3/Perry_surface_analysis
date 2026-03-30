@@ -17,6 +17,9 @@ library(corrplot)
 library(spdep)
 library(beepr)
 library(broom)
+library(psych)
+library(irr)
+
 ```
 
 
@@ -432,11 +435,11 @@ results_COMP_all <- purrr::map_dfr(
 )
 
 results_all <- bind_rows(results_SP_all, results_COMP_all)
-saveRDS(results_all, "../outputs/perry_model_results_03_28_2026.rds")
-saveRDS(resamples_SP, "../outputs/resamples_SP_03_28_2026.rds")
-saveRDS(resamples_COMP, "../outputs/resamples_COMP_03_28_2026.rds")
+saveRDS(results_all, "../outputs/perry_model_results_03_30_2026.rds")
+saveRDS(resamples_SP, "../outputs/resamples_SP_03_30_2026.rds")
+saveRDS(resamples_COMP, "../outputs/resamples_COMP_03_30_2026.rds")
 #save results_all as .csv
-write.csv(results_all, "../outputs/perry_model_results_03_28_2026.csv", row.names = FALSE)
+write.csv(results_all, "../outputs/perry_model_results_03_30_2026.csv", row.names = FALSE)
 beep("wilhelm")
 ```
 
@@ -782,6 +785,38 @@ for (ds in names(final_ensemble_rasters)) {
 
 beep("wilhelm")
 
+
+check_final_ensemble <- function(final_ensemble_rasters, soil_vars) {
+  bind_rows(
+    lapply(names(final_ensemble_rasters), function(ds) {
+      bind_rows(
+        lapply(names(final_ensemble_rasters[[ds]]), function(meth) {
+          bind_rows(
+            lapply(soil_vars, function(v) {
+              obj <- final_ensemble_rasters[[ds]][[meth]][[v]]
+              
+              tibble(
+                dataset = ds,
+                method = meth,
+                variable = v,
+                is_null = is.null(obj),
+                has_mean = !is.null(obj) && !is.null(obj$mean),
+                n_valid_mean = if (!is.null(obj) && !is.null(obj$mean)) {
+                  sum(!is.na(terra::values(obj$mean, mat = FALSE)))
+                } else {
+                  NA_integer_
+                }
+              )
+            })
+          )
+        })
+      )
+    })
+  )
+}
+
+ensemble_check_tbl <- check_final_ensemble(final_ensemble_rasters, soil_vars)
+ensemble_check_tbl
 ```
 ```{r comparison}
 
@@ -901,8 +936,8 @@ spcomp_p_tests <- bind_rows(spcomp_rmse_tests, spcomp_mae_tests, spcomp_r2_tests
 
 spcomp_p_tests
 
-readr::write_csv(method_p_tests, "../outputs/ensemble_map_diffs/method_comparison_p_tests_03_28_2026.csv")
-readr::write_csv(spcomp_p_tests, "../outputs/ensemble_map_diffs/sampling_comparison_p_tests_03_28_2026.csv")
+readr::write_csv(method_p_tests, "../outputs/ensemble_map_diffs/method_comparison_p_tests_03_30_2026.csv")
+readr::write_csv(spcomp_p_tests, "../outputs/ensemble_map_diffs/sampling_comparison_p_tests_03_30_2026.csv")
 
 #what this answers: under the bootstrap workflow, does a method tend to produce lower RMSE / MAE or higher R^2 than another, often enough to be unlikely by chance?
 
@@ -1195,7 +1230,7 @@ plot_diff_maps <- function(diff_tbl, title_cols) {
   
   par(op)
 }
-png("../outputs/sp_comp_diff_maps_3_28_2026.png", width = 2400, height = 1800, res = 200)
+png("../outputs/sp_comp_diff_maps_3_30_2026.png", width = 2400, height = 1800, res = 200)
 par(mfrow = c(3, 3), mar = c(3, 3, 2, 1))
 plot_diff_maps(sp_comp_diff_tbl[1:9, ], c("method", "variable"))
 dev.off()
@@ -1237,21 +1272,1593 @@ method_compare_tbl <- method_diff_summary %>%
 
 method_compare_tbl
 readr::write_csv(sp_comp_compare_tbl,
-                 "../outputs/ensemble_map_diffs/sp_comp_compare_tbl_03_28_2026.csv")
+                 "../outputs/ensemble_map_diffs/sp_comp_compare_tbl_03_30_2026.csv")
 
 readr::write_csv(method_compare_tbl,
-                 "../outputs/ensemble_map_diffs/method_compare_tbl_03_28_2026.csv")
+                 "../outputs/ensemble_map_diffs/method_compare_tbl_03_30_2026.csv")
 
 
 ```
 
+```{r ensemble validation}
+#validation of ensemble maps
+
+
+ap_val <- read_csv("../LOCAL DATA DO NOT PUSH/Ap_hz_data/hz_0_15_wide_03_30_2026.csv")
+
+ap_val_sf <- ap_val %>%
+  st_as_sf(coords = c("POINT_X", "POINT_Y"), crs = 3857) %>%
+  st_transform(26917)
+
+
+val_var_lookup <- c(
+  "ca" = "Ca_0_15",
+  "k" = "K_0_15",
+  "mg" = "Mg_0_15",
+  "mn" = "Mn_0_15",
+  "p" = "P_0_15",
+  "zn" = "Zn_0_15",
+  "p_h_2" = "pH.2_0_15",
+  "lbc_1" = "LBC.1_0_15",
+  "lb_ceq" = "LBCeq_0_15"
+)
+
+extract_continuous_validation <- function(ap_val_sf, final_ensemble_rasters, val_var_lookup) {
+  out_list <- list()
+  k <- 1
+  
+  for (ds in c("SP", "COMP")) {
+    for (meth in c("RF", "OK", "RK")) {
+      for (nm in names(val_var_lookup)) {
+        
+        obj <- final_ensemble_rasters[[ds]][[meth]][[nm]]
+        if (is.null(obj) || is.null(obj$mean)) next
+        
+        pred_rast <- obj$mean
+        obs_col <- val_var_lookup[[nm]]
+        
+        ext <- terra::extract(pred_rast, terra::vect(ap_val_sf))
+        
+        tmp <- ap_val_sf %>%
+          st_drop_geometry() %>%
+          transmute(
+            Point = Point,
+            dataset = ds,
+            method = meth,
+            nutrient = nm,
+            observed = .data[[obs_col]],
+            predicted = ext[, 2]
+          ) %>%
+          filter(!is.na(observed), !is.na(predicted))
+        
+        out_list[[k]] <- tmp
+        k <- k + 1
+      }
+    }
+  }
+  
+  bind_rows(out_list)
+}
+
+continuous_val_tbl <- extract_continuous_validation(ap_val_sf, final_ensemble_rasters, val_var_lookup)
+continuous_val_tbl
+
+calc_validation_metrics <- function(obs, pred) {
+  tibble(
+    n = length(obs),
+    RMSE = sqrt(mean((obs - pred)^2, na.rm = TRUE)),
+    MAE = mean(abs(obs - pred), na.rm = TRUE),
+    mean_error = mean(obs - pred, na.rm = TRUE),
+    R2 = ifelse(length(unique(obs)) > 1, cor(obs, pred, use = "complete.obs")^2, NA_real_),
+    spearman_rho = ifelse(length(unique(obs)) > 1, cor(obs, pred, method = "spearman", use = "complete.obs"), NA_real_)
+  )
+}
+
+continuous_val_metrics <- continuous_val_tbl %>%
+  group_by(dataset, method, nutrient) %>%
+  group_modify(~ calc_validation_metrics(.x$observed, .x$predicted)) %>%
+  ungroup()
+
+continuous_val_metrics
+
+continuous_val_ranked2 <- continuous_val_metrics %>%
+  group_by(nutrient) %>%
+  mutate(
+    rmse_score = ifelse(max(RMSE) == min(RMSE), 1,
+                        (max(RMSE) - RMSE) / (max(RMSE) - min(RMSE))),
+    r2_score = ifelse(max(R2, na.rm = TRUE) == min(R2, na.rm = TRUE), 1,
+                      (R2 - min(R2, na.rm = TRUE)) / (max(R2, na.rm = TRUE) - min(R2, na.rm = TRUE))),
+    overall_score = 0.5 * rmse_score + 0.5 * r2_score
+  ) %>%
+  arrange(nutrient, desc(overall_score)) %>%
+  ungroup()
+
+continuous_val_ranked2
+plot_continuous_validation_clean <- function(continuous_val_tbl, nutrient_name,
+                                             outlier_thresh = 3) {
+  
+  dat0 <- continuous_val_tbl %>%
+    filter(nutrient == nutrient_name) %>%
+    filter(is.finite(observed), is.finite(predicted))
+  
+  # fit within each panel, remove extreme outliers by studentized residual
+  dat_clean <- dat0 %>%
+    group_by(dataset, method) %>%
+    group_modify(~{
+      df <- .x
+      
+      if (nrow(df) < 4 || length(unique(df$observed)) < 2) {
+        df$stud_resid <- NA_real_
+        df$keep <- TRUE
+        return(df)
+      }
+      
+      fit <- lm(predicted ~ observed, data = df)
+      df$stud_resid <- rstudent(fit)
+      df$keep <- abs(df$stud_resid) <= outlier_thresh | is.na(df$stud_resid)
+      df
+    }) %>%
+    ungroup() %>%
+    filter(keep)
+  
+  # panel-wise stats after outlier removal
+  panel_stats <- dat_clean %>%
+    group_by(dataset, method) %>%
+    group_modify(~{
+      df <- .x
+      
+      if (nrow(df) < 3 || length(unique(df$observed)) < 2) {
+        return(tibble(
+          n = nrow(df),
+          r2 = NA_real_,
+          slope = NA_real_,
+          intercept = NA_real_,
+          x = NA_real_,
+          y = NA_real_,
+          lab = paste0("n = ", nrow(df), "\nR² = NA")
+        ))
+      }
+      
+      fit <- lm(predicted ~ observed, data = df)
+      s <- summary(fit)
+      cf <- coef(fit)
+      
+      x_pos <- min(df$observed, na.rm = TRUE) + 0.05 * diff(range(df$observed, na.rm = TRUE))
+      y_pos <- max(df$predicted, na.rm = TRUE) - 0.08 * diff(range(df$predicted, na.rm = TRUE))
+      
+      tibble(
+        n = nrow(df),
+        r2 = s$r.squared,
+        slope = unname(cf[2]),
+        intercept = unname(cf[1]),
+        x = x_pos,
+        y = y_pos,
+        lab = paste0(
+          "n = ", nrow(df),
+          "\nR² = ", round(s$r.squared, 2),
+          "\ny = ", round(cf[1], 2), " + ", round(cf[2], 2), "x"
+        )
+      )
+    }) %>%
+    ungroup()
+  
+  plot_continuous_validation_clean <- function(continuous_val_tbl, nutrient_name, iqr_mult = 1.5) {
+  
+  dat0 <- continuous_val_tbl %>%
+    dplyr::filter(nutrient == nutrient_name) %>%
+    dplyr::filter(is.finite(observed), is.finite(predicted))
+  
+  # remove extreme outliers relative to the 1:1 line within each panel
+  dat_clean <- dat0 %>%
+    dplyr::group_by(dataset, method) %>%
+    dplyr::group_modify(~{
+      df <- .x
+      df$resid_11 <- df$predicted - df$observed
+      
+      q1 <- quantile(df$resid_11, 0.25, na.rm = TRUE)
+      q3 <- quantile(df$resid_11, 0.75, na.rm = TRUE)
+      iqr <- q3 - q1
+      
+      lower <- q1 - iqr_mult * iqr
+      upper <- q3 + iqr_mult * iqr
+      
+      df %>%
+        dplyr::filter(resid_11 >= lower, resid_11 <= upper)
+    }) %>%
+    dplyr::ungroup()
+  
+  # panel stats after outlier removal
+  panel_stats <- dat_clean %>%
+    dplyr::group_by(dataset, method) %>%
+    dplyr::group_modify(~{
+      df <- .x
+      
+      if (nrow(df) < 3 || dplyr::n_distinct(df$observed) < 2) {
+        return(tibble::tibble(
+          n = nrow(df),
+          r2 = NA_real_,
+          x = NA_real_,
+          y = NA_real_,
+          lab = paste0("n = ", nrow(df), "\nR² = NA")
+        ))
+      }
+      
+      fit <- lm(predicted ~ observed, data = df)
+      r2 <- summary(fit)$r.squared
+      
+      x_pos <- min(df$observed, na.rm = TRUE) + 0.05 * diff(range(df$observed, na.rm = TRUE))
+      y_pos <- max(df$predicted, na.rm = TRUE) - 0.08 * diff(range(df$predicted, na.rm = TRUE))
+      
+      tibble::tibble(
+        n = nrow(df),
+        r2 = r2,
+        x = x_pos,
+        y = y_pos,
+        lab = paste0("n = ", nrow(df), "\nR² = ", round(r2, 2))
+      )
+    }) %>%
+    dplyr::ungroup()
+  
+  ggplot2::ggplot(dat_clean, ggplot2::aes(x = observed, y = predicted)) +
+    ggplot2::geom_point(alpha = 0.7) +
+    ggplot2::geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    ggplot2::geom_text(
+      data = panel_stats,
+      ggplot2::aes(x = x, y = y, label = lab),
+      inherit.aes = FALSE,
+      hjust = 0,
+      vjust = 1,
+      size = 3
+    ) +
+    ggplot2::facet_grid(dataset ~ method, scales = "free") +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(
+      title = paste("Validation:", nutrient_name),
+      subtitle = paste("Extreme outliers removed using 1:1 residual IQR filter (", iqr_mult, "× IQR)", sep = ""),
+      x = "Observed (validation 0–15 cm)",
+      y = "Predicted (ensemble mean)"
+    )
+  }
+  
+#plot all variables:
+for (v in names(val_var_lookup)) {
+  print(plot_continuous_validation_clean(continuous_val_tbl, v))
+}
+
+# for (v in names(val_var_lookup)) {
+#   g <- plot_continuous_validation_clean(continuous_val_tbl, v)
+#   
+#   ggsave(
+#     filename = paste0("../outputs/validation/plots/", v, "_validation_clean.png"),
+#     plot = g,
+#     width = 9,
+#     height = 6,
+#     dpi = 300
+#   )
+# }
+
+readr::write_csv(continuous_val_tbl,
+                 "../outputs/validation/continuous_val_tbl_03_30_2026.csv")
+
+readr::write_csv(continuous_val_metrics,
+                 "../outputs/validation/continuous_val_metrics_03_30_2026.csv")
+
+readr::write_csv(continuous_val_ranked2,
+                 "../outputs/validation/continuous_val_ranked_03_30_2026.csv")
+
+continuous_val_residuals <- continuous_val_tbl %>%
+  mutate(
+    residual = observed - predicted,
+    abs_residual = abs(residual)
+  )
+
+compare_sampling_abs_resid <- function(resid_tbl) {
+  out <- list()
+  k <- 1
+  
+  for (meth in unique(resid_tbl$method)) {
+    for (nut in unique(resid_tbl$nutrient)) {
+      sub <- resid_tbl %>%
+        filter(method == meth, nutrient == nut) %>%
+        select(Point, dataset, abs_residual) %>%
+        pivot_wider(names_from = dataset, values_from = abs_residual)
+      
+      if (all(c("SP", "COMP") %in% names(sub))) {
+        dat <- sub %>% drop_na()
+        if (nrow(dat) >= 5) {
+          test <- wilcox.test(dat$SP, dat$COMP, paired = TRUE, exact = FALSE)
+          
+          out[[k]] <- tibble(
+            method = meth,
+            nutrient = nut,
+            n_pairs = nrow(dat),
+            median_diff = median(dat$SP - dat$COMP, na.rm = TRUE),
+            p_value = test$p.value
+          )
+          k <- k + 1
+        }
+      }
+    }
+  }
+  
+  bind_rows(out) %>%
+    group_by(nutrient) %>%
+    mutate(p_adj_BH = p.adjust(p_value, method = "BH")) %>%
+    ungroup()
+}
+
+continuous_spcomp_tests <- compare_sampling_abs_resid(continuous_val_residuals)
+continuous_spcomp_tests
+
+compare_methods_abs_resid <- function(resid_tbl) {
+  method_pairs <- list(
+    c("RF", "OK"),
+    c("RK", "RF"),
+    c("RK", "OK")
+  )
+  
+  out <- list()
+  k <- 1
+  
+  for (ds in unique(resid_tbl$dataset)) {
+    for (nut in unique(resid_tbl$nutrient)) {
+      sub <- resid_tbl %>%
+        filter(dataset == ds, nutrient == nut) %>%
+        select(Point, method, abs_residual) %>%
+        pivot_wider(names_from = method, values_from = abs_residual)
+      
+      for (pair in method_pairs) {
+        m1 <- pair[1]
+        m2 <- pair[2]
+        
+        if (all(c(m1, m2) %in% names(sub))) {
+          dat <- sub %>% select(Point, all_of(c(m1, m2))) %>% drop_na()
+          
+          if (nrow(dat) >= 5) {
+            test <- wilcox.test(dat[[m1]], dat[[m2]], paired = TRUE, exact = FALSE)
+            
+            out[[k]] <- tibble(
+              dataset = ds,
+              nutrient = nut,
+              comparison = paste0(m1, "_vs_", m2),
+              n_pairs = nrow(dat),
+              median_diff = median(dat[[m1]] - dat[[m2]], na.rm = TRUE),
+              p_value = test$p.value
+            )
+            k <- k + 1
+          }
+        }
+      }
+    }
+  }
+  
+  bind_rows(out) %>%
+    group_by(nutrient) %>%
+    mutate(p_adj_BH = p.adjust(p_value, method = "BH")) %>%
+    ungroup()
+}
+
+continuous_method_tests <- compare_methods_abs_resid(continuous_val_residuals)
+continuous_method_tests
+
+readr::write_csv(continuous_spcomp_tests,
+                 "../outputs/validation/continuous_spcomp_tests_03_30_2026.csv")
+readr::write_csv(continuous_method_tests,
+                 "../outputs/validation/continuous_method_tests_03_30_2026.csv")
+
+#Takeaways:
+    # SP + RK is best for P
+    # COMP + RK is best for most of the other nutrients
+    # method differences are only clearly significant for the buffer variables
+    # the differennt validation grid makes this a pretty tough test for OK/RK at short distances, so modest performance for some nutrients is not surprising
+  #so...
+    # SP + RK is the best P map
+    # COMP + RK is the best broad-fertility map
+    # COMP is generally better except for P and Mn
+    # RK is the strongest overall method
+    # OK is weakest overall in independent continuous validation
+```
+```{r variogram all}
+ap_val_match <- ap_val_sf %>%
+  transmute(
+    Point = Point,
+    lbc_1 = LBC.1_0_15,
+    lb_ceq = LBCeq_0_15,
+    p_h_2 = pH.2_0_15,
+    ca = Ca_0_15,
+    k = K_0_15,
+    mg = Mg_0_15,
+    mn = Mn_0_15,
+    p = P_0_15,
+    zn = Zn_0_15,
+    source = "validation",
+    geometry = geometry
+  )
+
+sp_match <- soil_prop_SP %>%
+  transmute(
+    Point = label,
+    lbc_1 = lbc_1,
+    lb_ceq = lb_ceq,
+    p_h_2 = p_h_2,
+    ca = ca,
+    k = k,
+    mg = mg,
+    mn = mn,
+    p = p,
+    zn = zn,
+    source = "SP",
+    geometry = geometry
+  )
+
+comp_match <- soil_prop_COMP %>%
+  transmute(
+    Point = label,
+    lbc_1 = lbc_1,
+    lb_ceq = lb_ceq,
+    p_h_2 = p_h_2,
+    ca = ca,
+    k = k,
+    mg = mg,
+    mn = mn,
+    p = p,
+    zn = zn,
+    source = "COMP",
+    geometry = geometry
+  )
+
+sp_plus_val <- bind_rows(sp_match, ap_val_match)
+comp_plus_val <- bind_rows(comp_match, ap_val_match)
+
+
+table(sp_plus_val$source)
+table(comp_plus_val$source)
+
+coords_spval <- st_coordinates(sp_plus_val)
+coords_compval <- st_coordinates(comp_plus_val)
+
+cutoff_spval <- max(dist(coords_spval)) / 2
+cutoff_compval <- max(dist(coords_compval)) / 2
+
+width_spval <- 50
+width_compval <- 50
+
+make_variograms <- function(dat_sf, soil_vars, cutoff, width) {
+  dat_sp <- as(dat_sf, "Spatial")
+  
+  out <- purrr::map(soil_vars, function(v) {
+    f <- as.formula(paste(v, "~ 1"))
+    gstat::variogram(f, data = dat_sp, cutoff = cutoff, width = width)
+  })
+  
+  names(out) <- soil_vars
+  out
+}
+
+vg_spval <- make_variograms(sp_plus_val, soil_vars, cutoff = cutoff_spval, width = width_spval)
+vg_compval <- make_variograms(comp_plus_val, soil_vars, cutoff = cutoff_compval, width = width_compval)
+
+fit_variogram_models <- function(vg) {
+  vg_df <- as.data.frame(vg)
+  
+  init_nugget <- max(0, min(vg_df$gamma, na.rm = TRUE) * 0.5)
+  init_sill   <- max(vg_df$gamma, na.rm = TRUE)
+  init_psill  <- max(init_sill - init_nugget, 1e-6)
+  init_range  <- max(vg_df$dist, na.rm = TRUE) / 3
+  
+  candidate_models <- c("Sph", "Exp")
+  
+  fits <- purrr::map(candidate_models, function(m) {
+    tryCatch({
+      fit <- fit.variogram(
+        vg,
+        model = vgm(
+          psill = init_psill,
+          model = m,
+          range = init_range,
+          nugget = init_nugget
+        )
+      )
+      
+      if (any(!is.finite(fit$psill))) return(NULL)
+      if (any(!is.finite(fit$range))) return(NULL)
+      if (any(fit$range[fit$model != "Nug"] <= 0)) return(NULL)
+      
+      fit
+    }, error = function(e) NULL)
+  })
+  
+  fits <- fits[!sapply(fits, is.null)]
+  if (length(fits) == 0) return(NULL)
+  
+  sse <- sapply(fits, function(f) attr(f, "SSErr"))
+  fits[[which.min(sse)]]
+}
+
+fit_spval <- purrr::map(vg_spval, fit_variogram_models)
+fit_compval <- purrr::map(vg_compval, fit_variogram_models)
+
+plot_vg_with_fit <- function(vg, fit = NULL, title = "") {
+  vg_df <- as.data.frame(vg)
+  
+  plot(
+    vg_df$dist, vg_df$gamma,
+    main = title,
+    xlab = "Distance",
+    ylab = "Semivariance",
+    pch = 16
+  )
+  
+  if (!is.null(fit)) {
+    good_range <- all(is.finite(fit$range[fit$model != "Nug"])) &&
+      all(fit$range[fit$model != "Nug"] > 0)
+    
+    good_psill <- all(is.finite(fit$psill)) &&
+      sum(fit$psill, na.rm = TRUE) > 0
+    
+    if (good_range && good_psill) {
+      vline <- variogramLine(fit, maxdist = max(vg_df$dist))
+      lines(vline$dist, vline$gamma, col = "red", lwd = 2)
+    }
+  }
+}
+
+op <- par(mfrow = c(3, 3), mar = c(3, 3, 2, 1))
+for (v in soil_vars) {
+  plot_vg_with_fit(vg_spval[[v]], fit_spval[[v]], paste("SP + validation:", v))
+}
+par(op)
+
+op <- par(mfrow = c(3, 3), mar = c(3, 3, 2, 1))
+for (v in soil_vars) {
+  plot_vg_with_fit(vg_compval[[v]], fit_compval[[v]], paste("COMP + validation:", v))
+}
+par(op)
+
+extract_vg_metrics <- function(fit, var_name, dataset) {
+  if (is.null(fit)) {
+    return(tibble(
+      dataset = dataset,
+      variable = var_name,
+      model = NA_character_,
+      nugget = NA_real_,
+      sill = NA_real_,
+      range = NA_real_,
+      nugget_ratio = NA_real_,
+      SSErr = NA_real_
+    ))
+  }
+  
+  nugget <- fit$psill[fit$model == "Nug"]
+  if (length(nugget) == 0) nugget <- 0
+  
+  sill <- sum(fit$psill, na.rm = TRUE)
+  range <- fit$range[fit$model != "Nug"][1]
+  
+  tibble(
+    dataset = dataset,
+    variable = var_name,
+    model = fit$model[fit$model != "Nug"][1],
+    nugget = nugget,
+    sill = sill,
+    range = range,
+    nugget_ratio = nugget / sill,
+    SSErr = attr(fit, "SSErr")
+  )
+}
+
+vg_metrics_spval <- purrr::map_dfr(
+  names(fit_spval),
+  ~extract_vg_metrics(fit_spval[[.x]], .x, "SP_plus_val")
+)
+
+vg_metrics_compval <- purrr::map_dfr(
+  names(fit_compval),
+  ~extract_vg_metrics(fit_compval[[.x]], .x, "COMP_plus_val")
+)
+
+vg_metrics_combined <- bind_rows(vg_metrics_spval, vg_metrics_compval)
+vg_metrics_combined
+```
+
+
+
+```{r clustering}
+zone_vars <- c("p_h_2", "ca", "k", "mg", "mn", "p", "zn")
+context_vars <- c("lbc_1", "lb_ceq")   # summarize later, but do not cluster on them
+all_zone_summary_vars <- c(zone_vars, context_vars)
+
+build_method_stack_current <- function(final_ensemble_rasters, dataset_name, method_name, vars_use) {
+  rast_list <- list()
+  
+  for (v in vars_use) {
+    obj <- final_ensemble_rasters[[dataset_name]][[method_name]][[v]]
+    
+    if (is.null(obj)) {
+      message("Dropping ", dataset_name, " ", method_name, " ", v, ": object is NULL")
+      next
+    }
+    
+    # allow either a list(mean = raster) or a bare raster
+    if (inherits(obj, "SpatRaster")) {
+      r <- obj
+    } else if (is.list(obj) && !is.null(obj$mean) && inherits(obj$mean, "SpatRaster")) {
+      r <- obj$mean
+    } else {
+      message("Dropping ", dataset_name, " ", method_name, " ", v,
+              ": object exists but is not a usable raster/list(mean=raster)")
+      next
+    }
+    
+    vals <- terra::values(r, mat = FALSE)
+    n_valid <- sum(!is.na(vals))
+    
+    if (n_valid > 0) {
+      rast_list[[v]] <- r
+    } else {
+      message("Dropping ", dataset_name, " ", method_name, " ", v,
+              " because it has 0 valid cells.")
+    }
+  }
+  
+  if (length(rast_list) == 0) return(NULL)
+  
+  out <- terra::rast(rast_list)
+  names(out) <- names(rast_list)
+  out
+}
+
+filter_stack_by_completeness <- function(r_stack, max_na_prop = 0.4) {
+  keep <- sapply(names(r_stack), function(nm) {
+    vals <- terra::values(r_stack[[nm]], mat = FALSE)
+    mean(is.na(vals)) <= max_na_prop
+  })
+  
+  r_stack[[names(r_stack)[keep]]]
+}
+
+mask_to_common_support <- function(r_stack) {
+  valid_sum <- sum(!is.na(r_stack))
+  common_mask <- valid_sum == terra::nlyr(r_stack)
+  terra::mask(r_stack, common_mask, maskvalues = 0)
+}
+
+sample_raster_pixels <- function(r_stack, n = 10000, seed = 123) {
+  set.seed(seed)
+  
+  samp <- terra::spatSample(
+    r_stack,
+    size = n,
+    method = "random",
+    na.rm = TRUE,
+    as.df = TRUE,
+    warn = FALSE
+  )
+  
+  samp <- as.data.frame(samp)
+  samp <- samp[, names(r_stack), drop = FALSE]
+  samp <- samp[complete.cases(samp), , drop = FALSE]
+  
+  samp
+}
+
+fit_sample_kmeans_zones <- function(sample_df, k = 4, seed = 123) {
+  sample_df <- as.data.frame(sample_df)
+  
+  if (nrow(sample_df) == 0) stop("No sampled pixels available after NA filtering.")
+  
+  sample_df <- sample_df[, vapply(sample_df, is.numeric, logical(1)), drop = FALSE]
+  if (ncol(sample_df) == 0) stop("No numeric raster layers available for clustering.")
+  
+  keep <- vapply(sample_df, function(x) {
+    sx <- sd(x, na.rm = TRUE)
+    is.finite(sx) && sx > 0
+  }, logical(1))
+  
+  sample_df <- sample_df[, keep, drop = FALSE]
+  if (ncol(sample_df) == 0) stop("All sampled raster layers had zero variance.")
+  
+  k_use <- min(k, nrow(sample_df))
+  if (k_use < 2) stop("Too few sampled pixels to create 2 or more clusters.")
+  
+  x <- scale(sample_df)
+  
+  set.seed(seed)
+  km <- kmeans(x, centers = k_use, nstart = 25)
+  
+  list(
+    model = km,
+    centers = km$centers,
+    scale_center = attr(x, "scaled:center"),
+    scale_scale  = attr(x, "scaled:scale"),
+    kept_names = colnames(sample_df),
+    sample_scaled = x,
+    sample_cluster = km$cluster
+  )
+}
+fit_sample_kmeans_zones <- function(sample_df, k = 4, seed = 123) {
+  sample_df <- as.data.frame(sample_df)
+  
+  if (nrow(sample_df) == 0) stop("No sampled pixels available after NA filtering.")
+  
+  sample_df <- sample_df[, vapply(sample_df, is.numeric, logical(1)), drop = FALSE]
+  if (ncol(sample_df) == 0) stop("No numeric raster layers available for clustering.")
+  
+  keep <- vapply(sample_df, function(x) {
+    sx <- sd(x, na.rm = TRUE)
+    is.finite(sx) && sx > 0
+  }, logical(1))
+  
+  sample_df <- sample_df[, keep, drop = FALSE]
+  if (ncol(sample_df) == 0) stop("All sampled raster layers had zero variance.")
+  
+  k_use <- min(k, nrow(sample_df))
+  if (k_use < 2) stop("Too few sampled pixels to create 2 or more clusters.")
+  
+  x <- scale(sample_df)
+  
+  set.seed(seed)
+  km <- kmeans(x, centers = k_use, nstart = 25)
+  
+  list(
+    model = km,
+    centers = km$centers,
+    scale_center = attr(x, "scaled:center"),
+    scale_scale  = attr(x, "scaled:scale"),
+    kept_names = colnames(sample_df),
+    sample_scaled = x,
+    sample_cluster = km$cluster
+  )
+}
+
+assign_raster_to_centroids <- function(r_stack, zone_fit, filename = NULL, overwrite = TRUE) {
+  
+  centers <- as.matrix(zone_fit$centers)
+  scale_center <- zone_fit$scale_center
+  scale_scale  <- zone_fit$scale_scale
+  
+  zone_fun <- function(v) {
+    if (is.null(dim(v))) {
+      v <- matrix(v, ncol = length(scale_center), byrow = TRUE)
+    } else {
+      v <- as.matrix(v)
+    }
+    
+    out <- rep(NA_integer_, nrow(v))
+    ok <- complete.cases(v)
+    if (!any(ok)) return(out)
+    
+    x <- v[ok, , drop = FALSE]
+    x_scaled <- sweep(x, 2, scale_center, "-")
+    x_scaled <- sweep(x_scaled, 2, scale_scale, "/")
+    
+    dmat <- vapply(seq_len(nrow(centers)), function(j) {
+      rowSums((x_scaled - matrix(
+        centers[j, ],
+        nrow = nrow(x_scaled),
+        ncol = ncol(x_scaled),
+        byrow = TRUE
+      ))^2)
+    }, FUN.VALUE = numeric(nrow(x_scaled)))
+    
+    dmat <- as.matrix(dmat)
+    if (nrow(dmat) != nrow(x_scaled)) dmat <- t(dmat)
+    
+    out[ok] <- max.col(-dmat, ties.method = "first")
+    out
+  }
+  
+  if (is.null(filename)) {
+    z <- terra::app(r_stack, fun = zone_fun)
+  } else {
+    z <- terra::app(
+      r_stack,
+      fun = zone_fun,
+      filename = filename,
+      overwrite = overwrite,
+      wopt = list(datatype = "INT2S")
+    )
+  }
+  
+  names(z) <- "management_zone"
+  z
+}
+
+management_zone_rasters <- list()
+
+for (ds in c("SP", "COMP")) {
+  management_zone_rasters[[ds]] <- list()
+  
+  for (meth in c("RF", "OK", "RK")) {
+    cat("Creating zones for", ds, meth, "\n")
+    
+    management_zone_rasters[[ds]][[meth]] <- tryCatch({
+      r_stack <- build_method_stack_current(
+        final_ensemble_rasters = final_ensemble_rasters,
+        dataset_name = ds,
+        method_name = meth,
+        vars_use = zone_vars
+      )
+      
+      if (is.null(r_stack)) stop("No usable layers in stack.")
+      
+      r_stack <- filter_stack_by_completeness(r_stack, max_na_prop = 0.4)
+      if (is.null(r_stack) || terra::nlyr(r_stack) < 2) {
+        stop("Fewer than 2 usable layers after completeness filtering.")
+      }
+      
+      r_stack <- mask_to_common_support(r_stack)
+      
+      samp <- sample_raster_pixels(r_stack, n = 10000, seed = 123)
+      if (nrow(samp) < 10) stop("Too few complete sampled pixels after filtering.")
+      
+      fit <- fit_sample_kmeans_zones(samp, k = 4, seed = 123)
+      r_stack_use <- r_stack[[fit$kept_names]]
+      
+      assign_raster_to_centroids(r_stack = r_stack_use, zone_fit = fit)
+      
+    }, error = function(e) {
+      message("Failed for ", ds, " ", meth, ": ", e$message)
+      NULL
+    })
+  }
+}
+
+summarize_clusters <- function(zone_raster, nutrient_stack) {
+  zone_vals <- terra::values(zone_raster, mat = FALSE)
+  nut_vals  <- terra::as.data.frame(nutrient_stack, na.rm = FALSE)
+  
+  vals <- dplyr::bind_cols(
+    tibble::tibble(zone = zone_vals),
+    nut_vals
+  ) %>%
+    dplyr::filter(!is.na(zone)) %>%
+    dplyr::filter(dplyr::if_all(-1, ~ !is.na(.x)))
+  
+  nutrient_cols <- setdiff(names(vals), "zone")
+  
+  vals %>%
+    dplyr::group_by(zone) %>%
+    dplyr::summarise(
+      dplyr::across(
+        .cols = dplyr::all_of(nutrient_cols),
+        .fns = list(
+          mean = ~mean(.x, na.rm = TRUE),
+          median = ~median(.x, na.rm = TRUE),
+          sd = ~sd(.x, na.rm = TRUE)
+        ),
+        .names = "{.col}_{.fn}"
+      ),
+      n_cells = dplyr::n(),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(zone)
+}
+
+cluster_profile_zscores <- function(zone_raster, nutrient_stack) {
+  zone_vals <- terra::values(zone_raster, mat = FALSE)
+  nut_vals  <- terra::as.data.frame(nutrient_stack, na.rm = FALSE)
+  
+  vals <- dplyr::bind_cols(
+    tibble::tibble(zone = zone_vals),
+    nut_vals
+  ) %>%
+    dplyr::filter(!is.na(zone)) %>%
+    dplyr::filter(dplyr::if_all(-1, ~ !is.na(.x)))
+  
+  nutrient_cols <- setdiff(names(vals), "zone")
+  
+  vals_z <- vals
+  vals_z[nutrient_cols] <- lapply(vals_z[nutrient_cols], function(x) as.numeric(scale(x)))
+  
+  vals_z %>%
+    dplyr::group_by(zone) %>%
+    dplyr::summarise(
+      dplyr::across(
+        .cols = dplyr::all_of(nutrient_cols),
+        .fns = ~mean(.x, na.rm = TRUE)
+      ),
+      n_cells = dplyr::n(),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(zone)
+}
+
+cluster_summary_list <- list()
+cluster_profile_list <- list()
+
+for (ds in c("SP", "COMP")) {
+  for (meth in c("RF", "OK", "RK")) {
+    cat("Summarizing clusters for", ds, meth, "\n")
+    
+    z <- management_zone_rasters[[ds]][[meth]]
+    if (is.null(z)) next
+    
+    stack_i <- build_method_stack_current(
+      final_ensemble_rasters = final_ensemble_rasters,
+      dataset_name = ds,
+      method_name = meth,
+      vars_use = all_zone_summary_vars
+    )
+    if (is.null(stack_i)) next
+    
+    stack_i <- filter_stack_by_completeness(stack_i, max_na_prop = 0.4)
+    stack_i <- mask_to_common_support(stack_i)
+    
+    cl_sum <- summarize_clusters(z, stack_i) %>%
+      dplyr::mutate(dataset = ds, method = meth) %>%
+      dplyr::relocate(dataset, method)
+    
+    cl_prof <- cluster_profile_zscores(z, stack_i) %>%
+      dplyr::mutate(dataset = ds, method = meth) %>%
+      dplyr::relocate(dataset, method)
+    
+    cluster_summary_list[[paste(ds, meth, sep = "_")]] <- cl_sum
+    cluster_profile_list[[paste(ds, meth, sep = "_")]] <- cl_prof
+  }
+}
+
+cluster_summary_all <- dplyr::bind_rows(cluster_summary_list)
+cluster_profile_all <- dplyr::bind_rows(cluster_profile_list)
+
+priority_vars <- c("p_h_2", "ca", "k", "mg", "mn", "p", "zn")
+
+cluster_priority_lookup <- cluster_profile_all %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    fertility_score = mean(c_across(all_of(priority_vars)), na.rm = TRUE)
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(dataset, method) %>%
+  dplyr::arrange(fertility_score, .by_group = TRUE) %>%
+  dplyr::mutate(
+    new_zone = dplyr::row_number(),
+    n_zones_map = dplyr::n(),
+    priority_label = dplyr::case_when(
+      n_zones_map == 2 & new_zone == 1 ~ "High priority",
+      n_zones_map == 2 & new_zone == 2 ~ "Low priority",
+      
+      n_zones_map == 3 & new_zone == 1 ~ "High priority",
+      n_zones_map == 3 & new_zone == 2 ~ "Moderate priority",
+      n_zones_map == 3 & new_zone == 3 ~ "Low priority",
+      
+      n_zones_map == 4 & new_zone == 1 ~ "High priority",
+      n_zones_map == 4 & new_zone == 2 ~ "Moderate-high priority",
+      n_zones_map == 4 & new_zone == 3 ~ "Moderate-low priority",
+      n_zones_map == 4 & new_zone == 4 ~ "Low priority",
+      
+      TRUE ~ paste("Zone", new_zone)
+    )
+  ) %>%
+  dplyr::ungroup()
+
+relabel_zone_raster <- function(zone_raster, lookup_df, ds, meth) {
+  lut <- lookup_df %>%
+    dplyr::filter(dataset == ds, method == meth) %>%
+    dplyr::select(zone, new_zone, priority_label)
+  
+  if (nrow(lut) == 0) return(NULL)
+  
+  vals <- terra::values(zone_raster, mat = FALSE)
+  new_vals <- vals
+  
+  for (i in seq_len(nrow(lut))) {
+    new_vals[vals == lut$zone[i]] <- lut$new_zone[i]
+  }
+  
+  out <- zone_raster
+  terra::values(out) <- new_vals
+  names(out) <- paste0(ds, "_", meth, "_priority_zone")
+  
+  out <- terra::as.factor(out)
+  lv <- data.frame(
+    value = lut$new_zone,
+    label = lut$priority_label
+  )
+  levels(out) <- lv
+  
+  out
+}
+
+relabeled_management_zone_rasters <- list()
+
+for (ds in c("SP", "COMP")) {
+  relabeled_management_zone_rasters[[ds]] <- list()
+  
+  for (meth in c("RF", "OK", "RK")) {
+    z <- management_zone_rasters[[ds]][[meth]]
+    if (is.null(z)) {
+      relabeled_management_zone_rasters[[ds]][[meth]] <- NULL
+      next
+    }
+    
+    relabeled_management_zone_rasters[[ds]][[meth]] <- relabel_zone_raster(
+      zone_raster = z,
+      lookup_df = cluster_priority_lookup,
+      ds = ds,
+      meth = meth
+    )
+  }
+}
+
+zone_cols_priority <- c("#B2182B", "#EF8A62", "#A6DBA0", "#1A9850")
+
+par(mfrow = c(2, 3), mar = c(3, 3, 3, 5))
+
+for (ds in c("SP", "COMP")) {
+  for (meth in c("RF", "OK", "RK")) {
+    z <- relabeled_management_zone_rasters[[ds]][[meth]]
+    
+    if (!is.null(z)) {
+      plot(
+        z,
+        main = paste(ds, meth, "\nHigh → Low amendment priority"),
+        col = zone_cols_priority,
+        type = "classes"
+      )
+    } else {
+      plot(NA, NA, main = paste(ds, meth), xlim = c(0, 1), ylim = c(0, 1))
+      text(0.5, 0.5, "No zones", cex = 1.2)
+    }
+  }
+}
+
+zone_area_summary <- function(zone_raster, ds, meth) {
+  vals <- terra::values(zone_raster, mat = FALSE)
+  vals <- vals[!is.na(vals)]
+  
+  tibble(zone = vals) %>%
+    count(zone, name = "n_cells") %>%
+    mutate(
+      dataset = ds,
+      method = meth,
+      prop = n_cells / sum(n_cells)
+    )
+}
+
+zone_area_tbl <- bind_rows(
+  lapply(c("SP", "COMP"), function(ds) {
+    bind_rows(lapply(c("RF", "OK", "RK"), function(meth) {
+      z <- relabeled_management_zone_rasters[[ds]][[meth]]
+      if (is.null(z)) return(NULL)
+      zone_area_summary(z, ds, meth)
+    }))
+  })
+)
+```
+
+```{r zonal stats}
+extract_zone_pairs <- function(r1, r2, name1 = "zone1", name2 = "zone2") {
+  v1 <- terra::values(r1, mat = FALSE)
+  v2 <- terra::values(r2, mat = FALSE)
+  
+  out <- tibble(
+    !!name1 := v1,
+    !!name2 := v2
+  ) %>%
+    filter(!is.na(.data[[name1]]), !is.na(.data[[name2]]))
+  
+  out
+}
+
+zone_agreement_metrics <- function(pair_df, z1 = "zone1", z2 = "zone2") {
+  tab <- table(pair_df[[z1]], pair_df[[z2]])
+  
+  overall_agreement <- sum(diag(tab)) / sum(tab)
+  
+  # simple Cohen's kappa by hand
+  row_marg <- rowSums(tab)
+  col_marg <- colSums(tab)
+  expected <- sum(row_marg * col_marg) / (sum(tab)^2)
+  kappa <- (overall_agreement - expected) / (1 - expected)
+  
+  tibble(
+    n_cells = sum(tab),
+    overall_agreement = overall_agreement,
+    kappa = kappa
+  )
+}
+
+
+
+zone_weighted_kappa <- function(pair_df, z1 = "zone1", z2 = "zone2") {
+  dat <- pair_df %>%
+    transmute(
+      z1 = as.integer(.data[[z1]]),
+      z2 = as.integer(.data[[z2]])
+    )
+  
+  kk_equal <- irr::kappa2(dat, weight = "equal")
+  
+  tibble(
+    weighted_kappa = kk_equal$value
+  )
+}
+
+compare_sp_comp_zones <- function(relabeled_management_zone_rasters) {
+  out_metrics <- list()
+  out_tabs <- list()
+  k <- 1
+  
+  for (meth in c("RF", "OK", "RK")) {
+    z_sp <- relabeled_management_zone_rasters[["SP"]][[meth]]
+    z_comp <- relabeled_management_zone_rasters[["COMP"]][[meth]]
+    
+    if (is.null(z_sp) || is.null(z_comp)) next
+    
+    pairs <- extract_zone_pairs(z_sp, z_comp, "SP_zone", "COMP_zone")
+    mets <- zone_agreement_metrics(pairs, "SP_zone", "COMP_zone")
+    wk <- zone_weighted_kappa(pairs, "SP_zone", "COMP_zone")
+    
+    out_metrics[[k]] <- bind_cols(
+      tibble(comparison = "SP_vs_COMP", method = meth),
+      mets,
+      wk
+    )
+    
+    out_tabs[[meth]] <- as.data.frame.matrix(table(pairs$SP_zone, pairs$COMP_zone))
+    k <- k + 1
+  }
+  
+  list(
+    metrics = bind_rows(out_metrics),
+    confusion_tables = out_tabs
+  )
+}
+
+sp_comp_zone_compare <- compare_sp_comp_zones(relabeled_management_zone_rasters)
+sp_comp_zone_compare$metrics
+
+compare_method_zones <- function(relabeled_management_zone_rasters) {
+  out_metrics <- list()
+  out_tabs <- list()
+  k <- 1
+  
+  method_pairs <- list(
+    c("RF", "OK"),
+    c("RK", "RF"),
+    c("RK", "OK")
+  )
+  
+  for (ds in c("SP", "COMP")) {
+    for (pair in method_pairs) {
+      m1 <- pair[1]
+      m2 <- pair[2]
+      
+      z1 <- relabeled_management_zone_rasters[[ds]][[m1]]
+      z2 <- relabeled_management_zone_rasters[[ds]][[m2]]
+      
+      if (is.null(z1) || is.null(z2)) next
+      
+      pairs <- extract_zone_pairs(z1, z2, "zone_1", "zone_2")
+      mets <- zone_agreement_metrics(pairs, "zone_1", "zone_2")
+      wk <- zone_weighted_kappa(pairs, "zone_1", "zone_2")
+      
+      comp_name <- paste0(m1, "_vs_", m2)
+      
+      out_metrics[[k]] <- bind_cols(
+        tibble(dataset = ds, comparison = comp_name),
+        mets,
+        wk
+      )
+      
+      out_tabs[[paste(ds, comp_name, sep = "_")]] <- as.data.frame.matrix(table(pairs$zone_1, pairs$zone_2))
+      k <- k + 1
+    }
+  }
+  
+  list(
+    metrics = bind_rows(out_metrics),
+    confusion_tables = out_tabs
+  )
+}
+
+method_zone_compare <- compare_method_zones(relabeled_management_zone_rasters)
+method_zone_compare$metrics
+
+zone_near_agreement <- function(pair_df, z1 = "zone1", z2 = "zone2") {
+  dz <- abs(as.integer(pair_df[[z1]]) - as.integer(pair_df[[z2]]))
+  
+  tibble(
+    exact_agreement = mean(dz == 0, na.rm = TRUE),
+    within_1_zone = mean(dz <= 1, na.rm = TRUE),
+    mean_abs_zone_diff = mean(dz, na.rm = TRUE)
+  )
+}
+
+compare_sp_comp_zones <- function(relabeled_management_zone_rasters) {
+  out_metrics <- list()
+  out_tabs <- list()
+  k <- 1
+  
+  for (meth in c("RF", "OK", "RK")) {
+    z_sp <- relabeled_management_zone_rasters[["SP"]][[meth]]
+    z_comp <- relabeled_management_zone_rasters[["COMP"]][[meth]]
+    
+    if (is.null(z_sp) || is.null(z_comp)) next
+    
+    pairs <- extract_zone_pairs(z_sp, z_comp, "SP_zone", "COMP_zone")
+    mets <- zone_agreement_metrics(pairs, "SP_zone", "COMP_zone")
+    wk <- zone_weighted_kappa(pairs, "SP_zone", "COMP_zone")
+    near <- zone_near_agreement(pairs, "SP_zone", "COMP_zone")
+    
+    out_metrics[[k]] <- bind_cols(
+      tibble(comparison = "SP_vs_COMP", method = meth),
+      mets,
+      wk,
+      near
+    )
+    
+    out_tabs[[meth]] <- as.data.frame.matrix(table(pairs$SP_zone, pairs$COMP_zone))
+    k <- k + 1
+  }
+  
+  list(
+    metrics = bind_rows(out_metrics),
+    confusion_tables = out_tabs
+  )
+}
+
+sp_comp_zone_compare <- compare_sp_comp_zones(relabeled_management_zone_rasters)
+sp_comp_zone_compare$metrics
+
+compare_method_zones <- function(relabeled_management_zone_rasters) {
+  out_metrics <- list()
+  out_tabs <- list()
+  k <- 1
+  
+  method_pairs <- list(
+    c("RF", "OK"),
+    c("RK", "RF"),
+    c("RK", "OK")
+  )
+  
+  for (ds in c("SP", "COMP")) {
+    for (pair in method_pairs) {
+      m1 <- pair[1]
+      m2 <- pair[2]
+      
+      z1 <- relabeled_management_zone_rasters[[ds]][[m1]]
+      z2 <- relabeled_management_zone_rasters[[ds]][[m2]]
+      
+      if (is.null(z1) || is.null(z2)) next
+      
+      pairs <- extract_zone_pairs(z1, z2, "zone_1", "zone_2")
+      mets <- zone_agreement_metrics(pairs, "zone_1", "zone_2")
+      wk <- zone_weighted_kappa(pairs, "zone_1", "zone_2")
+      near <- zone_near_agreement(pairs, "zone_1", "zone_2")
+      
+      comp_name <- paste0(m1, "_vs_", m2)
+      
+      out_metrics[[k]] <- bind_cols(
+        tibble(dataset = ds, comparison = comp_name),
+        mets,
+        wk,
+        near
+      )
+      
+      out_tabs[[paste(ds, comp_name, sep = "_")]] <- as.data.frame.matrix(table(pairs$zone_1, pairs$zone_2))
+      k <- k + 1
+    }
+  }
+  
+  list(
+    metrics = bind_rows(out_metrics),
+    confusion_tables = out_tabs
+  )
+}
+
+method_zone_compare <- compare_method_zones(relabeled_management_zone_rasters)
+method_zone_compare$metrics
+
+
+
+plot_confusion_heatmap <- function(tab_df, title = "Zone confusion matrix") {
+  tab_df %>%
+    tibble::rownames_to_column("row_zone") %>%
+    pivot_longer(-row_zone, names_to = "col_zone", values_to = "n") %>%
+    ggplot(aes(x = col_zone, y = row_zone, fill = n)) +
+    geom_tile() +
+    geom_text(aes(label = n), color = "black") +
+    scale_fill_gradient(low = "white", high = "steelblue") +
+    theme_minimal() +
+    labs(title = title, x = "Map 2 zone", y = "Map 1 zone")
+}
+
+plot_confusion_heatmap(sp_comp_zone_compare$confusion_tables[["RF"]], "SP vs COMP | RF")
+plot_confusion_heatmap(method_zone_compare$confusion_tables[["SP_RF_vs_OK"]], "SP | RF vs OK")
+
+# readr::write_csv(sp_comp_zone_compare$metrics,
+#                  "../LOCAL DATA DO NOT PUSH/sp_comp_zone_agreement_metrics_03_30_2026.csv")
+# 
+# readr::write_csv(method_zone_compare$metrics,
+#                  "../LOCAL DATA DO NOT PUSH/method_zone_agreement_metrics_03_30_2026.csv")
+
+
+#Takeaways:
+  #RK gives the most similar priority-zone map between SP and COMP. OK gives the least similar.
+  #RK is robust to sampling type. OK is the most sensitive to sampling type. RF is in between.
+    #Sampling type affects zoning most under OK!
+  
+
+```
+```{r zonal validation}
+#Validation
+
+
+plot(st_geometry(soil_prop_SP), col = "grey70")
+plot(st_geometry(ap_val_sf), add = TRUE, col = "red", pch = 16)
+
+#extract zone stuff:
+extract_zone_validation <- function(ap_val_sf, relabeled_management_zone_rasters) {
+  out_list <- list()
+  k <- 1
+  
+  for (ds in c("SP", "COMP")) {
+    for (meth in c("RF", "OK", "RK")) {
+      z <- relabeled_management_zone_rasters[[ds]][[meth]]
+      if (is.null(z)) next
+      
+      ext <- terra::extract(z, terra::vect(ap_val_sf))
+      
+      tmp <- ap_val_sf %>%
+        st_drop_geometry() %>%
+        mutate(
+          dataset = ds,
+          method = meth,
+          zone = ext[, 2]
+        )
+      
+      out_list[[k]] <- tmp
+      k <- k + 1
+    }
+  }
+  
+  bind_rows(out_list)
+}
+
+zone_val_tbl <- extract_zone_validation(ap_val_sf, relabeled_management_zone_rasters)
+zone_val_tbl
+
+
+summarize_validation_by_zone <- function(zone_val_tbl, val_var_lookup) {
+  out <- list()
+  k <- 1
+  
+  for (nm in names(val_var_lookup)) {
+    val_col <- val_var_lookup[[nm]]
+    
+    tmp <- zone_val_tbl %>%
+      filter(!is.na(zone), !is.na(.data[[val_col]])) %>%
+      group_by(dataset, method, zone) %>%
+      summarise(
+        nutrient = nm,
+        n_points = n(),
+        mean_val = mean(.data[[val_col]], na.rm = TRUE),
+        median_val = median(.data[[val_col]], na.rm = TRUE),
+        sd_val = sd(.data[[val_col]], na.rm = TRUE),
+        .groups = "drop"
+      )
+    
+    out[[k]] <- tmp
+    k <- k + 1
+  }
+  
+  bind_rows(out)
+}
+
+zone_val_summary <- summarize_validation_by_zone(zone_val_tbl, val_var_lookup)
+zone_val_summary
+
+kruskal_zone_validation <- function(zone_val_tbl, val_var_lookup) {
+  out <- list()
+  k <- 1
+  
+  for (nm in names(val_var_lookup)) {
+    val_col <- val_var_lookup[[nm]]
+    
+    for (ds in unique(zone_val_tbl$dataset)) {
+      for (meth in unique(zone_val_tbl$method)) {
+        
+        dat <- zone_val_tbl %>%
+          filter(dataset == ds, method == meth, !is.na(zone), !is.na(.data[[val_col]])) %>%
+          mutate(zone = factor(zone))
+        
+        if (nrow(dat) < 5 || n_distinct(dat$zone) < 2) next
+        
+        test <- kruskal.test(dat[[val_col]] ~ dat$zone)
+        
+        # epsilon-squared effect size for Kruskal-Wallis
+        n <- nrow(dat)
+        k_groups <- n_distinct(dat$zone)
+        H <- as.numeric(test$statistic)
+        eps2 <- (H - k_groups + 1) / (n - k_groups)
+        
+        out[[k]] <- tibble(
+          dataset = ds,
+          method = meth,
+          nutrient = nm,
+          n_points = n,
+          n_zones = k_groups,
+          statistic = H,
+          p_value = test$p.value,
+          epsilon2 = eps2
+        )
+        k <- k + 1
+      }
+    }
+  }
+  
+  bind_rows(out) %>%
+    group_by(nutrient) %>%
+    mutate(p_adj_BH = p.adjust(p_value, method = "BH")) %>%
+    ungroup()
+}
+
+zone_kw_tbl <- kruskal_zone_validation(zone_val_tbl, val_var_lookup)
+zone_kw_tbl
+zone_trend_validation <- function(zone_val_tbl, val_var_lookup) {
+  out <- list()
+  k <- 1
+  
+  for (nm in names(val_var_lookup)) {
+    val_col <- val_var_lookup[[nm]]
+    
+    for (ds in unique(zone_val_tbl$dataset)) {
+      for (meth in unique(zone_val_tbl$method)) {
+        
+        dat <- zone_val_tbl %>%
+          filter(dataset == ds, method == meth, !is.na(zone), !is.na(.data[[val_col]])) %>%
+          mutate(zone_num = as.numeric(zone))
+        
+        if (nrow(dat) < 5 || n_distinct(dat$zone_num) < 2) next
+        
+        test <- suppressWarnings(cor.test(dat$zone_num, dat[[val_col]], method = "spearman"))
+        
+        out[[k]] <- tibble(
+          dataset = ds,
+          method = meth,
+          nutrient = nm,
+          n_points = nrow(dat),
+          spearman_rho = unname(test$estimate),
+          p_value = test$p.value
+        )
+        k <- k + 1
+      }
+    }
+  }
+  
+  bind_rows(out) %>%
+    group_by(nutrient) %>%
+    mutate(p_adj_BH = p.adjust(p_value, method = "BH")) %>%
+    ungroup()
+}
+
+zone_trend_tbl <- zone_trend_validation(zone_val_tbl, val_var_lookup)
+zone_trend_tbl
+kruskal_zone_validation <- function(zone_val_tbl, val_var_lookup) {
+  out <- list()
+  k <- 1
+  
+  for (nm in names(val_var_lookup)) {
+    val_col <- val_var_lookup[[nm]]
+    
+    for (ds in unique(zone_val_tbl$dataset)) {
+      for (meth in unique(zone_val_tbl$method)) {
+        
+        dat <- zone_val_tbl %>%
+          filter(dataset == ds, method == meth, !is.na(zone), !is.na(.data[[val_col]])) %>%
+          mutate(zone = factor(zone))
+        
+        if (nrow(dat) < 5 || n_distinct(dat$zone) < 2) next
+        
+        test <- kruskal.test(dat[[val_col]] ~ dat$zone)
+        
+        # epsilon-squared effect size for Kruskal-Wallis
+        n <- nrow(dat)
+        k_groups <- n_distinct(dat$zone)
+        H <- as.numeric(test$statistic)
+        eps2 <- (H - k_groups + 1) / (n - k_groups)
+        
+        out[[k]] <- tibble(
+          dataset = ds,
+          method = meth,
+          nutrient = nm,
+          n_points = n,
+          n_zones = k_groups,
+          statistic = H,
+          p_value = test$p.value,
+          epsilon2 = eps2
+        )
+        k <- k + 1
+      }
+    }
+  }
+  
+  bind_rows(out) %>%
+    group_by(nutrient) %>%
+    mutate(p_adj_BH = p.adjust(p_value, method = "BH")) %>%
+    ungroup()
+}
+
+zone_kw_tbl <- kruskal_zone_validation(zone_val_tbl, val_var_lookup)
+zone_kw_tbl
+
+zone_r2_validation <- function(zone_val_tbl, val_var_lookup) {
+  out <- list()
+  k <- 1
+  
+  for (nm in names(val_var_lookup)) {
+    val_col <- val_var_lookup[[nm]]
+    
+    for (ds in unique(zone_val_tbl$dataset)) {
+      for (meth in unique(zone_val_tbl$method)) {
+        
+        dat <- zone_val_tbl %>%
+          filter(dataset == ds, method == meth, !is.na(zone), !is.na(.data[[val_col]])) %>%
+          mutate(zone = factor(zone))
+        
+        if (nrow(dat) < 5 || n_distinct(dat$zone) < 2) next
+        
+        mod <- lm(dat[[val_col]] ~ zone, data = dat)
+        r2 <- summary(mod)$r.squared
+        
+        out[[k]] <- tibble(
+          dataset = ds,
+          method = meth,
+          nutrient = nm,
+          n_points = nrow(dat),
+          zone_r2 = r2
+        )
+        k <- k + 1
+      }
+    }
+  }
+  
+  bind_rows(out)
+}
+
+zone_r2_tbl <- zone_r2_validation(zone_val_tbl, val_var_lookup)
+zone_r2_tbl
+
+
+
+readr::write_csv(zone_val_tbl,
+                 "../outputs/validation/zone_val_tbl_03_30_2026.csv")
+
+readr::write_csv(zone_val_summary,
+                 "../outputs/validation/zone_val_summary_03_30_2026.csv")
+
+readr::write_csv(zone_kw_tbl,
+                 "../outputs/validation/zone_kw_tbl_03_30_2026.csv")
+
+readr::write_csv(zone_trend_tbl,
+                 "../outputs/validation/zone_trend_tbl_03_30_2026.csv")
+
+readr::write_csv(zone_r2_tbl,
+                 "../outputs/validation/zone_r2_tbl_03_30_2026.csv")
+
+#validation takeaways:
+  #nutrient takeaways:
+    #all six zone maps significantly separated validation P after BH correction
+  
+      #Independent 0–15 cm validation data showed that the cluster-derived amendment-priority zones were most successful at capturing phosphorus variation, with all six dataset-by-method zone maps significantly separating validation P and several explaining substantial independent variance. Zinc also showed consistent but weaker support, while the lime buffer variables were most strongly represented in the composite-based zone maps, especially under ordinary kriging. In contrast, Ca, K, Mg, and Mn showed comparatively weak validation, suggesting that the multinutrient zones were not equally effective for all nutrients. Overall, the validation indicates that the zones are most useful as representations of broad phosphorus and fertility-priority structure rather than universal surrogates for every soil property.
+  #SP vs COMP:
+      #SP did better in P validation, COMP did better in LBC (even though it was not used in clustering, interesting...) 
+  #OK vs RF vs RK:
+      #SP RF and SP RK were the strongest for validation P, also Zn
+      #COMP OK was the strongest for validation LBCs, despite no LBC in clustering, interestingly....
+      #OK consistently looks like the weakest option for the zone-validation step, especially under SP.
+      #RF strongest for SP P
+      #RK is the most balanced across SP and COMP!
+```
 
 
 ```{r}
+#save everything! Yay!
+
+
 
 ```
-
-
-
 
 

@@ -46,11 +46,11 @@ Ap_hz_clean <- Ap_hz_perry %>%
 # 2) Depth-weighting function (0–15 cm)
 # -----------------------------
 depth_weighted_0_15 <- function(df, value_col,
-                                id_col = "Point",
-                                top_col = "top_cm",
-                                bot_col = "bottom_cm",
-                                zmax = 15) {
-  
+                               id_col = "Point",
+                               top_col = "top_cm",
+                               bot_col = "bottom_cm",
+                               zmax = 15) {
+
   df %>%
     mutate(
       z_top = .data[[top_col]],
