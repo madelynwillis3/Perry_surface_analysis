@@ -1,0 +1,520 @@
+---
+title: "Perry_analysis_full_dataset_04_01_2026"
+format: html
+---
+
+```{r}
+#load libraries:
+library(terra)
+library(tidyverse)
+library(janitor)
+library(sf)
+library(sp)
+library(gstat)
+library(randomForest)
+library(beepr)
+library(broom)
+```
+
+```{r}
+# original surface dataset
+soil_points_nutrients <- read.csv("../LOCAL DATA DO NOT PUSH/soil/perry_soil_points_surface_03_2026.csv") %>%
+  clean_names()
+
+# validation / added dataset
+ap_val <- read_csv("../LOCAL DATA DO NOT PUSH/Ap_hz_data/hz_0_15_wide_03_30_2026.csv")
+
+# covariates
+covariate_stack <- rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
+
+soil_vars <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn")
+cov_names <- names(covariate_stack)
+
+# -----------------------------
+# original SP / COMP
+# -----------------------------
+soil_prop_SP <- soil_points_nutrients %>%
+  filter(type == "SPID") %>%
+  st_as_sf(coords = c("x", "y"), crs = 4326) %>%
+  st_transform(26917)
+
+soil_prop_COMP <- soil_points_nutrients %>%
+  filter(type == "CID") %>%
+  st_as_sf(coords = c("x", "y"), crs = 4326) %>%
+  st_transform(26917)
+
+# -----------------------------
+# validation points
+# -----------------------------
+ap_val_sf <- ap_val %>%
+  st_as_sf(coords = c("POINT_X", "POINT_Y"), crs = 3857) %>%
+  st_transform(26917)
+
+# rename validation variables to match your modeling names
+ap_val_model <- ap_val_sf %>%
+  transmute(
+    point_label = paste0("VAL_", Point),
+    type = "VAL",
+    lbc_1 = LBC.1_0_15,
+    lb_ceq = LBCeq_0_15,
+    p_h_2 = pH.2_0_15,
+    ca = Ca_0_15,
+    k = K_0_15,
+    mg = Mg_0_15,
+    mn = Mn_0_15,
+    p = P_0_15,
+    zn = Zn_0_15,
+    geometry = geometry
+  )
+
+# helpers
+add_xy <- function(dat) {
+  coords <- st_coordinates(dat)
+  dat %>%
+    mutate(
+      X = coords[,1],
+      Y = coords[,2]
+    )
+}
+
+extract_covariates <- function(dat_sf, covariate_stack) {
+  vect_pts <- terra::vect(dat_sf)
+  cov_vals <- terra::extract(covariate_stack, vect_pts)
+  
+  bind_cols(
+    dat_sf %>% st_drop_geometry(),
+    cov_vals %>% dplyr::select(-ID)
+  ) %>%
+    bind_cols(geometry = st_geometry(dat_sf)) %>%
+    st_as_sf()
+}
+
+# original modeled datasets with covariates
+soil_SP_cov <- soil_prop_SP %>%
+  add_xy() %>%
+  extract_covariates(covariate_stack)
+
+soil_COMP_cov <- soil_prop_COMP %>%
+  add_xy() %>%
+  extract_covariates(covariate_stack)
+
+# validation points with covariates
+ap_val_cov <- ap_val_model %>%
+  add_xy() %>%
+  extract_covariates(covariate_stack)
+
+# -----------------------------
+# pooled datasets
+# -----------------------------
+full_SP_cov <- bind_rows(
+  soil_SP_cov %>% mutate(source_dataset = "SP_original"),
+  ap_val_cov %>% mutate(source_dataset = "validation")
+)
+
+full_COMP_cov <- bind_rows(
+  soil_COMP_cov %>% mutate(source_dataset = "COMP_original"),
+  ap_val_cov %>% mutate(source_dataset = "validation")
+)
+
+# quick checks
+full_SP_cov %>% st_drop_geometry() %>% count(source_dataset)
+full_COMP_cov %>% st_drop_geometry() %>% count(source_dataset)
+#plot to check spatial distribution of original vs validation points
+ggplot() +
+  geom_sf(data = full_SP_cov, aes(color = source_dataset), size = 2
+  ) +
+  theme_minimal() +
+  labs(title = "Spatial distribution of original SP and validation points") +
+  theme(legend.title = element_blank())
+ggplot() +
+  geom_sf(data = full_COMP_cov, aes(color = source_dataset), size = 2
+  ) +
+  theme_minimal() +
+  labs(title = "Spatial distribution of original COMP and validation points") +
+  theme(legend.title = element_blank())
+
+```
+
+
+```{r model, warning=FALSE}
+
+coords_full_SP <- st_coordinates(full_SP_cov)
+coords_full_COMP <- st_coordinates(full_COMP_cov)
+
+cutoff_full_SP <- max(dist(coords_full_SP)) / 2
+cutoff_full_COMP <- max(dist(coords_full_COMP)) / 2
+
+# smaller width may make sense now because added points increase short-lag support
+width_full_SP <- 75
+width_full_COMP <- 75
+
+make_resamples <- function(sf_data, n_iter = 50, train_frac = 0.7, base_seed = 20260401) {
+  ids <- seq_len(nrow(sf_data))
+  seeds <- base_seed + seq_len(n_iter)
+  
+  resamples <- vector("list", n_iter)
+  
+  for (i in seq_len(n_iter)) {
+    set.seed(seeds[i])
+    
+    n_train <- floor(train_frac * length(ids))
+    train_ids <- sort(sample(ids, size = n_train, replace = FALSE))
+    test_ids <- setdiff(ids, train_ids)
+    
+    resamples[[i]] <- list(
+      iteration = i,
+      seed = seeds[i],
+      train_ids = train_ids,
+      test_ids = test_ids
+    )
+  }
+  
+  resamples
+}
+
+resamples_full_SP <- make_resamples(full_SP_cov, n_iter = 50, train_frac = 0.7, base_seed = 20260401)
+resamples_full_COMP <- make_resamples(full_COMP_cov, n_iter = 50, train_frac = 0.7, base_seed = 20261401)
+
+calc_metrics <- function(obs, pred) {
+  tibble(
+    n = length(obs),
+    RMSE = sqrt(mean((obs - pred)^2, na.rm = TRUE)),
+    MAE = mean(abs(obs - pred), na.rm = TRUE),
+    R2 = cor(obs, pred, use = "complete.obs")^2,
+    mean_error = mean(obs - pred, na.rm = TRUE)
+  )
+}
+
+tune_rf_oob <- function(train_df, response, predictors, ntree = 500) {
+  x_train <- train_df %>% select(all_of(predictors))
+  y_train <- train_df[[response]]
+  
+  p <- length(predictors)
+  mtry_grid <- unique(pmax(1, c(
+    floor(sqrt(p)),
+    floor(p / 4),
+    floor(p / 3),
+    floor(p / 2)
+  )))
+  
+  fits <- purrr::map(mtry_grid, function(m) {
+    set.seed(sample.int(1e6, 1))
+    rf <- randomForest(
+      x = x_train,
+      y = y_train,
+      ntree = ntree,
+      mtry = m,
+      importance = TRUE
+    )
+    
+    tibble(
+      mtry = m,
+      oob_mse = tail(rf$mse, 1)
+    )
+  }) %>%
+    bind_rows()
+  
+  best_mtry <- fits %>%
+    slice_min(oob_mse, n = 1) %>%
+    pull(mtry)
+  
+  list(
+    best_mtry = best_mtry,
+    tuning_table = fits
+  )
+}
+
+fit_variogram_models <- function(vg) {
+  vg_df <- as.data.frame(vg)
+  
+  init_nugget <- max(0, min(vg_df$gamma, na.rm = TRUE) * 0.5)
+  init_sill <- max(vg_df$gamma, na.rm = TRUE)
+  init_psill <- max(init_sill - init_nugget, 1e-6)
+  init_range <- max(vg_df$dist, na.rm = TRUE) / 3
+  
+  candidate_models <- c("Sph", "Exp")
+  
+  fits <- purrr::map(candidate_models, function(m) {
+    tryCatch({
+      fit <- fit.variogram(
+        vg,
+        model = vgm(
+          psill = init_psill,
+          model = m,
+          range = init_range,
+          nugget = init_nugget
+        )
+      )
+      
+      if (any(!is.finite(fit$psill))) return(NULL)
+      if (any(!is.finite(fit$range))) return(NULL)
+      if (any(fit$range[fit$model != "Nug"] <= 0)) return(NULL)
+      
+      fit
+    }, error = function(e) NULL)
+  })
+  
+  fits <- fits[!sapply(fits, is.null)]
+  if (length(fits) == 0) return(NULL)
+  
+  sse <- sapply(fits, function(f) attr(f, "SSErr"))
+  fits[[which.min(sse)]]
+}
+
+run_rf_model <- function(train_sf, test_sf, response, predictors, ntree = 500) {
+  train_df <- train_sf %>% st_drop_geometry() %>% select(all_of(c(response, predictors))) %>% na.omit()
+  test_df  <- test_sf %>% st_drop_geometry() %>% select(all_of(c(response, predictors))) %>% na.omit()
+  
+  tuning <- tune_rf_oob(train_df, response, predictors, ntree = ntree)
+  
+  rf_fit <- randomForest(
+    x = train_df %>% select(all_of(predictors)),
+    y = train_df[[response]],
+    ntree = ntree,
+    mtry = tuning$best_mtry,
+    importance = TRUE
+  )
+  
+  preds <- predict(rf_fit, newdata = test_df %>% select(all_of(predictors)))
+  mets <- calc_metrics(test_df[[response]], preds)
+  
+  list(
+    model = rf_fit,
+    predictions = tibble(obs = test_df[[response]], pred = preds),
+    metrics = mets,
+    best_mtry = tuning$best_mtry
+  )
+}
+
+run_ok_model <- function(train_sf, test_sf, response, cutoff, width) {
+  train_sp <- as(train_sf, "Spatial")
+  test_sp <- as(test_sf, "Spatial")
+  
+  f <- as.formula(paste(response, "~ 1"))
+  vg <- variogram(f, data = train_sp, cutoff = cutoff, width = width)
+  fit <- fit_variogram_models(vg)
+  
+  if (is.null(fit)) return(NULL)
+  
+  kr <- krige(f, locations = train_sp, newdata = test_sp, model = fit)
+  pred <- kr$var1.pred
+  
+  obs <- test_sf %>% st_drop_geometry() %>% pull(.data[[response]])
+  mets <- calc_metrics(obs, pred)
+  
+  list(
+    variogram = vg,
+    fit = fit,
+    predictions = tibble(obs = obs, pred = pred),
+    metrics = mets
+  )
+}
+
+run_rk_model <- function(train_sf, test_sf, response, predictors, cutoff, width, ntree = 500) {
+  train_df <- train_sf %>% st_drop_geometry() %>% select(all_of(c(response, predictors))) %>% na.omit()
+  test_df  <- test_sf %>% st_drop_geometry() %>% select(all_of(c(response, predictors))) %>% na.omit()
+  
+  train_sf2 <- train_sf %>% filter(complete.cases(st_drop_geometry(select(., all_of(c(response, predictors))))))
+  test_sf2  <- test_sf %>% filter(complete.cases(st_drop_geometry(select(., all_of(c(response, predictors))))))
+  
+  tuning <- tune_rf_oob(train_df, response, predictors, ntree = ntree)
+  
+  rf_fit <- randomForest(
+    x = train_df %>% select(all_of(predictors)),
+    y = train_df[[response]],
+    ntree = ntree,
+    mtry = tuning$best_mtry,
+    importance = TRUE
+  )
+  
+  trend_train <- predict(rf_fit, newdata = train_df %>% select(all_of(predictors)))
+  trend_test  <- predict(rf_fit, newdata = test_df %>% select(all_of(predictors)))
+  
+  train_sf2$residual <- train_df[[response]] - trend_train
+  
+  train_sp <- as(train_sf2, "Spatial")
+  test_sp <- as(test_sf2, "Spatial")
+  
+  vg_resid <- variogram(residual ~ 1, data = train_sp, cutoff = cutoff, width = width)
+  fit_resid <- fit_variogram_models(vg_resid)
+  
+  if (is.null(fit_resid)) {
+    pred <- trend_test
+    obs <- test_df[[response]]
+    
+    return(list(
+      metrics = calc_metrics(obs, pred),
+      best_mtry = tuning$best_mtry,
+      used_residual_kriging = FALSE
+    ))
+  }
+  
+  kr_resid <- krige(residual ~ 1, locations = train_sp, newdata = test_sp, model = fit_resid)
+  pred <- trend_test + kr_resid$var1.pred
+  obs <- test_df[[response]]
+  
+  list(
+    metrics = calc_metrics(obs, pred),
+    best_mtry = tuning$best_mtry,
+    used_residual_kriging = TRUE
+  )
+}
+
+run_one_iteration <- function(sf_data, split, response, predictors, dataset_name, cutoff, width, ntree = 500) {
+  train_sf <- sf_data[split$train_ids, ]
+  test_sf  <- sf_data[split$test_ids, ]
+  
+  rf_res <- run_rf_model(train_sf, test_sf, response, predictors, ntree = ntree)
+  ok_res <- run_ok_model(train_sf, test_sf, response, cutoff = cutoff, width = width)
+  rk_res <- run_rk_model(train_sf, test_sf, response, predictors, cutoff = cutoff, width = width, ntree = ntree)
+  
+  bind_rows(
+    rf_res$metrics %>%
+      mutate(
+        dataset = dataset_name,
+        variable = response,
+        method = "RF",
+        iteration = split$iteration,
+        seed = split$seed,
+        best_mtry = rf_res$best_mtry
+      ),
+    
+    if (!is.null(ok_res)) {
+      ok_res$metrics %>%
+        mutate(
+          dataset = dataset_name,
+          variable = response,
+          method = "OK",
+          iteration = split$iteration,
+          seed = split$seed,
+          best_mtry = NA_real_
+        )
+    },
+    
+    rk_res$metrics %>%
+      mutate(
+        dataset = dataset_name,
+        variable = response,
+        method = "RK",
+        iteration = split$iteration,
+        seed = split$seed,
+        best_mtry = rk_res$best_mtry,
+        used_residual_kriging = rk_res$used_residual_kriging
+      )
+  )
+}
+
+results_full_SP <- purrr::map_dfr(
+  soil_vars,
+  function(v) {
+    purrr::map_dfr(
+      resamples_full_SP,
+      function(split_obj) {
+        run_one_iteration(
+          sf_data = full_SP_cov,
+          split = split_obj,
+          response = v,
+          predictors = cov_names,
+          dataset_name = "FULL_SP",
+          cutoff = cutoff_full_SP,
+          width = width_full_SP,
+          ntree = 500
+        )
+      }
+    )
+  }
+)
+
+results_full_COMP <- purrr::map_dfr(
+  soil_vars,
+  function(v) {
+    purrr::map_dfr(
+      resamples_full_COMP,
+      function(split_obj) {
+        run_one_iteration(
+          sf_data = full_COMP_cov,
+          split = split_obj,
+          response = v,
+          predictors = cov_names,
+          dataset_name = "FULL_COMP",
+          cutoff = cutoff_full_COMP,
+          width = width_full_COMP,
+          ntree = 500
+        )
+      }
+    )
+  }
+)
+
+results_full_all <- bind_rows(results_full_SP, results_full_COMP)
+results_full_all %>%
+  mutate(
+    dataset = factor(dataset, levels = c("FULL_SP", "FULL_COMP")),
+    method = factor(method, levels = c("OK", "RF", "RK"))
+  ) %>%
+  ggplot(aes(x = method, y = R2, fill = method)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.8) +
+  facet_grid(variable ~ dataset, scales = "free_y") +
+  theme_minimal() +
+  labs(
+    title = "Bootstrap distribution of R² by dataset and method",
+    x = "Method",
+    y = expression(R^2)
+  ) +
+  theme(legend.position = "none")
+
+results_full_all %>%
+  mutate(
+    dataset = factor(dataset, levels = c("FULL_SP", "FULL_COMP")),
+    method = factor(method, levels = c("OK", "RF", "RK"))
+  ) %>%
+  ggplot(aes(x = method, y = RMSE, fill = method)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.8) +
+  facet_grid(variable ~ dataset, scales = "free_y") +
+  theme_minimal() +
+  labs(
+    title = "Bootstrap distribution of RMSE by dataset and method",
+    x = "Method",
+    y = "RMSE"
+  ) +
+  theme(legend.position = "none")
+results_full_all %>%
+  group_by(dataset, variable, method) %>%
+  summarise(
+    mean_RMSE = mean(RMSE, na.rm = TRUE),
+    mean_R2 = mean(R2, na.rm = TRUE),
+    mean_MAE = mean(MAE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(variable, dataset, desc(mean_R2))
+
+boot_summary_tbl <- results_full_all %>%
+  group_by(dataset, variable, method) %>%
+  summarise(
+    n_iter = n(),
+    
+    median_R2 = median(R2, na.rm = TRUE),
+    q25_R2 = quantile(R2, 0.25, na.rm = TRUE),
+    q75_R2 = quantile(R2, 0.75, na.rm = TRUE),
+    min_R2 = min(R2, na.rm = TRUE),
+    max_R2 = max(R2, na.rm = TRUE),
+    
+    median_RMSE = median(RMSE, na.rm = TRUE),
+    q25_RMSE = quantile(RMSE, 0.25, na.rm = TRUE),
+    q75_RMSE = quantile(RMSE, 0.75, na.rm = TRUE),
+    
+    median_MAE = median(MAE, na.rm = TRUE),
+    
+    .groups = "drop"
+  ) %>%
+  arrange(variable, dataset, desc(median_R2))
+
+boot_summary_tbl
+beep("wilhelm")
+#save as csv
+write_csv(boot_summary_tbl, "../outputs/full DO NOT MIX/modeling_results/full_dataset_modeling_results_04_01_2026.csv")
+```
+
+

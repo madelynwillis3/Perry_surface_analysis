@@ -2,7 +2,7 @@
 title: "Perry_analysis_03_30_2026"
 format: html
 ---
-```{r}
+```{r libraries}
 
 library(terra)
 library(tidyverse)
@@ -12,7 +12,7 @@ library(randomForest)
 library(irr)
 ```
 
-```{r}
+```{r load in data}
 
 soil_vars <- c("lbc_1","lb_ceq","p_h_2","ca","k","mg","mn","p","zn")
 
@@ -54,4 +54,913 @@ sp_plus_val <- sf::st_read("../outputs/checkpoints/vectors/sp_plus_val.gpkg", qu
 comp_plus_val <- sf::st_read("../outputs/checkpoints/vectors/comp_plus_val.gpkg", quiet = TRUE)
 
 ```
+
+```{r summaries, eval = FALSE}
+#summaries
+# ---------- 1. prep continuous metrics ----------
+cont_tbl <- continuous_val_metrics %>%
+  select(dataset, method, nutrient, RMSE, R2, spearman_rho) %>%
+  left_join(
+    continuous_val_ranked2 %>%
+      select(dataset, method, nutrient, overall_score),
+    by = c("dataset", "method", "nutrient")
+  ) %>%
+  rename(
+    cont_spearman = spearman_rho
+  )
+
+# ---------- 2. prep zone metrics ----------
+zone_tbl <- zone_r2_tbl %>%
+  select(dataset, method, nutrient, zone_r2) %>%
+  left_join(
+    zone_trend_tbl %>%
+      select(dataset, method, nutrient, spearman_rho) %>%
+      rename(zone_spearman = spearman_rho),
+    by = c("dataset", "method", "nutrient")
+  ) %>%
+  left_join(
+    zone_kw_tbl %>%
+      select(dataset, method, nutrient, epsilon2, p_adj_BH),
+    by = c("dataset", "method", "nutrient")
+  )
+
+# ---------- 3. combine ----------
+combo_summary_tbl <- cont_tbl %>%
+  full_join(zone_tbl, by = c("dataset", "method", "nutrient")) %>%
+  arrange(dataset, method, nutrient)
+
+combo_summary_tbl
+
+table_SP_OK   <- combo_summary_tbl %>% filter(dataset == "SP",   method == "OK")
+table_SP_RF   <- combo_summary_tbl %>% filter(dataset == "SP",   method == "RF")
+table_SP_RK   <- combo_summary_tbl %>% filter(dataset == "SP",   method == "RK")
+table_COMP_OK <- combo_summary_tbl %>% filter(dataset == "COMP", method == "OK")
+table_COMP_RF <- combo_summary_tbl %>% filter(dataset == "COMP", method == "RF")
+table_COMP_RK <- combo_summary_tbl %>% filter(dataset == "COMP", method == "RK")
+
+round_combo_table <- function(df) {
+  df %>%
+    mutate(
+      RMSE = round(RMSE, 2),
+      R2 = round(R2, 3),
+      cont_spearman = round(cont_spearman, 3),
+      overall_score = round(overall_score, 3),
+      zone_r2 = round(zone_r2, 3),
+      zone_spearman = round(zone_spearman, 3),
+      epsilon2 = round(epsilon2, 3),
+      p_adj_BH = signif(p_adj_BH, 3)
+    )
+}
+
+table_SP_OK   <- round_combo_table(table_SP_OK)
+table_SP_RF   <- round_combo_table(table_SP_RF)
+table_SP_RK   <- round_combo_table(table_SP_RK)
+table_COMP_OK <- round_combo_table(table_COMP_OK)
+table_COMP_RF <- round_combo_table(table_COMP_RF)
+table_COMP_RK <- round_combo_table(table_COMP_RK)
+
+add_flags <- function(df) {
+  df %>%
+    mutate(
+      cont_strength = case_when(
+        !is.na(R2) & R2 >= 0.30 ~ "strong",
+        !is.na(R2) & R2 >= 0.15 ~ "moderate",
+        !is.na(R2) ~ "weak",
+        TRUE ~ NA_character_
+      ),
+      zone_strength = case_when(
+        !is.na(zone_r2) & zone_r2 >= 0.25 ~ "strong",
+        !is.na(zone_r2) & zone_r2 >= 0.10 ~ "moderate",
+        !is.na(zone_r2) ~ "weak",
+        TRUE ~ NA_character_
+      ),
+      zone_sig = case_when(
+        !is.na(p_adj_BH) & p_adj_BH < 0.05 ~ "yes",
+        !is.na(p_adj_BH) ~ "no",
+        TRUE ~ NA_character_
+      )
+    )
+}
+
+table_SP_OK   <- add_flags(table_SP_OK)
+table_SP_RF   <- add_flags(table_SP_RF)
+table_SP_RK   <- add_flags(table_SP_RK)
+table_COMP_OK <- add_flags(table_COMP_OK)
+table_COMP_RF <- add_flags(table_COMP_RF)
+table_COMP_RK <- add_flags(table_COMP_RK)
+
+table_SP_OK
+table_SP_RF
+table_SP_RK
+table_COMP_OK
+table_COMP_RF
+table_COMP_RK
+
+
+
+readr::write_csv(table_SP_OK,   "../outputs/summary_tables/table_SP_OK.csv")
+readr::write_csv(table_SP_RF,   "../outputs/summary_tables/table_SP_RF.csv")
+readr::write_csv(table_SP_RK,   "../outputs/summary_tables/table_SP_RK.csv")
+readr::write_csv(table_COMP_OK, "../outputs/summary_tables/table_COMP_OK.csv")
+readr::write_csv(table_COMP_RF, "../outputs/summary_tables/table_COMP_RF.csv")
+readr::write_csv(table_COMP_RK, "../outputs/summary_tables/table_COMP_RK.csv")
+
+
+# -----------------------------
+# 1. Continuous best by nutrient
+# -----------------------------
+continuous_best_tbl <- continuous_val_metrics %>%
+  select(dataset, method, nutrient, RMSE, R2, spearman_rho) %>%
+  arrange(nutrient, RMSE, desc(R2), desc(spearman_rho)) %>%
+  group_by(nutrient) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(
+    best_continuous = paste(dataset, method, sep = " + "),
+    continuous_metrics = paste0(
+      "RMSE=", round(RMSE, 2),
+      "; R²=", round(R2, 2),
+      "; rho=", round(spearman_rho, 2)
+    )
+  ) %>%
+  select(nutrient, best_continuous, continuous_metrics)
+
+# -----------------------------
+# 2. Zone best by nutrient
+# -----------------------------
+zone_best_tbl <- zone_r2_tbl %>%
+  select(dataset, method, nutrient, zone_r2) %>%
+  left_join(
+    zone_trend_tbl %>%
+      select(dataset, method, nutrient, spearman_rho) %>%
+      rename(zone_spearman = spearman_rho),
+    by = c("dataset", "method", "nutrient")
+  ) %>%
+  left_join(
+    zone_kw_tbl %>%
+      select(dataset, method, nutrient, epsilon2, p_adj_BH),
+    by = c("dataset", "method", "nutrient")
+  ) %>%
+  arrange(nutrient, desc(zone_r2), p_adj_BH, desc(epsilon2), desc(zone_spearman)) %>%
+  group_by(nutrient) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(
+    best_zone = paste(dataset, method, sep = " + "),
+    zone_metrics = paste0(
+      "zone R²=", round(zone_r2, 2),
+      "; rho=", round(zone_spearman, 2),
+      "; eps²=", round(epsilon2, 2),
+      "; p=", signif(p_adj_BH, 2)
+    )
+  ) %>%
+  select(nutrient, best_zone, zone_metrics)
+
+# -----------------------------
+# 3. Join into one poster table
+# -----------------------------
+poster_best_tbl <- continuous_best_tbl %>%
+  full_join(zone_best_tbl, by = "nutrient") %>%
+  arrange(nutrient)
+
+poster_best_tbl <- poster_best_tbl %>%
+  mutate(
+    nutrient = recode(
+      nutrient,
+      lbc_1 = "LBC.1",
+      lb_ceq = "LBCeq",
+      p_h_2 = "pH",
+      ca = "Ca",
+      k = "K",
+      mg = "Mg",
+      mn = "Mn",
+      p = "P",
+      zn = "Zn"
+    )
+  )
+
+poster_best_tbl
+
+zone_best_tbl <- zone_r2_tbl %>%
+  select(dataset, method, nutrient, zone_r2) %>%
+  left_join(
+    zone_trend_tbl %>%
+      select(dataset, method, nutrient, spearman_rho) %>%
+      rename(zone_spearman = spearman_rho),
+    by = c("dataset", "method", "nutrient")
+  ) %>%
+  left_join(
+    zone_kw_tbl %>%
+      select(dataset, method, nutrient, epsilon2, p_adj_BH),
+    by = c("dataset", "method", "nutrient")
+  ) %>%
+  mutate(zone_sig = ifelse(!is.na(p_adj_BH) & p_adj_BH < 0.05, 1, 0)) %>%
+  arrange(nutrient, desc(zone_sig), desc(zone_r2), desc(epsilon2), desc(zone_spearman)) %>%
+  group_by(nutrient) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(
+    best_zone = paste(dataset, method, sep = " + "),
+    zone_metrics = paste0(
+      "zone R²=", round(zone_r2, 2),
+      "; rho=", round(zone_spearman, 2),
+      "; eps²=", round(epsilon2, 2),
+      "; p=", signif(p_adj_BH, 2)
+    )
+  ) %>%
+  select(nutrient, best_zone, zone_metrics)
+
+poster_best_4col <- continuous_val_metrics %>%
+  select(dataset, method, nutrient, RMSE, R2, spearman_rho) %>%
+  arrange(nutrient, RMSE, desc(R2), desc(spearman_rho)) %>%
+  group_by(nutrient) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(
+    continuous = paste(dataset, method, sep = " + "),
+    continuous_metric_text = paste0(
+      "RMSE=", round(RMSE, 2),
+      ", R²=", round(R2, 2)
+    )
+  ) %>%
+  select(nutrient, continuous, continuous_metric_text) %>%
+  left_join(
+    zone_r2_tbl %>%
+      select(dataset, method, nutrient, zone_r2) %>%
+      left_join(
+        zone_kw_tbl %>%
+          select(dataset, method, nutrient, epsilon2, p_adj_BH),
+        by = c("dataset", "method", "nutrient")
+      ) %>%
+      mutate(zone_sig = ifelse(!is.na(p_adj_BH) & p_adj_BH < 0.05, 1, 0)) %>%
+      arrange(nutrient, desc(zone_sig), desc(zone_r2), desc(epsilon2)) %>%
+      group_by(nutrient) %>%
+      slice(1) %>%
+      ungroup() %>%
+      mutate(
+        management_zone = paste(dataset, method, sep = " + "),
+        zone_metric_text = paste0(
+          "zone R²=", round(zone_r2, 2),
+          ", eps²=", round(epsilon2, 2),
+          ", p=", signif(p_adj_BH, 2)
+        )
+      ) %>%
+      select(nutrient, management_zone, zone_metric_text),
+    by = "nutrient"
+  ) %>%
+  mutate(
+    best_metrics = paste0(
+      "Continuous: ", continuous_metric_text,
+      " | Zone: ", zone_metric_text
+    )
+  ) %>%
+  select(nutrient, continuous, management_zone, best_metrics)
+
+poster_best_4col
+```
+
+```{r bootstrap VIP, eval = FALSE}
+#VIP
+covariate_stack <- terra::rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
+cov_names <- names(covariate_stack)
+
+get_dataset_objects <- function(dataset_name) {
+  if (dataset_name == "SP") {
+    list(
+      sf_data = soil_SP_cov,
+      resamples = resamples_SP
+    )
+  } else if (dataset_name == "COMP") {
+    list(
+      sf_data = soil_COMP_cov,
+      resamples = resamples_COMP
+    )
+  } else {
+    stop("dataset_name must be 'SP' or 'COMP'")
+  }
+}
+
+extract_rf_importance_one <- function(dataset_name, method_name, variable_name, iter_row,
+                                      covariates_use, ntree = 500) {
+  
+  if (!method_name %in% c("RF", "RK")) return(NULL)
+  
+  objs <- get_dataset_objects(dataset_name)
+  sf_data <- objs$sf_data
+  resamples <- objs$resamples
+  
+  split <- resamples[[iter_row$iteration]]
+  train_sf <- sf_data[split$train_ids, ]
+  
+  # only keep predictors that actually exist
+  predictors_present <- intersect(covariates_use, names(train_sf))
+  
+  train_df <- train_sf %>%
+    st_drop_geometry() %>%
+    select(all_of(c(variable_name, predictors_present))) %>%
+    na.omit()
+  
+  if (nrow(train_df) < 5) return(NULL)
+  if (length(predictors_present) < 2) return(NULL)
+  
+  mtry_use <- iter_row$best_mtry
+  if (!is.finite(mtry_use)) {
+    mtry_use <- max(1, floor(sqrt(length(predictors_present))))
+  }
+  mtry_use <- min(mtry_use, length(predictors_present))
+  
+  set.seed(iter_row$seed)
+  
+  rf_fit <- randomForest(
+    x = train_df[, predictors_present, drop = FALSE],
+    y = train_df[[variable_name]],
+    ntree = ntree,
+    mtry = mtry_use,
+    importance = TRUE
+  )
+  
+  imp <- randomForest::importance(rf_fit)
+  imp <- as.data.frame(imp)
+  imp$predictor <- rownames(imp)
+  
+  tibble(
+    predictor = imp$predictor,
+    inc_mse = if ("%IncMSE" %in% names(imp)) imp[["%IncMSE"]] else NA_real_,
+    inc_node_purity = if ("IncNodePurity" %in% names(imp)) imp[["IncNodePurity"]] else NA_real_
+  )
+}
+
+extract_weighted_importance <- function(selected_iters, dataset_name, method_name, variable_name,
+                                        covariates_use, ntree = 500) {
+  
+  sel <- selected_iters %>%
+    filter(
+      dataset == dataset_name,
+      method == method_name,
+      variable == variable_name
+    ) %>%
+    arrange(desc(weight))
+  
+  if (nrow(sel) == 0) return(NULL)
+  
+  out_list <- list()
+  k <- 1
+  
+  for (i in seq_len(nrow(sel))) {
+    imp_tbl <- extract_rf_importance_one(
+      dataset_name = dataset_name,
+      method_name = method_name,
+      variable_name = variable_name,
+      iter_row = sel[i, ],
+      covariates_use = covariates_use,
+      ntree = ntree
+    )
+    
+    if (!is.null(imp_tbl)) {
+      out_list[[k]] <- imp_tbl %>%
+        mutate(
+          dataset = dataset_name,
+          method = method_name,
+          nutrient = variable_name,
+          iteration = sel$iteration[i],
+          seed = sel$seed[i],
+          model_weight = sel$weight[i]
+        )
+      k <- k + 1
+    }
+  }
+  
+  if (length(out_list) == 0) return(NULL)
+  
+  bind_rows(out_list)
+}
+non_predictor_cols <- c(
+  "id", "objectid_1", "label", "row", "point_label", "row_num", "one",
+  "plbsac", "type", "lbc_1", "lb_ceq", "p_h_2", "ca", "k", "mg",
+  "mn", "p", "zn", "geometry", "geom", "x", "y", "X", "Y", "point", "source"
+)
+
+cov_names <- names(soil_SP_cov)
+cov_names <- setdiff(cov_names, non_predictor_cols)
+
+cov_names
+importance_raw <- bind_rows(
+  purrr::map_dfr(c("SP", "COMP"), function(ds) {
+    purrr::map_dfr(c("RF", "RK"), function(meth) {
+      purrr::map_dfr(soil_vars, function(v) {
+        extract_weighted_importance(
+          selected_iters = selected_iters,
+          dataset_name = ds,
+          method_name = meth,
+          variable_name = v,
+          covariates_use = cov_names,
+          ntree = 500
+        )
+      })
+    })
+  })
+)
+
+importance_raw
+
+importance_by_nutrient <- importance_raw %>%
+  group_by(dataset, method, nutrient, predictor) %>%
+  summarise(
+    weighted_inc_mse = sum(inc_mse * model_weight, na.rm = TRUE) / sum(model_weight[!is.na(inc_mse)]),
+    weighted_inc_node_purity = sum(inc_node_purity * model_weight, na.rm = TRUE) / sum(model_weight[!is.na(inc_node_purity)]),
+    .groups = "drop"
+  ) %>%
+  arrange(dataset, method, nutrient, desc(weighted_inc_mse))
+
+importance_by_nutrient
+
+top10_by_nutrient <- importance_by_nutrient %>%
+  group_by(dataset, method, nutrient) %>%
+  slice_max(order_by = weighted_inc_mse, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+top10_by_nutrient
+
+importance_general_equal <- importance_by_nutrient %>%
+  group_by(dataset, method, predictor) %>%
+  summarise(
+    mean_weighted_inc_mse = mean(weighted_inc_mse, na.rm = TRUE),
+    mean_weighted_inc_node_purity = mean(weighted_inc_node_purity, na.rm = TRUE),
+    n_nutrients = sum(is.finite(weighted_inc_mse)),
+    .groups = "drop"
+  ) %>%
+  arrange(dataset, method, desc(mean_weighted_inc_mse))
+
+importance_general_equal
+top15_general <- importance_general_equal %>%
+  group_by(dataset, method) %>%
+  slice_max(order_by = mean_weighted_inc_mse, n = 15, with_ties = FALSE) %>%
+  ungroup()
+
+top15_general
+
+importance_overall_method <- importance_by_nutrient %>%
+  group_by(method, predictor) %>%
+  summarise(
+    mean_weighted_inc_mse = mean(weighted_inc_mse, na.rm = TRUE),
+    mean_weighted_inc_node_purity = mean(weighted_inc_node_purity, na.rm = TRUE),
+    n_cases = sum(is.finite(weighted_inc_mse)),
+    .groups = "drop"
+  ) %>%
+  arrange(method, desc(mean_weighted_inc_mse))
+
+importance_overall_method
+```
+
+```{r individual mz maps}
+# rebuild ensemble raster object from saved rasters
+final_ensemble_rasters <- list()
+
+for (ds in c("SP", "COMP")) {
+  final_ensemble_rasters[[ds]] <- list()
+  
+  for (meth in c("RF", "OK", "RK")) {
+    final_ensemble_rasters[[ds]][[meth]] <- list()
+    
+    for (v in soil_vars) {
+      f_mean <- paste0(
+        "../outputs/checkpoints/rasters/ensemble_mean/",
+        ds, "_", meth, "_", v, "_mean.tif"
+      )
+      
+      f_sd <- paste0(
+        "../outputs/checkpoints/rasters/ensemble_sd/",
+        ds, "_", meth, "_", v, "_sd.tif"
+      )
+      
+      if (file.exists(f_mean) && file.exists(f_sd)) {
+        final_ensemble_rasters[[ds]][[meth]][[v]] <- list(
+          mean = terra::rast(f_mean),
+          sd   = terra::rast(f_sd)
+        )
+      } else {
+        final_ensemble_rasters[[ds]][[meth]][[v]] <- NULL
+      }
+    }
+  }
+}
+fit_single_nutrient_kmeans <- function(r, k = 4, n_samp = 10000, seed = 123) {
+  set.seed(seed)
+  
+  samp <- terra::spatSample(
+    r,
+    size = n_samp,
+    method = "random",
+    na.rm = TRUE,
+    as.df = TRUE,
+    warn = FALSE
+  )
+  
+  samp <- as.data.frame(samp)
+  names(samp) <- "value"
+  samp <- samp[is.finite(samp$value), , drop = FALSE]
+  
+  if (nrow(samp) < k) stop("Too few valid sampled cells for k-means.")
+  
+  x <- scale(samp$value)
+  
+  km <- kmeans(x, centers = k, nstart = 25)
+  
+  list(
+    model = km,
+    centers_scaled = as.numeric(km$centers[, 1]),
+    scale_center = attr(x, "scaled:center"),
+    scale_scale = attr(x, "scaled:scale"),
+    sampled_values = samp$value
+  )
+}
+
+fit_single_nutrient_kmeans <- function(r, k = 4, n_samp = 10000, seed = 123) {
+  set.seed(seed)
+  
+  samp <- terra::spatSample(
+    r,
+    size = n_samp,
+    method = "random",
+    na.rm = TRUE,
+    as.df = TRUE,
+    warn = FALSE
+  )
+  
+  samp <- as.data.frame(samp)
+  names(samp) <- "value"
+  samp <- samp[is.finite(samp$value), , drop = FALSE]
+  
+  if (nrow(samp) < k) stop("Too few valid sampled cells for k-means.")
+  
+  x <- scale(samp$value)
+  
+  km <- kmeans(x, centers = k, nstart = 25)
+  
+  list(
+    model = km,
+    centers_scaled = as.numeric(km$centers[, 1]),
+    scale_center = attr(x, "scaled:center"),
+    scale_scale = attr(x, "scaled:scale"),
+    sampled_values = samp$value
+  )
+}
+assign_single_nutrient_zones <- function(r, zone_fit, filename = NULL, overwrite = TRUE) {
+  centers <- zone_fit$centers_scaled
+  mu <- zone_fit$scale_center
+  sdv <- zone_fit$scale_scale
+  
+  zone_fun <- function(v) {
+    out <- rep(NA_integer_, length(v))
+    ok <- is.finite(v)
+    if (!any(ok)) return(out)
+    
+    x_scaled <- (v[ok] - mu) / sdv
+    
+    dmat <- sapply(centers, function(cc) (x_scaled - cc)^2)
+    if (is.null(dim(dmat))) dmat <- matrix(dmat, ncol = length(centers))
+    
+    out[ok] <- max.col(-dmat, ties.method = "first")
+    out
+  }
+  
+  if (is.null(filename)) {
+    z <- terra::app(r, fun = zone_fun)
+  } else {
+    z <- terra::app(
+      r,
+      fun = zone_fun,
+      filename = filename,
+      overwrite = overwrite,
+      wopt = list(datatype = "INT2S")
+    )
+  }
+  
+  names(z) <- "zone"
+  z
+}
+
+relabel_single_nutrient_zones <- function(zone_raster, value_raster, ds, meth, nutrient) {
+  z_vals <- terra::values(zone_raster, mat = FALSE)
+  v_vals <- terra::values(value_raster, mat = FALSE)
+  
+  lut <- tibble(
+    zone = z_vals,
+    value = v_vals
+  ) %>%
+    filter(!is.na(zone), is.finite(value)) %>%
+    group_by(zone) %>%
+    summarise(
+      mean_value = mean(value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(mean_value) %>%
+    mutate(
+      new_zone = row_number(),
+      label = paste0("Zone ", new_zone)
+    )
+  
+  new_vals <- z_vals
+  for (i in seq_len(nrow(lut))) {
+    new_vals[z_vals == lut$zone[i]] <- lut$new_zone[i]
+  }
+  
+  out <- zone_raster
+  terra::values(out) <- new_vals
+  names(out) <- paste(ds, meth, nutrient, "zone", sep = "_")
+  
+  list(
+    raster = out,
+    lookup = lut %>% mutate(dataset = ds, method = meth, nutrient = nutrient)
+  )
+}
+
+single_nutrient_zone_rasters <- list()
+single_nutrient_zone_lookup <- list()
+
+for (ds in c("SP", "COMP")) {
+  single_nutrient_zone_rasters[[ds]] <- list()
+  
+  for (meth in c("RF", "OK", "RK")) {
+    single_nutrient_zone_rasters[[ds]][[meth]] <- list()
+    
+    for (v in soil_vars) {
+      cat("Creating single-nutrient zones for", ds, meth, v, "\n")
+      
+      obj <- final_ensemble_rasters[[ds]][[meth]][[v]]
+      if (is.null(obj) || is.null(obj$mean)) {
+        single_nutrient_zone_rasters[[ds]][[meth]][[v]] <- NULL
+        next
+      }
+      
+      r <- obj$mean
+      vals <- terra::values(r, mat = FALSE)
+      
+      if (sum(is.finite(vals)) < 20) {
+        single_nutrient_zone_rasters[[ds]][[meth]][[v]] <- NULL
+        next
+      }
+      
+      out <- tryCatch({
+        fit <- fit_single_nutrient_kmeans(r, k = 4, n_samp = 10000, seed = 123)
+        z_raw <- assign_single_nutrient_zones(r, fit)
+        z_rel <- relabel_single_nutrient_zones(z_raw, r, ds, meth, v)
+        
+        single_nutrient_zone_lookup[[paste(ds, meth, v, sep = "_")]] <- z_rel$lookup
+        z_rel$raster
+      }, error = function(e) {
+        message("Failed for ", ds, " ", meth, " ", v, ": ", e$message)
+        NULL
+      })
+      
+      single_nutrient_zone_rasters[[ds]][[meth]][[v]] <- out
+    }
+  }
+}
+
+single_nutrient_zone_lookup_tbl <- bind_rows(single_nutrient_zone_lookup)
+single_nutrient_zone_lookup_tbl
+
+plot_single_nutrient_zone_maps <- function(zone_list, dataset_name, method_name, vars_use = soil_vars) {
+  op <- par(mfrow = c(3, 3), mar = c(3, 3, 2, 1))
+  
+  for (v in vars_use) {
+    z <- zone_list[[dataset_name]][[method_name]][[v]]
+    if (!is.null(z)) {
+      plot(z, main = paste(dataset_name, method_name, v))
+    } else {
+      plot.new()
+      title(main = paste(dataset_name, method_name, v, "\nNo map"))
+    }
+  }
+  
+  par(op)
+}
+
+
+#plot all, SP COMP OK RF RK:
+for (ds in c("SP", "COMP")) {
+  for (meth in c("RF", "OK", "RK")) {
+    plot_single_nutrient_zone_maps(single_nutrient_zone_rasters, ds, meth)
+  }
+}
+
+dir.create("../outputs/single_nutrient_zones", recursive = TRUE, showWarnings = FALSE)
+
+for (ds in c("SP", "COMP")) {
+  for (meth in c("RF", "OK", "RK")) {
+    for (v in soil_vars) {
+      z <- single_nutrient_zone_rasters[[ds]][[meth]][[v]]
+      if (is.null(z)) next
+      
+      terra::writeRaster(
+        z,
+        filename = paste0("../outputs/single_nutrient_zones/", ds, "_", meth, "_", v, "_zones.tif"),
+        overwrite = TRUE
+      )
+    }
+  }
+}
+
+readr::write_csv(
+  single_nutrient_zone_lookup_tbl,
+  "../outputs/single_nutrient_zones/single_nutrient_zone_lookup.csv"
+)
+```
+
+```{r individual validation}
+#validate individual nutrient zones
+
+val_var_lookup <- c(
+  "ca" = "Ca_0_15",
+  "k" = "K_0_15",
+  "mg" = "Mg_0_15",
+  "mn" = "Mn_0_15",
+  "p" = "P_0_15",
+  "zn" = "Zn_0_15",
+  "p_h_2" = "pH.2_0_15",
+  "lbc_1" = "LBC.1_0_15",
+  "lb_ceq" = "LBCeq_0_15"
+)
+
+# extract zone values from each single-nutrient zone raster to validation points
+extract_single_nutrient_zone_validation <- function(ap_val_sf, single_nutrient_zone_rasters, val_var_lookup) {
+  out <- list()
+  k <- 1
+  
+  for (ds in c("SP", "COMP")) {
+    for (meth in c("RF", "OK", "RK")) {
+      for (v in names(val_var_lookup)) {
+        
+        z <- single_nutrient_zone_rasters[[ds]][[meth]][[v]]
+        if (is.null(z)) next
+        
+        ext <- terra::extract(z, terra::vect(ap_val_sf))
+        obs_col <- val_var_lookup[[v]]
+        
+        tmp <- ap_val_sf %>%
+          st_drop_geometry() %>%
+          transmute(
+            Point = Point,
+            dataset = ds,
+            method = meth,
+            nutrient = v,
+            observed = .data[[obs_col]],
+            zone = ext[, 2]
+          ) %>%
+          filter(!is.na(observed), !is.na(zone))
+        
+        out[[k]] <- tmp
+        k <- k + 1
+      }
+    }
+  }
+  
+  bind_rows(out)
+}
+
+single_zone_val_tbl <- extract_single_nutrient_zone_validation(
+  ap_val_sf,
+  single_nutrient_zone_rasters,
+  val_var_lookup
+)
+
+single_zone_val_tbl
+
+# summarize validation for long-format single-nutrient zone table
+single_zone_validation_summary <- function(single_zone_val_tbl) {
+  kw_out <- list()
+  trend_out <- list()
+  r2_out <- list()
+  k1 <- 1
+  k2 <- 1
+  k3 <- 1
+  
+  for (ds in unique(single_zone_val_tbl$dataset)) {
+    for (meth in unique(single_zone_val_tbl$method)) {
+      for (nut in unique(single_zone_val_tbl$nutrient)) {
+        
+        dat <- single_zone_val_tbl %>%
+          filter(dataset == ds, method == meth, nutrient == nut) %>%
+          mutate(
+            zone = factor(zone),
+            zone_num = as.numeric(zone)
+          )
+        
+        if (nrow(dat) < 5 || n_distinct(dat$zone) < 2) next
+        
+        # Kruskal-Wallis
+        kw <- kruskal.test(observed ~ zone, data = dat)
+        H <- as.numeric(kw$statistic)
+        n <- nrow(dat)
+        k_groups <- n_distinct(dat$zone)
+        eps2 <- (H - k_groups + 1) / (n - k_groups)
+        
+        kw_out[[k1]] <- tibble(
+          dataset = ds,
+          method = meth,
+          nutrient = nut,
+          n_points = n,
+          n_zones = k_groups,
+          statistic = H,
+          p_value = kw$p.value,
+          epsilon2 = eps2
+        )
+        k1 <- k1 + 1
+        
+        # Spearman trend
+        tr <- suppressWarnings(cor.test(dat$zone_num, dat$observed, method = "spearman"))
+        trend_out[[k2]] <- tibble(
+          dataset = ds,
+          method = meth,
+          nutrient = nut,
+          n_points = n,
+          spearman_rho = unname(tr$estimate),
+          p_value = tr$p.value
+        )
+        k2 <- k2 + 1
+        
+        # Zone R²
+        mod <- lm(observed ~ zone, data = dat)
+        r2_out[[k3]] <- tibble(
+          dataset = ds,
+          method = meth,
+          nutrient = nut,
+          n_points = n,
+          zone_r2 = summary(mod)$r.squared
+        )
+        k3 <- k3 + 1
+      }
+    }
+  }
+  
+  kw_tbl <- bind_rows(kw_out) %>%
+    group_by(nutrient) %>%
+    mutate(p_adj_BH = p.adjust(p_value, method = "BH")) %>%
+    ungroup()
+  
+  trend_tbl <- bind_rows(trend_out) %>%
+    group_by(nutrient) %>%
+    mutate(p_adj_BH = p.adjust(p_value, method = "BH")) %>%
+    ungroup()
+  
+  r2_tbl <- bind_rows(r2_out)
+  
+  list(
+    kw = kw_tbl,
+    trend = trend_tbl,
+    r2 = r2_tbl
+  )
+}
+
+single_zone_validation <- single_zone_validation_summary(single_zone_val_tbl)
+
+single_zone_kw_tbl <- single_zone_validation$kw
+single_zone_trend_tbl <- single_zone_validation$trend
+single_zone_r2_tbl <- single_zone_validation$r2
+
+single_zone_kw_tbl
+single_zone_trend_tbl
+single_zone_r2_tbl
+
+# optional: combined summary table
+single_zone_summary_tbl <- single_zone_r2_tbl %>%
+  left_join(
+    single_zone_trend_tbl %>%
+      select(dataset, method, nutrient, spearman_rho, p_adj_BH) %>%
+      rename(zone_spearman = spearman_rho,
+             trend_p_adj_BH = p_adj_BH),
+    by = c("dataset", "method", "nutrient")
+  ) %>%
+  left_join(
+    single_zone_kw_tbl %>%
+      select(dataset, method, nutrient, epsilon2, p_adj_BH) %>%
+      rename(kw_p_adj_BH = p_adj_BH),
+    by = c("dataset", "method", "nutrient")
+  ) %>%
+  arrange(dataset, method, nutrient)
+
+single_zone_summary_tbl
+
+# optional: export
+dir.create("../outputs/single_nutrient_zones/validation", recursive = TRUE, showWarnings = FALSE)
+
+readr::write_csv(single_zone_val_tbl,
+                 "../outputs/single_nutrient_zones/validation/single_zone_val_tbl.csv")
+
+readr::write_csv(single_zone_kw_tbl,
+                 "../outputs/single_nutrient_zones/validation/single_zone_kw_tbl.csv")
+
+readr::write_csv(single_zone_trend_tbl,
+                 "../outputs/single_nutrient_zones/validation/single_zone_trend_tbl.csv")
+
+readr::write_csv(single_zone_r2_tbl,
+                 "../outputs/single_nutrient_zones/validation/single_zone_r2_tbl.csv")
+
+readr::write_csv(single_zone_summary_tbl,
+                 "../outputs/single_nutrient_zones/validation/single_zone_summary_tbl.csv")
+
+
+```
+
 
