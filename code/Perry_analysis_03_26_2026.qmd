@@ -2854,11 +2854,97 @@ readr::write_csv(zone_r2_tbl,
 ```
 
 
-```{r}
+```{r save}
 #save everything! Yay!
 
+dir.create("../outputs/checkpoints", recursive = TRUE, showWarnings = FALSE)
+dir.create("../outputs/checkpoints/tables", recursive = TRUE, showWarnings = FALSE)
+dir.create("../outputs/checkpoints/vectors", recursive = TRUE, showWarnings = FALSE)
+dir.create("../outputs/checkpoints/rasters/ensemble_mean", recursive = TRUE, showWarnings = FALSE)
+dir.create("../outputs/checkpoints/rasters/ensemble_sd", recursive = TRUE, showWarnings = FALSE)
+dir.create("../outputs/checkpoints/rasters/zones_raw", recursive = TRUE, showWarnings = FALSE)
+dir.create("../outputs/checkpoints/rasters/zones_priority", recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(results_all, "../outputs/checkpoints/tables/results_all.rds")
+saveRDS(resamples_SP, "../outputs/checkpoints/tables/resamples_SP.rds")
+saveRDS(resamples_COMP, "../outputs/checkpoints/tables/resamples_COMP.rds")
+saveRDS(selected_iters, "../outputs/checkpoints/tables/selected_iters.rds")
+
+saveRDS(method_p_tests, "../outputs/checkpoints/tables/method_p_tests.rds")
+saveRDS(spcomp_p_tests, "../outputs/checkpoints/tables/spcomp_p_tests.rds")
+
+saveRDS(sp_comp_compare_tbl, "../outputs/checkpoints/tables/sp_comp_compare_tbl.rds")
+saveRDS(method_compare_tbl, "../outputs/checkpoints/tables/method_compare_tbl.rds")
+
+saveRDS(continuous_val_tbl, "../outputs/checkpoints/tables/continuous_val_tbl.rds")
+saveRDS(continuous_val_metrics, "../outputs/checkpoints/tables/continuous_val_metrics.rds")
+saveRDS(continuous_val_ranked2, "../outputs/checkpoints/tables/continuous_val_ranked2.rds")
+saveRDS(continuous_spcomp_tests, "../outputs/checkpoints/tables/continuous_spcomp_tests.rds")
+saveRDS(continuous_method_tests, "../outputs/checkpoints/tables/continuous_method_tests.rds")
+
+saveRDS(zone_val_tbl, "../outputs/checkpoints/tables/zone_val_tbl.rds")
+saveRDS(zone_val_summary, "../outputs/checkpoints/tables/zone_val_summary.rds")
+saveRDS(zone_kw_tbl, "../outputs/checkpoints/tables/zone_kw_tbl.rds")
+saveRDS(zone_trend_tbl, "../outputs/checkpoints/tables/zone_trend_tbl.rds")
+saveRDS(zone_r2_tbl, "../outputs/checkpoints/tables/zone_r2_tbl.rds")
+
+saveRDS(sp_comp_zone_compare$metrics, "../outputs/checkpoints/tables/sp_comp_zone_metrics.rds")
+saveRDS(method_zone_compare$metrics, "../outputs/checkpoints/tables/method_zone_metrics.rds")
+
+saveRDS(vg_metrics_combined, "../outputs/checkpoints/tables/vg_metrics_combined.rds")
+saveRDS(cluster_priority_lookup, "../outputs/checkpoints/tables/cluster_priority_lookup.rds")
+saveRDS(zone_area_tbl, "../outputs/checkpoints/tables/zone_area_tbl.rds")
+saveRDS(ensemble_check_tbl, "../outputs/checkpoints/tables/ensemble_check_tbl.rds")
 
 
+sf::st_write(soil_SP_cov, "../outputs/checkpoints/vectors/soil_SP_cov.gpkg", delete_dsn = TRUE, quiet = TRUE)
+sf::st_write(soil_COMP_cov, "../outputs/checkpoints/vectors/soil_COMP_cov.gpkg", delete_dsn = TRUE, quiet = TRUE)
+sf::st_write(ap_val_sf, "../outputs/checkpoints/vectors/ap_val_sf.gpkg", delete_dsn = TRUE, quiet = TRUE)
+sf::st_write(sp_plus_val, "../outputs/checkpoints/vectors/sp_plus_val.gpkg", delete_dsn = TRUE, quiet = TRUE)
+sf::st_write(comp_plus_val, "../outputs/checkpoints/vectors/comp_plus_val.gpkg", delete_dsn = TRUE, quiet = TRUE)
+
+for (ds in c("SP", "COMP")) {
+  for (meth in c("RF", "OK", "RK")) {
+    for (v in soil_vars) {
+      obj <- final_ensemble_rasters[[ds]][[meth]][[v]]
+      if (is.null(obj) || is.null(obj$mean)) next
+      
+      terra::writeRaster(
+        obj$mean,
+        filename = paste0("../outputs/checkpoints/rasters/ensemble_mean/", ds, "_", meth, "_", v, "_mean.tif"),
+        overwrite = TRUE
+      )
+      
+      terra::writeRaster(
+        obj$sd,
+        filename = paste0("../outputs/checkpoints/rasters/ensemble_sd/", ds, "_", meth, "_", v, "_sd.tif"),
+        overwrite = TRUE
+      )
+    }
+  }
+}
+
+for (ds in c("SP", "COMP")) {
+  for (meth in c("RF", "OK", "RK")) {
+    z_raw <- management_zone_rasters[[ds]][[meth]]
+    if (!is.null(z_raw)) {
+      terra::writeRaster(
+        z_raw,
+        filename = paste0("../outputs/checkpoints/rasters/zones_raw/", ds, "_", meth, "_zones_raw.tif"),
+        overwrite = TRUE
+      )
+    }
+    
+    z_pri <- relabeled_management_zone_rasters[[ds]][[meth]]
+    if (!is.null(z_pri)) {
+      terra::writeRaster(
+        z_pri,
+        filename = paste0("../outputs/checkpoints/rasters/zones_priority/", ds, "_", meth, "_zones_priority.tif"),
+        overwrite = TRUE
+      )
+    }
+  }
+}
 ```
 
 
