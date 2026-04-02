@@ -55,7 +55,7 @@ comp_plus_val <- sf::st_read("../outputs/checkpoints/vectors/comp_plus_val.gpkg"
 
 ```
 
-```{r summaries, eval = FALSE}
+```{r summaries}
 #summaries
 # ---------- 1. prep continuous metrics ----------
 cont_tbl <- continuous_val_metrics %>%
@@ -319,7 +319,7 @@ poster_best_4col <- continuous_val_metrics %>%
 poster_best_4col
 ```
 
-```{r bootstrap VIP, eval = FALSE}
+```{r bootstrap VIP}
 #VIP
 covariate_stack <- terra::rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
 cov_names <- names(covariate_stack)
@@ -510,6 +510,22 @@ importance_overall_method <- importance_by_nutrient %>%
   arrange(method, desc(mean_weighted_inc_mse))
 
 importance_overall_method
+
+#plot top 15 general predictors:
+importance_general_equal %>%
+  group_by(dataset, method) %>%
+  slice_max(order_by = mean_weighted_inc_mse, n = 15, with_ties = FALSE) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder(predictor, mean_weighted_inc_mse), y = mean_weighted_inc_mse, fill = method)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ dataset, scales = "free_y") +
+  coord_flip() +
+  labs(
+    title = "Top 15 Predictors by Mean Weighted IncMSE",
+    x = "Predictor",
+    y = "Mean Weighted IncMSE"
+  ) +
+  theme_minimal()
 ```
 
 ```{r individual mz maps}
@@ -962,5 +978,7 @@ readr::write_csv(single_zone_summary_tbl,
 
 
 ```
+
+
 
 
