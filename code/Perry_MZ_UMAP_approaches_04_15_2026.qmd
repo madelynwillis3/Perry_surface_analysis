@@ -2863,6 +2863,320 @@ cat("Table saved to ../outputs/\n")
 ```
 
 
+```{r}
+# Per-variable observed VR heatmap — clean supplementary figure
+# Already computed in calc_zone_consistency_by_var
+
+obs_vr_by_var_all <- bind_rows(
+  # UMAP configs
+  purrr::imap_dfr(val_named, function(x, nm) {
+    df <- x$val_with_zones %>%
+      st_drop_geometry() %>%
+      filter(!is.na(zone)) %>%
+      select(zone, all_of(soil_vars)) %>%
+      na.omit()
+
+    if (nrow(df) < 5 || length(unique(df$zone)) < 2)
+      return(NULL)
+
+    total_var_vec <- df %>%
+      select(all_of(soil_vars)) %>%
+      summarise(across(everything(),
+                       ~ var(.x, na.rm = TRUE))) %>%
+      unlist()
+
+    purrr::map_dfr(soil_vars, function(v) {
+      wv <- df %>%
+        group_by(zone) %>%
+        summarise(wv = var(.data[[v]], na.rm = TRUE),
+                  .groups = "drop") %>%
+        pull(wv) %>%
+        mean(na.rm = TRUE)
+
+      tibble(
+        configuration = nm,
+        variable      = v,
+        obs_VR        = round(1 - wv /
+                                total_var_vec[[v]], 3)
+      )
+    })
+  }),
+
+  # PCA configs
+  purrr::imap_dfr(val_baseline, function(x, nm) {
+    df <- x$val_with_zones %>%
+      st_drop_geometry() %>%
+      filter(!is.na(zone)) %>%
+      select(zone, all_of(soil_vars)) %>%
+      na.omit()
+
+    if (nrow(df) < 5 || length(unique(df$zone)) < 2)
+      return(NULL)
+
+    total_var_vec <- df %>%
+      select(all_of(soil_vars)) %>%
+      summarise(across(everything(),
+                       ~ var(.x, na.rm = TRUE))) %>%
+      unlist()
+
+    purrr::map_dfr(soil_vars, function(v) {
+      wv <- df %>%
+        group_by(zone) %>%
+        summarise(wv = var(.data[[v]], na.rm = TRUE),
+                  .groups = "drop") %>%
+        pull(wv) %>%
+        mean(na.rm = TRUE)
+
+      tibble(
+        configuration = paste0(nm, "_kmeans"),
+        variable      = v,
+        obs_VR        = round(1 - wv /
+                                total_var_vec[[v]], 3)
+      )
+    })
+  })
+) %>%
+  left_join(
+    final_summary %>%
+      select(configuration, clustering,
+             pred_method, sampling_design,
+             spatial_lags, n_zones),
+    by = "configuration"
+  ) %>%
+  # After the left_join to final_summary, add:
+  mutate(
+    clustering = case_when(
+      is.na(clustering) & str_detect(configuration, "_kmeans") ~
+        "PCA+kmeans",
+      is.na(clustering) ~
+        "UMAP+HDBSCAN",
+      TRUE ~ clustering
+    ),
+    approach = factor(clustering,
+                      levels = c("PCA+kmeans",
+                                 "UMAP+HDBSCAN"))
+  ) %>%
+  mutate(
+    config_label = str_replace_all(
+      configuration,
+      c("_nolags" = "", "_lags" = "+lags",
+        "_kmeans" = "", "COMP_" = "COMP/",
+        "SP_" = "SP/")
+    ),
+    approach = factor(clustering,
+                      levels = c("PCA+kmeans",
+                                 "UMAP+HDBSCAN")),
+    # Clean variable names for display
+    variable = factor(variable,
+                      levels = c("lbc_1", "lb_ceq",
+                                 "ca", "k", "mg",
+                                 "mn", "p", "p_h_2",
+                                 "zn"))
+  )
+
+# Heatmap
+p_obs_vr <- obs_vr_by_var_all %>%
+  ggplot(aes(x    = config_label,
+             y    = variable,
+             fill = obs_VR)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.2f", obs_VR)),
+            size = 2.2,
+            color = ifelse(
+              obs_vr_by_var_all$obs_VR > 0.3 |
+                obs_vr_by_var_all$obs_VR < -0.3,
+              "white", "grey20")
+            ) +
+  facet_wrap(~ approach, scales = "free_x") +
+      scale_fill_gradient2(
+      low      = "#d73027",
+      mid      = "#ffffbf",
+      high     = "#1a9850",
+      midpoint = 0,
+      limits   = c(-1, 1),
+      oob      = scales::squish,   # ← clamps outliers to red/green
+      name     = "Observed VR",
+      labels   = scales::number_format(accuracy = 0.1)
+    ) +
+  theme_bw(base_size = 9) +
+  theme(
+    axis.text.x      = element_text(angle = 45,
+                                     hjust = 1,
+                                     size  = 7),
+    axis.text.y      = element_text(size  = 8),
+    strip.background = element_rect(fill  = "grey92"),
+    strip.text       = element_text(face  = "bold",
+                                     size  = 9),
+    legend.position  = "right",
+    panel.grid       = element_blank()
+  ) +
+  labs(
+    title    = "Supplementary Figure S1. Per-variable observed variance reduction",
+    subtitle = paste0(
+      "Observed VR computed on held-out validation points ",
+      "(n = 59) independently of all prediction surfaces.\n",
+      "Green = zones capture variance structure in ",
+      "independent observations; ",
+      "red = zones do not align with real gradients."
+    ),
+    x        = NULL,
+    y        = "Soil variable",
+    caption  = paste0(
+      "Observed VR = 1 − (mean within-zone variance / ",
+      "total variance) at validation points.\n",
+      "Computed per variable independently — avoids ",
+      "cross-variable averaging assumptions.\n",
+      "Zn shows negative observed VR across most ",
+      "configurations, consistent with high nugget:sill ",
+      "ratio (SP = 0.937, COMP = 1.000)\n",
+      "indicating absent field-scale spatial structure ",
+      "for this variable regardless of zone method."
+    )
+  )
+
+print(p_obs_vr)
+
+ggsave("../outputs/figS1_observed_vr_heatmap.png",
+       p_obs_vr,
+       width  = 12,
+       height = 5,
+       dpi    = 300)
+
+write_csv(obs_vr_by_var_all,
+          "../outputs/observed_vr_per_variable.csv")
+
+cat("Supplementary figure saved\n")
+```
+```{r}
+calc_obs_effect_size <- function(val_with_zones,
+                                  soil_vars, label,
+                                  method = "epsilon") {
+  df <- val_with_zones %>%
+    st_drop_geometry() %>%
+    filter(!is.na(zone)) %>%
+    select(zone, all_of(soil_vars)) %>%
+    na.omit() %>%
+    mutate(zone = factor(zone))
+
+  if (nrow(df) < 5 || length(unique(df$zone)) < 2) {
+    return(tibble(
+      configuration = label,
+      variable      = soil_vars,
+      effect_size   = NA_real_,
+      metric        = method
+    ))
+  }
+
+  purrr::map_dfr(soil_vars, function(v) {
+    aov_fit <- tryCatch(
+      aov(reformulate("zone", response = v), data = df),
+      error = function(e) NULL
+    )
+    if (is.null(aov_fit)) {
+      return(tibble(configuration = label,
+                    variable = v,
+                    effect_size = NA_real_,
+                    metric = method))
+    }
+
+    ss     <- summary(aov_fit)[[1]]
+    ss_bet <- ss["zone",      "Sum Sq"]
+    ss_wit <- ss["Residuals", "Sum Sq"]
+    ss_tot <- ss_bet + ss_wit
+    ms_wit <- ss["Residuals", "Mean Sq"]
+    k      <- length(unique(df$zone))
+
+    es <- if (method == "omega") {
+      # ω² = (SS_between - (k-1)*MS_within) /
+      #       (SS_total + MS_within)
+      (ss_bet - (k - 1) * ms_wit) / (ss_tot + ms_wit)
+    } else {
+      # ε² = (SS_between - (k-1)*MS_within) / SS_total
+      # Analogous to adjusted R², least biased
+      (ss_bet - (k - 1) * ms_wit) / ss_tot
+    }
+
+    tibble(
+      configuration = label,
+      variable      = v,
+      effect_size   = round(es, 3),
+      metric        = method
+    )
+  })
+}
+
+# Run for all UMAP configs
+obs_es_umap <- purrr::imap_dfr(val_named, function(x, nm) {
+  calc_obs_effect_size(x$val_with_zones, soil_vars,
+                       label  = nm,
+                       method = "epsilon")
+})
+
+# Run for all PCA+kmeans configs
+obs_es_pca <- purrr::imap_dfr(val_baseline, function(x, nm) {
+  calc_obs_effect_size(x$val_with_zones, soil_vars,
+                       label  = paste0(nm, "_kmeans"),
+                       method = "epsilon")
+})
+
+obs_es_all <- bind_rows(obs_es_umap, obs_es_pca)
+
+# Summary per config
+obs_es_summary <- obs_es_all %>%
+  group_by(configuration) %>%
+  summarise(
+    median_es = round(median(effect_size, na.rm = TRUE), 3),
+    mean_es   = round(mean(effect_size,   na.rm = TRUE), 3),
+    n_pos_es  = sum(effect_size > 0,      na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+obs_es_summary %>% arrange(desc(median_es))
+
+
+obs_es_summary %>%
+  left_join(
+    final_summary %>%
+      # Add _kmeans to no-lags PCA configs to match
+      mutate(
+        config_join = case_when(
+          clustering == "PCA+kmeans" &
+            !str_detect(configuration, "_kmeans") ~
+            paste0(configuration, "_kmeans"),
+          TRUE ~ configuration
+        )
+      ) %>%
+      select(config_join, n_zones, clustering,
+             pred_method, sampling_design,
+             spatial_lags),
+    by = c("configuration" = "config_join")
+  ) %>%
+  mutate(
+    k_group = case_when(
+      n_zones == 2       ~ "k=2",
+      n_zones == 3       ~ "k=3",
+      n_zones %in% 4:5   ~ "k=4-5",
+      n_zones >= 6       ~ "k=6+",
+      TRUE               ~ NA_character_
+    )
+  ) %>%
+  arrange(k_group, desc(median_es)) %>%
+  select(configuration, clustering, n_zones,
+         k_group, median_es, n_pos_es) %>%
+  print(n = 25)
+
+#UMAP RF configurations (0.022–0.046) outperform PCA OK (0.003–0.039) at comparable zone counts. The three UMAP RF configs are all positive and meaningfully above zero. SP_OK_kmeans at 0.003 is essentially zero — 6 zones from PCA on OK predictions explains almost nothing at validation points
+
+#Using Cohen's benchmarks for eta-squared family effect sizes:
+# 
+# ε² ≥ 0.01 = small effect
+# ε² ≥ 0.06 = medium effect
+# ε² ≥ 0.14 = large effect
+
+#epsilon^2 = (SS_between - (k-1)*MS_within) / SS_total
+```
+
+
 ```{r picp-supplementary}
 # ============================================================
 # SUPPLEMENTARY — Prediction Interval Coverage Probability
