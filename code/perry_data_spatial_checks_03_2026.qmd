@@ -23,7 +23,7 @@ library(janitor)
 
 ```{r bad, eval = FALSE}
 # --- Load data ---
-covariate_stack <- rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m.tif")
+covariate_stack <- rast("../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m_all_with_SR_indices.tif")
 
 #raw soil data
 soil_SP_raw <- read.csv("../LOCAL DATA DO NOT PUSH/covariates_and_soil_data/soil_covariate_data_scaled_SP.csv")
@@ -1457,7 +1457,151 @@ extract_vg_metrics <- function(fit, var_name, dataset, stage) {
 }
 ```
 
+```{r}
+# Compute RF residual Moran's I fresh from the rf_all objects
+rf_moran_SP_correct <- purrr::map_dfr(names(rf_all_SP), function(v) {
+  coords <- st_coordinates(rf_all_SP[[v]]$data)
+  r <- rf_all_SP[[v]]$data %>%
+    st_drop_geometry() %>%
+    pull(residual)
+  knn <- knearneigh(coords, k = 5)
+  nb  <- knn2nb(knn)
+  lw  <- nb2listw(nb, style = "W")
+  mt  <- moran.test(r, lw)
+  tibble(
+    variable    = v,
+    moran_I     = unname(mt$estimate[1]),
+    p_value     = mt$p.value
+  )
+})
 
+rf_moran_COMP_correct <- purrr::map_dfr(names(rf_all_COMP), function(v) {
+  coords <- st_coordinates(rf_all_COMP[[v]]$data)
+  r <- rf_all_COMP[[v]]$data %>%
+    st_drop_geometry() %>%
+    pull(residual)
+  knn <- knearneigh(coords, k = 5)
+  nb  <- knn2nb(knn)
+  lw  <- nb2listw(nb, style = "W")
+  mt  <- moran.test(r, lw)
+  tibble(
+    variable    = v,
+    moran_I     = unname(mt$estimate[1]),
+    p_value     = mt$p.value
+  )
+})
+
+print(rf_moran_SP_correct,   n = 9)
+print(rf_moran_COMP_correct, n = 9)
+```
+
+
+```{r}
+print(rf_summary_SP)
+print(rf_summary_COMP)
+print(rf_moran_SP)
+print(rf_moran_COMP)
+print(lm_metrics_all, n = 20)
+print(vg_metrics_SP)
+print(vg_metrics_COMP)
+print(rf_moran_SP, n = 9)
+print(rf_moran_COMP, n = 9)
+```
+
+```{r}
+# ── Descriptive statistics table ──────────────────────────
+descriptive_stats <- function(dat, soil_vars, dataset_label) {
+  dat %>%
+    st_drop_geometry() %>%
+    select(all_of(soil_vars)) %>%
+    pivot_longer(everything(),
+                 names_to  = "variable",
+                 values_to = "value") %>%
+    group_by(variable) %>%
+    summarise(
+      n      = sum(!is.na(value)),
+      mean   = round(mean(value,   na.rm = TRUE), 2),
+      sd     = round(sd(value,     na.rm = TRUE), 2),
+      min    = round(min(value,    na.rm = TRUE), 2),
+      median = round(median(value, na.rm = TRUE), 2),
+      max    = round(max(value,    na.rm = TRUE), 2),
+      cv_pct = round(sd(value, na.rm = TRUE) /
+                     mean(value, na.rm = TRUE) * 100, 1),
+      .groups = "drop"
+    ) %>%
+    mutate(dataset = dataset_label) %>%
+    mutate(variable = recode(variable,
+      "lbc_1"  = "Lime Buffer Capacity",
+      "lb_ceq" = "LBC Equivalent",
+      "p_h_2"  = "pH",
+      "ca"     = "Calcium",
+      "k"      = "Potassium",
+      "mg"     = "Magnesium",
+      "mn"     = "Manganese",
+      "p"      = "Phosphorus",
+      "zn"     = "Zinc"
+    ))
+}
+
+desc_SP   <- descriptive_stats(soil_prop_SP,   soil_vars, "SP")
+desc_COMP <- descriptive_stats(soil_prop_COMP, soil_vars, "COMP")
+desc_all  <- bind_rows(desc_SP, desc_COMP)
+
+print(desc_all, n = 18)
+
+write.csv(desc_all, "../outputs/descriptive_statistics.csv")
+
+# For a figure, the most useful supplement to a descriptive stats table is a paired boxplot comparing SP vs COMP distributions side by side for each variable — it visually shows the mean shift, spread reduction, and outlier differences between sampling designs in one figure:
+# ── Paired SP vs COMP boxplot ─────────────────────────────
+soil_var_labels <- c(
+  "lbc_1"  = "Lime Buffer Capacity",
+  "lb_ceq" = "LBC Equilibrium",
+  "p_h_2"  = "pH",
+  "ca"     = "Calcium",
+  "k"      = "Potassium",
+  "mg"     = "Magnesium",
+  "mn"     = "Manganese",
+  "p"      = "Phosphorus",
+  "zn"     = "Zinc"
+)
+
+bind_rows(
+  soil_prop_SP   %>% st_drop_geometry() %>% mutate(dataset = "SP"),
+  soil_prop_COMP %>% st_drop_geometry() %>% mutate(dataset = "COMP")
+) %>%
+  select(all_of(soil_vars), dataset) %>%
+  pivot_longer(-dataset,
+               names_to  = "variable",
+               values_to = "value") %>%
+  mutate(
+    variable = recode(variable, !!!soil_var_labels),
+    variable = factor(variable, levels = soil_var_labels),
+    dataset  = factor(dataset, levels = c("SP", "COMP"))
+  ) %>%
+  ggplot(aes(x = dataset, y = value, fill = dataset)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 1.5,
+               alpha = 0.7, width = 0.5) +
+  geom_jitter(width = 0.15, alpha = 0.3, size = 0.8) +
+  scale_fill_manual(values = c("SP"   = "#2980b9",
+                                "COMP" = "#e74c3c")) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 3) +
+  theme_bw(base_size = 10) +
+  theme(
+    legend.position  = "none",
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold", size = 9),
+    axis.text.x      = element_text(size = 9)
+  ) +
+  labs(
+    title    = "Distribution of soil properties by sampling design",
+    subtitle = "SP = single-point; COMP = composite (n = 136 each)",
+    x        = NULL,
+    y        = "Value"
+  )
+
+ggsave("../outputs/fig_descriptive_boxplots.png",
+       width = 10, height = 10, dpi = 300)
+```
 
 
 

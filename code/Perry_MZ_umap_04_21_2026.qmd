@@ -1,0 +1,3254 @@
+---
+title: "Perry_MZ_umap_04_20_2026"
+format: html
+---
+
+# ============================================================
+# PHASE 0 — Libraries
+# ============================================================
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(terra)
+library(tidyverse)
+library(janitor)
+library(sf)
+library(sp)
+library(gstat)
+library(randomForest)
+library(quantregForest)   # QRF prediction intervals
+library(CAST)
+library(caret)
+library(umap)
+library(dbscan)
+library(beepr)
+library(broom)
+library(FNN)
+library(uwot)
+library(patchwork)
+library(ggtext)
+library(gt)
+library(gtExtras)
+library(ggrepel)
+library(cowplot)
+library(cluster)
+library(scales)
+```
+
+# ============================================================
+# PHASE 1 — Data Loading & Preparation
+# ============================================================
+
+```{r data-load}
+# ── Raw datasets ───────────────────────────────────────────
+soil_points_nutrients <- read.csv(
+  "../LOCAL DATA DO NOT PUSH/soil/perry_soil_points_surface_03_2026.csv"
+) %>% clean_names()
+
+ap_val <- read_csv(
+  "../LOCAL DATA DO NOT PUSH/Ap_hz_data/hz_0_15_wide_03_30_2026.csv"
+)
+
+covariate_stack <- rast(
+  "../LOCAL DATA DO NOT PUSH/covariate_stack/covariate_stack_3m_all_with_SR_indices.tif"
+)
+
+# ── Agronomic soil variable subset ────────────────────────
+
+soil_vars <- c("lbc_1", "lb_ceq", "p_h_2", "ca", "k", "mg", "mn", "p", "zn")
+cov_names <- names(covariate_stack)
+
+# ── Helper functions ───────────────────────────────────────
+add_xy <- function(dat) {
+  coords <- st_coordinates(dat)
+  dat %>% mutate(X = coords[, 1], Y = coords[, 2])
+}
+
+extract_covariates <- function(dat_sf, stack) {
+  vect_pts <- terra::vect(dat_sf)
+  cov_vals <- terra::extract(stack, vect_pts)
+  bind_cols(
+    dat_sf %>% st_drop_geometry(),
+    cov_vals %>% dplyr::select(-ID)
+  ) %>%
+    bind_cols(geometry = st_geometry(dat_sf)) %>%
+    st_as_sf()
+}
+
+# ── SP and COMP modelling datasets ────────────────────────
+soil_prop_SP <- soil_points_nutrients %>%
+  filter(type == "SPID") %>%
+  st_as_sf(coords = c("x", "y"), crs = 4326) %>%
+  st_transform(26917) %>%
+  add_xy() %>%
+  extract_covariates(covariate_stack)
+
+soil_prop_COMP <- soil_points_nutrients %>%
+  filter(type == "CID") %>%
+  st_as_sf(coords = c("x", "y"), crs = 4326) %>%
+  st_transform(26917) %>%
+  add_xy() %>%
+  extract_covariates(covariate_stack)
+
+# ── Validation dataset — HELD OUT, never used in CV ───────
+ap_val_sf <- ap_val %>%
+  st_as_sf(coords = c("POINT_X", "POINT_Y"), crs = 3857) %>%
+  st_transform(26917) %>%
+  transmute(
+    point_label = paste0("VAL_", Point),
+    type        = "VAL",
+    lb_ceq = LBCeq_0_15,
+    p_h_2  = pH.2_0_15,
+    ca     = Ca_0_15,
+    k      = K_0_15,
+    p      = P_0_15,
+     mg     = Mg_0_15,
+    mn     = Mn_0_15,
+    zn     = Zn_0_15,
+    lbc_1  = LBC.1_0_15,
+    geometry = geometry
+  ) %>%
+  add_xy() %>%
+  extract_covariates(covariate_stack)
+
+# ── Spatial distribution check ────────────────────────────
+ggplot() +
+  geom_sf(data = soil_prop_SP,   color = "steelblue",   size = 2) +
+  geom_sf(data = soil_prop_COMP, color = "tomato",      size = 2, shape = 17) +
+  geom_sf(data = ap_val_sf,      color = "forestgreen", size = 2, shape = 15) +
+  theme_minimal() +
+  labs(title = "Spatial distribution: SP (blue), COMP (red), VAL (green)")
+```
+
+# ============================================================
+# PHASE 2 — Spatial Cross-Validation Setup
+# ============================================================
+
+```{r spatial-cv-setup}
+make_spatial_folds <- function(sf_data, k = 5, seed = 20260401) {
+  coords <- st_coordinates(sf_data)
+  set.seed(seed)
+  km <- kmeans(coords, centers = k, nstart = 25)
+  sf_data$spatial_block <- as.character(km$cluster)
+
+  folds <- CAST::CreateSpacetimeFolds(
+    x        = sf_data %>% st_drop_geometry(),
+    spacevar = "spatial_block",
+    k        = k,
+    seed     = seed
+  )
+
+  purrr::map(seq_along(folds$index), function(i) {
+    list(
+      iteration = i,
+      seed      = seed,
+      train_ids = folds$index[[i]],
+      test_ids  = folds$indexOut[[i]]
+    )
+  })
+}
+
+resamples_SP   <- make_spatial_folds(soil_prop_SP,   k = 5)
+resamples_COMP <- make_spatial_folds(soil_prop_COMP, k = 5)
+
+make_cutoff <- function(sf_data) max(dist(st_coordinates(sf_data))) / 2
+width_lag   <- 75
+
+cutoff_SP   <- make_cutoff(soil_prop_SP)
+cutoff_COMP <- make_cutoff(soil_prop_COMP)
+
+# Visualise spatial blocks
+soil_prop_SP$spatial_block <- as.character(
+  kmeans(st_coordinates(soil_prop_SP), centers = 5, nstart = 25)$cluster
+)
+ggplot() +
+  geom_sf(data = soil_prop_SP, aes(color = spatial_block), size = 3) +
+  theme_minimal() +
+  labs(title = "Spatial CV blocks — SP dataset", color = "Block")
+```
+
+# ============================================================
+# PHASE 3 — Model Fitting Helpers (RF, OK, RK)
+# ============================================================
+
+```{r model-helpers}
+calc_metrics <- function(obs, pred) {
+  tibble(
+    n          = length(obs),
+    RMSE       = sqrt(mean((obs - pred)^2, na.rm = TRUE)),
+    MAE        = mean(abs(obs - pred),      na.rm = TRUE),
+    R2         = cor(obs, pred, use = "complete.obs")^2,
+    mean_error = mean(obs - pred,           na.rm = TRUE)
+  )
+}
+
+tune_rf_oob <- function(train_df, response, predictors, ntree = 500) {
+  x_train   <- train_df %>% select(all_of(predictors))
+  y_train   <- train_df[[response]]
+  p         <- length(predictors)
+  mtry_grid <- unique(pmax(1, c(
+    floor(sqrt(p)), floor(p / 4), floor(p / 3), floor(p / 2)
+  )))
+
+  fits <- purrr::map(mtry_grid, function(m) {
+    set.seed(sample.int(1e6, 1))
+    rf <- randomForest(x = x_train, y = y_train,
+                       ntree = ntree, mtry = m, importance = TRUE)
+    tibble(mtry = m, oob_mse = tail(rf$mse, 1))
+  }) %>% bind_rows()
+
+  list(
+    best_mtry    = fits %>% slice_min(oob_mse, n = 1) %>% pull(mtry),
+    tuning_table = fits
+  )
+}
+
+fit_variogram_models <- function(vg) {
+  vg_df       <- as.data.frame(vg)
+  init_nugget <- max(0, min(vg_df$gamma, na.rm = TRUE) * 0.5)
+  init_sill   <- max(vg_df$gamma, na.rm = TRUE)
+  init_psill  <- max(init_sill - init_nugget, 1e-6)
+  init_range  <- max(vg_df$dist, na.rm = TRUE) / 3
+
+  fits <- purrr::map(c("Sph", "Exp"), function(m) {
+    tryCatch({
+      fit <- fit.variogram(
+        vg,
+        model = vgm(psill = init_psill, model = m,
+                    range = init_range,  nugget = init_nugget)
+      )
+      if (any(!is.finite(fit$psill)))               return(NULL)
+      if (any(!is.finite(fit$range)))               return(NULL)
+      if (any(fit$range[fit$model != "Nug"] <= 0))  return(NULL)
+      fit
+    }, error = function(e) NULL)
+  })
+
+  fits <- fits[!sapply(fits, is.null)]
+  if (length(fits) == 0) return(NULL)
+
+  sse      <- sapply(fits, function(f) attr(f, "SSErr"))
+  best_fit <- fits[[which.min(sse)]]
+
+  # Degeneracy guard — pure nugget = constant surface
+  str_row <- best_fit %>% filter(model != "Nug")
+  if (nrow(str_row) > 0 && str_row$psill < 1e-6) {
+    warning("Degenerate variogram fit: psill ≈ 0. Returning NULL.")
+    return(NULL)
+  }
+  best_fit
+}
+
+# ── RF ─────────────────────────────────────────────────────
+run_rf_model <- function(train_sf, test_sf, response,
+                          predictors, ntree = 500) {
+  train_df <- train_sf %>% st_drop_geometry() %>%
+    select(all_of(c(response, predictors))) %>% na.omit()
+  test_df  <- test_sf  %>% st_drop_geometry() %>%
+    select(all_of(c(response, predictors))) %>% na.omit()
+
+  tuning  <- tune_rf_oob(train_df, response, predictors, ntree)
+  rf_fit  <- randomForest(
+    x = train_df %>% select(all_of(predictors)),
+    y = train_df[[response]],
+    ntree = ntree, mtry = tuning$best_mtry, importance = TRUE
+  )
+  preds <- predict(rf_fit, newdata = test_df %>% select(all_of(predictors)))
+  list(
+    model       = rf_fit,
+    predictions = tibble(obs = test_df[[response]], pred = preds),
+    metrics     = calc_metrics(test_df[[response]], preds),
+    best_mtry   = tuning$best_mtry
+  )
+}
+
+# ── OK ─────────────────────────────────────────────────────
+run_ok_model <- function(train_sf, test_sf, response, cutoff, width) {
+  train_sp <- as(train_sf, "Spatial")
+  test_sp  <- as(test_sf,  "Spatial")
+  f        <- as.formula(paste(response, "~ 1"))
+  vg       <- variogram(f, data = train_sp, cutoff = cutoff, width = width)
+  fit      <- fit_variogram_models(vg)
+  if (is.null(fit)) return(NULL)
+
+  kr   <- krige(f, locations = train_sp, newdata = test_sp, model = fit)
+  pred <- kr$var1.pred
+  obs  <- test_sf %>% st_drop_geometry() %>% pull(.data[[response]])
+  list(
+    variogram   = vg,
+    fit         = fit,
+    predictions = tibble(obs = obs, pred = pred),
+    metrics     = calc_metrics(obs, pred)
+  )
+}
+
+# ── RK ─────────────────────────────────────────────────────
+run_rk_model <- function(train_sf, test_sf, response, predictors,
+                          cutoff, width, ntree = 500) {
+  train_df <- train_sf %>% st_drop_geometry() %>%
+    select(all_of(c(response, predictors))) %>% na.omit()
+  test_df  <- test_sf  %>% st_drop_geometry() %>%
+    select(all_of(c(response, predictors))) %>% na.omit()
+
+  train_sf2 <- train_sf %>%
+    filter(complete.cases(st_drop_geometry(
+      select(., all_of(c(response, predictors))))))
+  test_sf2  <- test_sf  %>%
+    filter(complete.cases(st_drop_geometry(
+      select(., all_of(c(response, predictors))))))
+
+  tuning <- tune_rf_oob(train_df, response, predictors, ntree)
+  rf_fit <- randomForest(
+    x = train_df %>% select(all_of(predictors)),
+    y = train_df[[response]],
+    ntree = ntree, mtry = tuning$best_mtry, importance = TRUE
+  )
+
+  trend_train        <- predict(rf_fit, newdata = train_df %>%
+                                  select(all_of(predictors)))
+  trend_test         <- predict(rf_fit, newdata = test_df  %>%
+                                  select(all_of(predictors)))
+  train_sf2$residual <- train_df[[response]] - trend_train
+
+  train_sp  <- as(train_sf2, "Spatial")
+  test_sp   <- as(test_sf2,  "Spatial")
+  vg_resid  <- variogram(residual ~ 1, data = train_sp,
+                          cutoff = cutoff, width = width)
+  fit_resid <- fit_variogram_models(vg_resid)
+
+  if (is.null(fit_resid)) {
+    return(list(
+      metrics               = calc_metrics(test_df[[response]], trend_test),
+      best_mtry             = tuning$best_mtry,
+      used_residual_kriging = FALSE
+    ))
+  }
+
+  kr_resid <- krige(residual ~ 1, locations = train_sp,
+                    newdata = test_sp, model = fit_resid)
+  pred     <- trend_test + kr_resid$var1.pred
+  obs      <- test_df[[response]]
+
+  list(
+    metrics               = calc_metrics(obs, pred),
+    best_mtry             = tuning$best_mtry,
+    used_residual_kriging = TRUE
+  )
+}
+
+# ── Combined iteration runner ──────────────────────────────
+run_one_iteration <- function(sf_data, split, response, predictors,
+                               dataset_name, cutoff, width, ntree = 500) {
+  train_sf <- sf_data[split$train_ids, ]
+  test_sf  <- sf_data[split$test_ids,  ]
+
+  rf_res <- run_rf_model(train_sf, test_sf, response, predictors, ntree)
+  ok_res <- run_ok_model(train_sf, test_sf, response, cutoff, width)
+  rk_res <- run_rk_model(train_sf, test_sf, response, predictors,
+                          cutoff, width, ntree)
+
+  bind_rows(
+    rf_res$metrics %>%
+      mutate(dataset = dataset_name, variable = response, method = "RF",
+             iteration = split$iteration, seed = split$seed,
+             best_mtry = rf_res$best_mtry),
+    if (!is.null(ok_res))
+      ok_res$metrics %>%
+        mutate(dataset = dataset_name, variable = response, method = "OK",
+               iteration = split$iteration, seed = split$seed,
+               best_mtry = NA_real_),
+    rk_res$metrics %>%
+      mutate(dataset = dataset_name, variable = response, method = "RK",
+             iteration = split$iteration, seed = split$seed,
+             best_mtry = rk_res$best_mtry,
+             used_residual_kriging = rk_res$used_residual_kriging)
+  )
+}
+```
+
+```{r run-cv, warning=FALSE}
+results_SP <- purrr::map_dfr(soil_vars, function(v) {
+  purrr::map_dfr(resamples_SP, function(split_obj) {
+    run_one_iteration(soil_prop_SP, split_obj, v, cov_names,
+                      "SP", cutoff_SP, width_lag)
+  })
+})
+
+results_COMP <- purrr::map_dfr(soil_vars, function(v) {
+  purrr::map_dfr(resamples_COMP, function(split_obj) {
+    run_one_iteration(soil_prop_COMP, split_obj, v, cov_names,
+                      "COMP", cutoff_COMP, width_lag)
+  })
+})
+
+results_all <- bind_rows(results_SP, results_COMP)
+beep("wilhelm")
+
+# ── CV summary ────────────────────────────────────────────
+cv_summary <- results_all %>%
+  group_by(dataset, variable, method) %>%
+  summarise(
+    n_folds     = n(),
+    median_R2   = median(R2,   na.rm = TRUE),
+    q25_R2      = quantile(R2,   0.25, na.rm = TRUE),
+    q75_R2      = quantile(R2,   0.75, na.rm = TRUE),
+    median_RMSE = median(RMSE, na.rm = TRUE),
+    median_MAE  = median(MAE,  na.rm = TRUE),
+    .groups     = "drop"
+  ) %>%
+  arrange(variable, dataset, desc(median_R2))
+
+print(cv_summary)
+write_csv(cv_summary, "../outputs/cv_summary_spatial_folds.csv")
+
+# ── CV violin plots ───────────────────────────────────────
+results_all %>%
+  mutate(dataset = factor(dataset, c("SP", "COMP")),
+         method  = factor(method,  c("OK", "RF", "RK"))) %>%
+  ggplot(aes(x = method, y = R2, fill = method)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.8) +
+  facet_grid(variable ~ dataset, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Spatial CV: R² by dataset and method",
+       x = "Method", y = expression(R^2)) +
+  theme(legend.position = "none")
+```
+
+# ============================================================
+# PHASE 4 — Final Full-Dataset Models + Held-Out Validation
+# ============================================================
+
+```{r final-models}
+fit_final_rf <- function(sf_data, response, predictors, ntree = 500) {
+  df     <- sf_data %>% st_drop_geometry() %>%
+    select(all_of(c(response, predictors))) %>% na.omit()
+  tuning <- tune_rf_oob(df, response, predictors, ntree)
+  randomForest(
+    x          = df %>% select(all_of(predictors)),
+    y          = df[[response]],
+    ntree      = ntree,
+    mtry       = tuning$best_mtry,
+    importance = TRUE
+  )
+}
+
+fit_final_ok <- function(sf_data, response, cutoff, width) {
+  sp_data <- as(sf_data, "Spatial")
+  f       <- as.formula(paste(response, "~ 1"))
+  vg      <- variogram(f, data = sp_data, cutoff = cutoff, width = width)
+  fit     <- fit_variogram_models(vg)
+  list(variogram = vg, fit = fit, formula = f, sp_data = sp_data)
+}
+
+fit_final_rk <- function(sf_data, response, predictors,
+                          cutoff, width, ntree = 500) {
+  df      <- sf_data %>% st_drop_geometry() %>%
+    select(all_of(c(response, predictors))) %>% na.omit()
+  sf_data2 <- sf_data %>%
+    filter(complete.cases(st_drop_geometry(
+      select(., all_of(c(response, predictors))))))
+
+  tuning  <- tune_rf_oob(df, response, predictors, ntree)
+  rf_fit  <- randomForest(
+    x = df %>% select(all_of(predictors)),
+    y = df[[response]],
+    ntree = ntree, mtry = tuning$best_mtry, importance = TRUE
+  )
+  trend             <- predict(rf_fit, newdata = df %>%
+                                 select(all_of(predictors)))
+  sf_data2$residual <- df[[response]] - trend
+
+  sp_data  <- as(sf_data2, "Spatial")
+  vg_resid <- variogram(residual ~ 1, data = sp_data,
+                         cutoff = cutoff, width = width)
+  fit_resid <- fit_variogram_models(vg_resid)
+
+  list(rf_fit = rf_fit, fit_resid = fit_resid, sp_data = sp_data)
+}
+
+final_models_SP <- purrr::map(
+  setNames(soil_vars, soil_vars),
+  function(v) list(
+    rf = fit_final_rf(soil_prop_SP, v, cov_names),
+    ok = fit_final_ok(soil_prop_SP, v, cutoff_SP, width_lag),
+    rk = fit_final_rk(soil_prop_SP, v, cov_names, cutoff_SP, width_lag)
+  )
+)
+
+final_models_COMP <- purrr::map(
+  setNames(soil_vars, soil_vars),
+  function(v) list(
+    rf = fit_final_rf(soil_prop_COMP, v, cov_names),
+    ok = fit_final_ok(soil_prop_COMP, v, cutoff_COMP, width_lag),
+    rk = fit_final_rk(soil_prop_COMP, v, cov_names, cutoff_COMP, width_lag)
+  )
+)
+
+beep("fanfare")
+```
+
+```{r variogram-summary}
+# ── Phase 4b: Variogram model summary ─────────────────────
+extract_variogram_summary <- function(final_models, soil_vars, label) {
+  purrr::map_dfr(soil_vars, function(v) {
+    fit <- final_models[[v]]$ok$fit
+    if (is.null(fit)) {
+      return(tibble(variable = v, dataset = label,
+                    model = NA, nugget = NA, psill = NA,
+                    total_sill = NA, range_m = NA,
+                    nugget_sill_ratio = NA))
+    }
+    nug_row  <- fit %>% filter(model == "Nug")
+    str_row  <- fit %>% filter(model != "Nug")
+    nugget   <- if (nrow(nug_row) > 0) nug_row$psill else 0
+    psill    <- if (nrow(str_row) > 0) str_row$psill else NA
+    rng      <- if (nrow(str_row) > 0) str_row$range else NA
+    mod_type <- if (nrow(str_row) > 0) as.character(str_row$model) else NA
+    tibble(variable = v, dataset = label, model = mod_type,
+           nugget   = round(nugget, 4), psill = round(psill, 4),
+           total_sill = round(nugget + psill, 4),
+           range_m    = round(rng, 1),
+           nugget_sill_ratio = round(nugget / (nugget + psill), 3))
+  })
+}
+
+vg_summary_all <- bind_rows(
+  extract_variogram_summary(final_models_SP,   soil_vars, "SP"),
+  extract_variogram_summary(final_models_COMP, soil_vars, "COMP")
+)
+
+vg_summary_all %>%
+  mutate(spatial_dependence = case_when(
+    nugget_sill_ratio < 0.25 ~ "Strong",
+    nugget_sill_ratio < 0.75 ~ "Moderate",
+    TRUE                     ~ "Weak — kriging limited"
+  )) %>%
+  arrange(dataset, variable) %>%
+  print(n = 20)
+
+write_csv(vg_summary_all, "../outputs/variogram_summary_table.csv")
+```
+
+```{r held-out-validation}
+# ── Predict to held-out validation set ────────────────────
+predict_to_points <- function(models_list, response, new_sf,
+                               predictors, cutoff, width) {
+  new_df <- new_sf %>% st_drop_geometry() %>%
+    select(any_of(c(response, predictors))) %>% na.omit()
+  obs    <- new_df[[response]]
+
+  rf_pred <- predict(models_list$rf,
+                     newdata = new_df %>% select(all_of(predictors)))
+
+  ok_pred <- tryCatch({
+    kr <- krige(models_list$ok$formula,
+                locations = models_list$ok$sp_data,
+                newdata   = as(new_sf, "Spatial"),
+                model     = models_list$ok$fit)
+    kr$var1.pred
+  }, error = function(e) rep(NA_real_, nrow(new_df)))
+
+  rk_trend <- predict(models_list$rk$rf_fit,
+                      newdata = new_df %>% select(all_of(predictors)))
+  rk_resid <- tryCatch({
+    new_sf2 <- new_sf %>%
+      filter(complete.cases(st_drop_geometry(
+        select(., any_of(predictors)))))
+    kr2 <- krige(residual ~ 1,
+                 locations = models_list$rk$sp_data,
+                 newdata   = as(new_sf2, "Spatial"),
+                 model     = models_list$rk$fit_resid)
+    kr2$var1.pred
+  }, error = function(e) rep(0, length(rk_trend)))
+  rk_pred <- rk_trend + rk_resid
+
+  bind_rows(
+    calc_metrics(obs, rf_pred) %>%
+      mutate(variable = response, method = "RF"),
+    calc_metrics(obs, ok_pred) %>%
+      mutate(variable = response, method = "OK"),
+    calc_metrics(obs, rk_pred) %>%
+      mutate(variable = response, method = "RK")
+  )
+}
+
+val_results_all <- bind_rows(
+  purrr::map_dfr(soil_vars, function(v) {
+    predict_to_points(final_models_SP[[v]], v, ap_val_sf,
+                      cov_names, cutoff_SP, width_lag) %>%
+      mutate(dataset = "SP")
+  }),
+  purrr::map_dfr(soil_vars, function(v) {
+    predict_to_points(final_models_COMP[[v]], v, ap_val_sf,
+                      cov_names, cutoff_COMP, width_lag) %>%
+      mutate(dataset = "COMP")
+  })
+)
+
+write_csv(val_results_all, "../outputs/validation_results_held_out.csv")
+val_results_all %>% arrange(variable, dataset, desc(R2))
+```
+
+# ============================================================
+# PHASE 4c — RF Variable Importance Analysis
+# ============================================================
+
+```{r rf-importance}
+# ── Extract importance from final RF models ────────────────
+# Uses %IncMSE (permutation importance) — more reliable
+# than node impurity (%IncNodePurity) for correlated predictors.
+# Top-20 covariates shown per variable × dataset.
+
+extract_importance <- function(rf_model, variable, dataset) {
+  imp <- importance(rf_model, type = 1) # type=1 = %IncMSE
+  tibble(
+    covariate = rownames(imp),
+    pct_inc_mse = imp[, 1],
+    variable  = variable,
+    dataset   = dataset
+  ) %>%
+    arrange(desc(pct_inc_mse))
+}
+
+importance_SP <- purrr::map_dfr(soil_vars, function(v) {
+  extract_importance(final_models_SP[[v]]$rf, v, "SP")
+})
+
+importance_COMP <- purrr::map_dfr(soil_vars, function(v) {
+  extract_importance(final_models_COMP[[v]]$rf, v, "COMP")
+})
+
+importance_all <- bind_rows(importance_SP, importance_COMP)
+
+# ── Per-variable importance plots (top 20 covariates) ─────
+plot_importance_per_var <- function(imp_df, dataset_label) {
+  imp_df %>%
+    filter(dataset == dataset_label) %>%
+    group_by(variable) %>%
+    slice_max(order_by = pct_inc_mse, n = 20) %>%
+    ungroup() %>%
+    mutate(covariate = tidytext::reorder_within(
+      covariate, pct_inc_mse, variable)) %>%
+    ggplot(aes(x = covariate, y = pct_inc_mse,
+               fill = pct_inc_mse)) +
+    geom_col(show.legend = FALSE) +
+    tidytext::scale_x_reordered() +
+    scale_fill_viridis_c(option = "plasma", direction = -1) +
+    coord_flip() +
+    facet_wrap(~ variable, scales = "free") +
+    theme_bw(base_size = 9) +
+    labs(
+      title    = paste0("RF Variable Importance — ",
+                        dataset_label, " dataset"),
+      subtitle = "Top 20 covariates by %IncMSE (permutation importance)",
+      x        = NULL,
+      y        = "% Increase in MSE"
+    )
+}
+
+# Note: tidytext is used for reorder_within().
+# If not installed: install.packages("tidytext")
+# Alternative without tidytext: use fct_reorder within facets.
+
+print(plot_importance_per_var(importance_all, "SP"))
+print(plot_importance_per_var(importance_all, "COMP"))
+
+# ── Aggregate importance: mean %IncMSE across all soil vars ─
+# Identifies covariates that are broadly useful across
+# the full agronomic variable set, not just one variable.
+
+agg_importance <- importance_all %>%
+  group_by(covariate, dataset) %>%
+  summarise(
+    mean_pct_inc_mse   = mean(pct_inc_mse,   na.rm = TRUE),
+    median_pct_inc_mse = median(pct_inc_mse, na.rm = TRUE),
+    n_vars_top20 = sum(rank(desc(pct_inc_mse)) <= 20,
+                       na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(dataset, desc(mean_pct_inc_mse))
+
+# Top-30 aggregate importance
+p_agg_imp <- agg_importance %>%
+  group_by(dataset) %>%
+  slice_max(mean_pct_inc_mse, n = 30) %>%
+  ungroup() %>%
+  mutate(
+    covariate = tidytext::reorder_within(
+      covariate, mean_pct_inc_mse, dataset)
+  ) %>%
+  ggplot(aes(x = covariate, y = mean_pct_inc_mse,
+             fill = dataset)) +
+  geom_col(show.legend = FALSE) +
+  tidytext::scale_x_reordered() +
+  scale_fill_manual(values = c("SP"   = "#2980b9",
+                                "COMP" = "#e74c3c")) +
+  coord_flip() +
+  facet_wrap(~ dataset, scales = "free") +
+  theme_bw(base_size = 9) +
+  labs(
+    title    = "Aggregate RF Variable Importance",
+    subtitle = paste0("Mean %IncMSE across all ",
+                      length(soil_vars),
+                      " agronomic soil variables"),
+    x        = NULL,
+    y        = "Mean % Increase in MSE"
+  )
+
+print(p_agg_imp)
+
+# ── Covariate overlap: top-15 per variable heatmap ────────
+top15_per_var <- importance_all %>%
+  group_by(dataset, variable) %>%
+  slice_max(pct_inc_mse, n = 15) %>%
+  ungroup() %>%
+  mutate(in_top15 = TRUE)
+
+# Which covariates appear in top-15 for multiple variables?
+overlap_counts <- top15_per_var %>%
+  group_by(covariate, dataset) %>%
+  summarise(n_vars_in_top15 = n(), .groups = "drop") %>%
+  filter(n_vars_in_top15 >= 2)
+
+p_overlap <- top15_per_var %>%
+  filter(covariate %in% overlap_counts$covariate) %>%
+  ggplot(aes(x = variable, y = covariate,
+             fill = pct_inc_mse)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "magma", direction = -1,
+                        name = "%IncMSE") +
+  facet_wrap(~ dataset) +
+  theme_bw(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title    = "Covariate importance overlap across soil variables",
+    subtitle = "Covariates appearing in top-15 for ≥2 variables",
+    x = "Soil variable", y = "Covariate"
+  )
+
+print(p_overlap)
+single_bands <- c("coastal_blue", "blue", "green_i", "green",
+                  "yellow", "red", "rededge", "nir")
+
+# Soil variable display names
+soil_var_labels <- c(
+  "lbc_1"  = "Lime Buffer Capacity",
+  "lb_ceq" = "LBC Equivalent",
+  "p_h_2"  = "pH",
+  "ca"     = "Calcium",
+  "k"      = "Potassium",
+  "mg"     = "Magnesium",
+  "mn"     = "Manganese",
+  "p"      = "Phosphorus",
+  "zn"     = "Zinc"
+)
+
+# ── Covariate overlap: top-15 per variable heatmap ────────
+top15_per_var <- importance_all %>%
+  filter(!covariate %in% single_bands) %>%
+  group_by(dataset, variable) %>%
+  slice_max(pct_inc_mse, n = 15) %>%
+  ungroup() %>%
+  mutate(in_top15 = TRUE)
+
+overlap_counts <- top15_per_var %>%
+  group_by(covariate, dataset) %>%
+  summarise(n_vars_in_top15 = n(), .groups = "drop") %>%
+  filter(n_vars_in_top15 >= 2)
+
+p_overlap2 <- top15_per_var %>%
+  filter(covariate %in% overlap_counts$covariate) %>%
+  mutate(
+    variable = recode(variable, !!!soil_var_labels),
+    variable = factor(variable,
+                      levels = soil_var_labels)
+  ) %>%
+  ggplot(aes(x = variable, y = covariate,
+             fill = pct_inc_mse)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "magma", direction = -1,
+                        name = "%IncMSE") +
+  facet_wrap(~ dataset) +
+  theme_bw(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title    = "Covariate importance overlap across soil variables",
+    subtitle = "Covariates appearing in top-15 for ≥2 variables (single bands excluded)",
+    x = "Soil variable", y = "Covariate"
+  )
+
+print(p_overlap2)
+write_csv(importance_all,
+          "../outputs/rf_importance_per_variable.csv")
+write_csv(agg_importance,
+          "../outputs/rf_importance_aggregate.csv")
+
+soil_var_labels <- c(
+  "lbc_1"  = "Lime Buffer Capacity",
+  "lb_ceq" = "Lime Buffer Capacity Eq.",
+  "p_h_2"  = "pH",
+  "ca"     = "Calcium (Ca)",
+  "k"      = "Potassium (K)",
+  "mg"     = "Magnesium (Mg)",
+  "mn"     = "Manganese (Mn)",
+  "p"      = "Phosphorus (P)",
+  "zn"     = "Zinc (Zn)"
+)
+
+# ── Soil variable × covariate correlation heatmap ─────────
+# Pearson correlation between each soil variable and each
+# covariate at SP and COMP sampling locations combined.
+# Helps interpret which environmental drivers are most
+# associated with each soil property.
+
+cor_data <- bind_rows(
+  soil_prop_SP   %>% st_drop_geometry() %>% mutate(dataset = "SP"),
+  soil_prop_COMP %>% st_drop_geometry() %>% mutate(dataset = "COMP")
+) %>%
+  select(all_of(soil_vars), all_of(cov_names)) %>%
+  na.omit()
+
+cor_mat <- cor(
+  cor_data %>% select(all_of(soil_vars)),
+  cor_data %>% select(all_of(cov_names)),
+  use = "complete.obs"
+) %>%
+  as.data.frame() %>%
+  rownames_to_column("soil_var") %>%
+  pivot_longer(-soil_var,
+               names_to  = "covariate",
+               values_to = "r") %>%
+    mutate(
+        soil_var  = factor(recode(soil_var, !!!soil_var_labels),
+                           levels = soil_var_labels),
+        covariate = factor(covariate, levels = cov_names)
+      )
+
+p_cor_heatmap <- cor_mat %>%
+  ggplot(aes(x = soil_var, y = covariate, fill = r)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  geom_text(aes(label = ifelse(abs(r) >= 0.30,
+                                sprintf("%.2f", r), "")),
+            size = 2.0, color = "grey10") +
+  scale_fill_gradient2(
+    low      = "#d73027",
+    mid      = "#ffffbf",
+    high     = "#1a9850",
+    midpoint = 0,
+    limits   = c(-1, 1),
+    oob      = scales::squish,
+    name     = "Pearson r"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    axis.text.x      = element_text(angle = 30, hjust = 1,
+                                     size = 8, face = "bold"),
+    axis.text.y      = element_text(size = 7),
+    panel.grid       = element_blank(),
+    legend.position  = "right"
+  ) +
+  labs(
+    title    = "Soil property × covariate correlations",
+    subtitle = "SP and COMP sampling locations combined (n = 272). Values shown where |r| ≥ 0.30",
+    x        = "Soil variable",
+    y        = "Covariate"
+  )
+
+print(p_cor_heatmap)
+ggsave("../outputs/fig_soil_covariate_correlations.png",
+       p_cor_heatmap,
+       width  = 10,
+       height = 14,
+       dpi    = 300)
+write_csv(cor_mat, "../outputs/soil_covariate_correlations.csv")
+```
+
+# ============================================================
+# PHASE 5 — Full-Grid Spatial Prediction
+# ============================================================
+
+```{r grid-prediction}
+grid_df <- as.data.frame(covariate_stack, xy = TRUE, na.rm = TRUE)
+grid_sf <- st_as_sf(grid_df, coords = c("x", "y"), crs = 26917)
+grid_sp <- as(grid_sf, "Spatial")
+
+predict_grid_rf <- function(rf_model, grid_df, predictors) {
+  predict(rf_model, newdata = grid_df %>% select(all_of(predictors)))
+}
+
+predict_grid_ok <- function(ok_obj, grid_sp) {
+  tryCatch({
+    kr <- krige(ok_obj$formula,
+                locations = ok_obj$sp_data,
+                newdata   = grid_sp,
+                model     = ok_obj$fit)
+    kr$var1.pred
+  }, error = function(e) {
+    warning("OK prediction failed; returning NA")
+    rep(NA_real_, nrow(grid_sp@data))
+  })
+}
+
+predict_grid_rk <- function(rk_obj, grid_df, grid_sp, predictors) {
+  trend <- predict(rk_obj$rf_fit,
+                   newdata = grid_df %>% select(all_of(predictors)))
+  resid <- tryCatch({
+    kr2 <- krige(residual ~ 1,
+                 locations = rk_obj$sp_data,
+                 newdata   = grid_sp,
+                 model     = rk_obj$fit_resid)
+    kr2$var1.pred
+  }, error = function(e) rep(0, length(trend)))
+  trend + resid
+}
+
+build_prediction_stack <- function(final_models, grid_df, grid_sf,
+                                    grid_sp, soil_vars, predictors,
+                                    label) {
+  preds <- purrr::map(setNames(soil_vars, soil_vars), function(v) {
+    m <- final_models[[v]]
+    tibble(
+      !!paste0(v, "_RF") := predict_grid_rf(m$rf, grid_df, predictors),
+      !!paste0(v, "_RK") := predict_grid_rk(m$rk, grid_df, grid_sp, predictors),
+      !!paste0(v, "_OK") := predict_grid_ok(m$ok, grid_sp)
+    )
+  }) %>% bind_cols()
+
+  bind_cols(grid_df %>% select(x, y), preds, dataset = label)
+}
+
+pred_stack_SP   <- build_prediction_stack(
+  final_models_SP,   grid_df, grid_sf, grid_sp,
+  soil_vars, cov_names, "SP")
+pred_stack_COMP <- build_prediction_stack(
+  final_models_COMP, grid_df, grid_sf, grid_sp,
+  soil_vars, cov_names, "COMP")
+
+beep("mario")
+save.image("../outputs/workspace_phase4b.RData")
+beep("coin")
+```
+
+# ============================================================
+# PHASE 5b — Spatial Lag Features
+# ============================================================
+
+```{r spatial-lags}
+add_spatial_lags_focal <- function(pred_df, soil_vars, methods,
+                                    crs = "EPSG:26917") {
+  col_names <- as.vector(outer(soil_vars, methods, paste, sep = "_"))
+  col_names <- col_names[col_names %in% names(pred_df)]
+
+  cat("Computing spatial lags via terra::focal for",
+      length(col_names), "layers...\n")
+
+  pred_rast <- pred_df %>%
+    select(x, y, all_of(col_names)) %>%
+    rast(type = "xyz", crs = crs)
+
+  w       <- matrix(1, 3, 3)
+  w[2, 2] <- 0
+  lag_rast <- terra::focal(pred_rast, w = w,
+                            fun = "mean", na.rm = TRUE)
+  names(lag_rast) <- paste0(col_names, "_lag")
+
+  pts    <- terra::vect(pred_df %>% select(x, y),
+                        geom = c("x", "y"), crs = crs)
+  lag_df <- terra::extract(lag_rast, pts, ID = FALSE)
+
+  cat("pred_df rows:", nrow(pred_df),
+      "| lag rows:", nrow(lag_df), "\n")
+  bind_cols(pred_df, lag_df)
+}
+
+pred_stack_SP_lag   <- add_spatial_lags_focal(
+  pred_stack_SP,   soil_vars, c("RF", "RK"))
+pred_stack_COMP_lag <- add_spatial_lags_focal(
+  pred_stack_COMP, soil_vars, c("RF", "RK"))
+
+cat("SP lag stack columns:",   ncol(pred_stack_SP_lag),   "\n")
+cat("COMP lag stack columns:", ncol(pred_stack_COMP_lag), "\n")
+```
+
+# ============================================================
+# PHASE 5c — Uncertainty Analysis
+# ============================================================
+
+```{r uncertainty-analysis}
+# ── 1. Quantile Regression Forest (RF Prediction Intervals) ─
+# QRF extends RF to estimate conditional quantiles.
+# We compute the 10th and 90th percentiles to produce
+# an 80% prediction interval for each grid pixel.
+# Interval width = spatial map of RF prediction uncertainty.
+
+fit_qrf <- function(sf_data, response, predictors, ntree = 500) {
+  df     <- sf_data %>% st_drop_geometry() %>%
+    select(all_of(c(response, predictors))) %>% na.omit()
+  tuning <- tune_rf_oob(df, response, predictors, ntree)
+
+  set.seed(20260401)
+  quantregForest(
+    x    = as.matrix(df %>% select(all_of(predictors))),
+    y    = df[[response]],
+    ntree = ntree,
+    mtry  = tuning$best_mtry
+  )
+}
+
+cat("Fitting QRF models for SP dataset...\n")
+qrf_models_SP <- purrr::map(
+  setNames(soil_vars, soil_vars),
+  ~ fit_qrf(soil_prop_SP, .x, cov_names)
+)
+
+cat("Fitting QRF models for COMP dataset...\n")
+qrf_models_COMP <- purrr::map(
+  setNames(soil_vars, soil_vars),
+  ~ fit_qrf(soil_prop_COMP, .x, cov_names)
+)
+
+# Predict 80% PI to grid
+grid_mat <- as.matrix(grid_df %>% select(all_of(cov_names)))
+
+predict_qrf_grid <- function(qrf_model, grid_mat,
+                              quantiles = c(0.10, 0.90)) {
+  preds <- predict(qrf_model, newdata = grid_mat,
+                   what = quantiles)
+  tibble(
+    pi_lower = preds[, 1],
+    pi_upper = preds[, 2],
+    pi_width = preds[, 2] - preds[, 1]
+  )
+}
+
+qrf_uncertainty_SP <- purrr::map_dfc(
+  setNames(soil_vars, soil_vars), function(v) {
+    p <- predict_qrf_grid(qrf_models_SP[[v]], grid_mat)
+    setNames(p, paste0(v, "_", names(p)))
+  }
+) %>% bind_cols(grid_df %>% select(x, y), .)
+
+qrf_uncertainty_COMP <- purrr::map_dfc(
+  setNames(soil_vars, soil_vars), function(v) {
+    p <- predict_qrf_grid(qrf_models_COMP[[v]], grid_mat)
+    setNames(p, paste0(v, "_", names(p)))
+  }
+) %>% bind_cols(grid_df %>% select(x, y), .)
+
+# ── QRF uncertainty maps — one panel per variable ─────────
+plot_qrf_width <- function(qrf_df, dataset_label) {
+  width_cols <- paste0(soil_vars, "_pi_width")
+  width_cols <- width_cols[width_cols %in% names(qrf_df)]
+
+  qrf_df %>%
+    select(x, y, all_of(width_cols)) %>%
+    pivot_longer(-c(x, y),
+                 names_to  = "variable",
+                 values_to = "pi_width") %>%
+    mutate(variable = str_remove(variable, "_pi_width")) %>%
+    ggplot(aes(x = x, y = y, fill = pi_width)) +
+    geom_raster() +
+    scale_fill_viridis_c(option = "inferno", direction = -1,
+                          name = "PI width\n(80%)") +
+    facet_wrap(~ variable, scales = "free") +
+    theme_minimal(base_size = 9) +
+    labs(
+      title    = paste0("QRF 80% Prediction Interval Width — ",
+                        dataset_label),
+      subtitle = "Wider = higher RF prediction uncertainty",
+      x = "Easting", y = "Northing"
+    )
+}
+
+print(plot_qrf_width(qrf_uncertainty_SP,   "SP"))
+print(plot_qrf_width(qrf_uncertainty_COMP, "COMP"))
+
+write_csv(qrf_uncertainty_SP,
+          "../outputs/qrf_uncertainty_SP.csv")
+write_csv(qrf_uncertainty_COMP,
+          "../outputs/qrf_uncertainty_COMP.csv")
+
+# ── 2. Kriging Variance Surfaces (OK and RK) ──────────────
+# krige() returns var1.var — the kriging variance at each
+# prediction location. This is the geostatistical uncertainty
+# estimate; sqrt(var1.var) = standard error of the kriging
+# prediction. For RK, this is the residual kriging variance.
+
+predict_grid_ok_with_var <- function(ok_obj, grid_sp) {
+  tryCatch({
+    kr <- krige(ok_obj$formula,
+                locations = ok_obj$sp_data,
+                newdata   = grid_sp,
+                model     = ok_obj$fit)
+    tibble(
+      pred = kr$var1.pred,
+      krig_var = kr$var1.var
+    )
+  }, error = function(e) {
+    tibble(pred    = rep(NA_real_, nrow(grid_sp@data)),
+           krig_var = rep(NA_real_, nrow(grid_sp@data)))
+  })
+}
+
+predict_grid_rk_with_var <- function(rk_obj, grid_df,
+                                      grid_sp, predictors) {
+  trend <- predict(rk_obj$rf_fit,
+                   newdata = grid_df %>% select(all_of(predictors)))
+  resid_pred <- tryCatch({
+    kr2 <- krige(residual ~ 1,
+                 locations = rk_obj$sp_data,
+                 newdata   = grid_sp,
+                 model     = rk_obj$fit_resid)
+    tibble(resid = kr2$var1.pred,
+           krig_var = kr2$var1.var)
+  }, error = function(e) {
+    tibble(resid    = rep(0, length(trend)),
+           krig_var = rep(NA_real_, length(trend)))
+  })
+  tibble(
+    pred     = trend + resid_pred$resid,
+    krig_var = resid_pred$krig_var
+  )
+}
+
+krig_var_SP <- purrr::map_dfc(
+  setNames(soil_vars, soil_vars), function(v) {
+    m <- final_models_SP[[v]]
+    ok <- predict_grid_ok_with_var(m$ok, grid_sp)
+    rk <- predict_grid_rk_with_var(m$rk, grid_df, grid_sp, cov_names)
+    tibble(
+      !!paste0(v, "_ok_krig_var") := ok$krig_var,
+      !!paste0(v, "_rk_krig_var") := rk$krig_var
+    )
+  }
+) %>% bind_cols(grid_df %>% select(x, y), .)
+
+krig_var_COMP <- purrr::map_dfc(
+  setNames(soil_vars, soil_vars), function(v) {
+    m <- final_models_COMP[[v]]
+    ok <- predict_grid_ok_with_var(m$ok, grid_sp)
+    rk <- predict_grid_rk_with_var(m$rk, grid_df, grid_sp, cov_names)
+    tibble(
+      !!paste0(v, "_ok_krig_var") := ok$krig_var,
+      !!paste0(v, "_rk_krig_var") := rk$krig_var
+    )
+  }
+) %>% bind_cols(grid_df %>% select(x, y), .)
+
+# ── Kriging SE maps ───────────────────────────────────────
+plot_krig_se <- function(kv_df, dataset_label, method_suffix) {
+  se_cols <- paste0(soil_vars, method_suffix)
+  se_cols <- se_cols[se_cols %in% names(kv_df)]
+
+  kv_df %>%
+    select(x, y, all_of(se_cols)) %>%
+    mutate(across(all_of(se_cols), sqrt)) %>%  # var → SE
+    pivot_longer(-c(x, y),
+                 names_to  = "variable",
+                 values_to = "krig_se") %>%
+    mutate(variable = str_remove(
+      variable, str_escape(method_suffix))) %>%
+    ggplot(aes(x = x, y = y, fill = krig_se)) +
+    geom_raster() +
+    scale_fill_viridis_c(option = "magma", direction = -1,
+                          name = "Kriging SE",
+                          na.value = "grey80") +
+    facet_wrap(~ variable, scales = "free") +
+    theme_minimal(base_size = 9) +
+    labs(
+      title    = paste0("Kriging Standard Error — ",
+                        dataset_label, " (",
+                        str_remove(method_suffix,
+                                   "_krig_var"), ")"),
+      subtitle = "sqrt(kriging variance) at each grid pixel",
+      x = "Easting", y = "Northing"
+    )
+}
+
+print(plot_krig_se(krig_var_SP,   "SP",   "_ok_krig_var"))
+print(plot_krig_se(krig_var_SP,   "SP",   "_rk_krig_var"))
+print(plot_krig_se(krig_var_COMP, "COMP", "_ok_krig_var"))
+print(plot_krig_se(krig_var_COMP, "COMP", "_rk_krig_var"))
+
+write_csv(krig_var_SP,   "../outputs/kriging_variance_SP.csv")
+write_csv(krig_var_COMP, "../outputs/kriging_variance_COMP.csv")
+
+# ── 3. Bootstrap Uncertainty for RF Predictions ───────────
+# Bootstrap resampling of training data (B=100 replicates)
+# to estimate prediction SD at each grid pixel.
+# SD captures the sensitivity of RF predictions to the
+# specific set of training observations used.
+
+bootstrap_rf_uncertainty <- function(sf_data, soil_vars,
+                                      predictors, grid_df,
+                                      B = 100, ntree = 500,
+                                      seed = 20260401) {
+  cat("Bootstrap RF uncertainty (B =", B, "replicates)...\n")
+
+  df_full <- sf_data %>% st_drop_geometry() %>%
+    select(all_of(c(soil_vars, predictors))) %>% na.omit()
+
+  set.seed(seed)
+  boot_preds <- purrr::map(seq_len(B), function(b) {
+    if (b %% 10 == 0) cat(" Bootstrap rep:", b, "/", B, "\n")
+    boot_idx <- sample(nrow(df_full), replace = TRUE)
+    boot_df  <- df_full[boot_idx, ]
+
+    purrr::map_dfc(soil_vars, function(v) {
+      rf_b <- tryCatch({
+        randomForest(
+          x = boot_df %>% select(all_of(predictors)),
+          y = boot_df[[v]],
+          ntree = ntree, mtry = floor(sqrt(length(predictors)))
+        )
+      }, error = function(e) NULL)
+
+      if (is.null(rf_b)) {
+        return(tibble(!!v := rep(NA_real_, nrow(grid_df))))
+      }
+
+      tibble(
+        !!v := predict(rf_b,
+                       newdata = grid_df %>%
+                         select(all_of(predictors)))
+      )
+    })
+  })
+
+  # Compute SD across bootstrap replicates per pixel
+  purrr::map_dfc(soil_vars, function(v) {
+    boot_mat <- do.call(cbind, purrr::map(boot_preds, ~ .x[[v]]))
+    tibble(
+      !!paste0(v, "_boot_sd")   := apply(boot_mat, 1,
+                                          sd, na.rm = TRUE),
+      !!paste0(v, "_boot_mean") := apply(boot_mat, 1,
+                                          mean, na.rm = TRUE)
+    )
+  }) %>%
+    bind_cols(grid_df %>% select(x, y), .)
+}
+
+# B=100 replicates — increase to 500 for publication
+cat("Running bootstrap for SP dataset...\n")
+boot_uncertainty_SP   <- bootstrap_rf_uncertainty(
+  soil_prop_SP,   soil_vars, cov_names, grid_df, B = 100)
+
+cat("Running bootstrap for COMP dataset...\n")
+boot_uncertainty_COMP <- bootstrap_rf_uncertainty(
+  soil_prop_COMP, soil_vars, cov_names, grid_df, B = 100)
+
+# ── Bootstrap SD maps ─────────────────────────────────────
+plot_boot_sd <- function(boot_df, dataset_label) {
+  sd_cols <- paste0(soil_vars, "_boot_sd")
+  sd_cols <- sd_cols[sd_cols %in% names(boot_df)]
+
+  boot_df %>%
+    select(x, y, all_of(sd_cols)) %>%
+    pivot_longer(-c(x, y),
+                 names_to  = "variable",
+                 values_to = "boot_sd") %>%
+    mutate(variable = str_remove(variable, "_boot_sd")) %>%
+    ggplot(aes(x = x, y = y, fill = boot_sd)) +
+    geom_raster() +
+    scale_fill_viridis_c(option = "rocket", direction = -1,
+                          name = "Bootstrap SD") +
+    facet_wrap(~ variable, scales = "free") +
+    theme_minimal(base_size = 9) +
+    labs(
+      title    = paste0("RF Bootstrap Uncertainty (B=100) — ",
+                        dataset_label),
+      subtitle = "SD of predictions across 100 bootstrap replicates",
+      x = "Easting", y = "Northing"
+    )
+}
+
+print(plot_boot_sd(boot_uncertainty_SP,   "SP"))
+print(plot_boot_sd(boot_uncertainty_COMP, "COMP"))
+
+write_csv(boot_uncertainty_SP,
+          "../outputs/bootstrap_uncertainty_SP.csv")
+write_csv(boot_uncertainty_COMP,
+          "../outputs/bootstrap_uncertainty_COMP.csv")
+
+# ── 4. Zone Assignment Uncertainty (membership probability) ─
+# Already computed within HDBSCAN — handled in Phase 6b.
+# Membership probability ∈ [0,1]: 1 = core cluster member,
+# 0 = peripherally assigned (borderline pixel).
+# Noise pixels assigned by NN have membership_prob = 0.
+# Reported spatially and summarised per zone below.
+# See plot_confidence() in Phase 6b for spatial maps.
+
+# ── Uncertainty comparison summary ────────────────────────
+# Side-by-side comparison of uncertainty magnitude by method
+uncertainty_summary <- bind_rows(
+  # QRF mean PI width
+  qrf_uncertainty_SP %>%
+    select(x, y, ends_with("_pi_width")) %>%
+    pivot_longer(-c(x, y),
+                 names_to = "variable", values_to = "value") %>%
+    mutate(variable  = str_remove(variable, "_pi_width"),
+           method    = "QRF 80% PI width",
+           dataset   = "SP"),
+
+  qrf_uncertainty_COMP %>%
+    select(x, y, ends_with("_pi_width")) %>%
+    pivot_longer(-c(x, y),
+                 names_to = "variable", values_to = "value") %>%
+    mutate(variable = str_remove(variable, "_pi_width"),
+           method   = "QRF 80% PI width",
+           dataset  = "COMP"),
+
+  # Bootstrap SD
+  boot_uncertainty_SP %>%
+    select(x, y, ends_with("_boot_sd")) %>%
+    pivot_longer(-c(x, y),
+                 names_to = "variable", values_to = "value") %>%
+    mutate(variable = str_remove(variable, "_boot_sd"),
+           method   = "Bootstrap SD",
+           dataset  = "SP"),
+
+  boot_uncertainty_COMP %>%
+    select(x, y, ends_with("_boot_sd")) %>%
+    pivot_longer(-c(x, y),
+                 names_to = "variable", values_to = "value") %>%
+    mutate(variable = str_remove(variable, "_boot_sd"),
+           method   = "Bootstrap SD",
+           dataset  = "COMP")
+) %>%
+  group_by(variable, method, dataset) %>%
+  summarise(
+    mean_unc   = round(mean(value,   na.rm = TRUE), 3),
+    median_unc = round(median(value, na.rm = TRUE), 3),
+    .groups    = "drop"
+  )
+
+print(uncertainty_summary, n = 40)
+write_csv(uncertainty_summary,
+          "../outputs/uncertainty_summary.csv")
+
+beep("wilhelm")
+save.image("../outputs/workspace_uncertainty.RData")
+#ERROR:
+#Per-variable interpretation:
+
+  # pH — bootstrap SD ~0.07–0.10, PI width ~0.9–1.1. Very tight, makes sense — pH varies narrowly at field scale and RF predicts it well
+  # P — bootstrap SD ~2–3, PI width ~20–23. Low uncertainty relative to the other nutrients, consistent with P often being spatially structured by management history
+  # K — moderate uncertainty, COMP tighter than SP which is expected given composite sampling smooths local variability
+  # Ca and lb_ceq — largest absolute uncertainty, which makes sense as these are highly variable and correlated with soil texture and organic matter gradients
+#The SP > COMP pattern for most variables is also exactly what I expect w/ composite samples average over a larger area so the RF trained on them sees less local noise, producing tighter predictions.
+
+#P flips the pattern (COMP SD slightly higher than SP). That's worth a sentence in my methods ...it may reflect that composite sampling obscures real P spatial structure that single-point sampling captures, since P is often highly localized around application history.
+# Kriging SE summary — OK
+bind_rows(
+  krig_var_SP %>%
+    select(ends_with("_ok_krig_var")) %>%
+    summarise(across(everything(), list(
+      mean   = ~ mean(sqrt(.), na.rm = TRUE),
+      median = ~ median(sqrt(.), na.rm = TRUE)))) %>%
+    pivot_longer(everything()) %>%
+    mutate(dataset = "SP", method = "OK kriging SE"),
+
+  krig_var_COMP %>%
+    select(ends_with("_ok_krig_var")) %>%
+    summarise(across(everything(), list(
+      mean   = ~ mean(sqrt(.), na.rm = TRUE),
+      median = ~ median(sqrt(.), na.rm = TRUE)))) %>%
+    pivot_longer(everything()) %>%
+    mutate(dataset = "COMP", method = "OK kriging SE"),
+
+  krig_var_SP %>%
+    select(ends_with("_rk_krig_var")) %>%
+    summarise(across(everything(), list(
+      mean   = ~ mean(sqrt(.), na.rm = TRUE),
+      median = ~ median(sqrt(.), na.rm = TRUE)))) %>%
+    pivot_longer(everything()) %>%
+    mutate(dataset = "SP", method = "RK kriging SE"),
+
+  krig_var_COMP %>%
+    select(ends_with("_rk_krig_var")) %>%
+    summarise(across(everything(), list(
+      mean   = ~ mean(sqrt(.), na.rm = TRUE),
+      median = ~ median(sqrt(.), na.rm = TRUE)))) %>%
+    pivot_longer(everything()) %>%
+    mutate(dataset = "COMP", method = "RK kriging SE")
+) %>%
+  mutate(
+    variable = str_extract(name, paste(soil_vars, collapse = "|")),
+    stat     = if_else(str_detect(name, "_mean"), "mean", "median")
+  ) %>%
+  select(variable, stat, dataset, method, value) %>%
+  arrange(variable, method, dataset, stat) 
+
+# FINAL UNCERTAINTY SUMMARY:
+# SP > COMP for most variables (SP higher uncertainty), except P (COMP slightly higher)
+# OK > RK > RF in uncertainty magnitude
+# HOWEVER — these are not apples-to-apples comparisons:
+#   - OK SE is purely geometry-driven (data configuration)
+#   - RK SE is residual kriging component only (incomplete — missing RF trend uncertainty)
+#   - RF bootstrap SD captures training data sensitivity only
+# RK total uncertainty = RF trend uncertainty + residual kriging variance (neither alone is complete)
+# All three are complementary, not directly comparable on the same scale
+
+```
+
+# ============================================================
+# PHASE 6 — UMAP + HDBSCAN Management Zone Delineation
+# ============================================================
+
+```{r umap-hdbscan}
+run_umap_hdbscan <- function(pred_df,
+                              methods          = c("RF", "RK"),
+                              soil_vars,
+                              include_lags     = FALSE,
+                              n_components     = 2,
+                              min_dist         = 0.001,
+                              n_neighbors      = 30,
+                              minPts           = 50,
+                              cluster_eps      = 0,
+                              label            = "dataset") {
+
+  col_names <- as.vector(outer(soil_vars, methods, paste, sep = "_"))
+  if (include_lags) {
+    lag_cols  <- paste0(col_names, "_lag")
+    col_names <- c(col_names, lag_cols[lag_cols %in% names(pred_df)])
+  }
+  col_names <- col_names[col_names %in% names(pred_df)]
+
+  mat           <- pred_df %>% select(all_of(col_names)) %>% as.matrix()
+  complete_rows <- complete.cases(mat)
+  mat_clean     <- mat[complete_rows, ]
+  xy_clean      <- pred_df %>% select(x, y) %>% slice(which(complete_rows))
+
+  cat(label, "— pixels:", nrow(mat_clean),
+      "| cols:", ncol(mat_clean),
+      "| lags:", include_lags, "\n")
+
+  # Zero-variance guard
+  col_ranges <- apply(mat_clean, 2, function(x)
+                      diff(range(x, na.rm = TRUE)))
+  zero_var   <- col_ranges < 1e-10
+
+  if (any(zero_var)) {
+    cat("Warning: dropping", sum(zero_var), "constant column(s):",
+        paste(colnames(mat_clean)[zero_var], collapse = ", "), "\n")
+    mat_clean <- mat_clean[, !zero_var, drop = FALSE]
+  }
+
+  if (ncol(mat_clean) < 2) {
+    cat("ERROR: fewer than 2 valid columns for", label, "\n")
+    return(NULL)
+  }
+
+  mat_scaled <- scale(mat_clean)
+  mat_scaled[!is.finite(mat_scaled)] <- 0
+  stopifnot("NA values remain" = !anyNA(mat_scaled))
+
+  cat("Fitting UMAP...\n")
+  umap_fit <- uwot::umap(
+    mat_scaled,
+    n_components = n_components,
+    min_dist     = min_dist,
+    n_neighbors  = n_neighbors,
+    ret_model    = TRUE,
+    seed         = 20260401,
+    verbose      = TRUE
+  )
+
+  emb_df        <- as.data.frame(umap_fit$embedding)
+  names(emb_df) <- paste0("UMAP", seq_len(n_components))
+
+  hdbscan_sample_size <- min(nrow(emb_df), 10000)
+  set.seed(20260401)
+  sample_idx <- sort(sample(nrow(emb_df), hdbscan_sample_size))
+  emb_sample <- emb_df[sample_idx, ]
+
+  cat("Running HDBSCAN on subsample of", hdbscan_sample_size,
+      "points...\n")
+  hdb_fit <- dbscan::hdbscan(
+    as.matrix(emb_sample),
+    minPts                    = minPts,
+    cluster_selection_epsilon = cluster_eps
+  )
+
+  cat("Clusters on subsample:", max(hdb_fit$cluster),
+      "| noise:", round(mean(hdb_fit$cluster == 0) * 100, 1), "%\n")
+
+  nn_assign     <- FNN::get.knnx(
+    data  = as.matrix(emb_sample),
+    query = as.matrix(emb_df),
+    k     = 1
+  )
+  full_clusters <- hdb_fit$cluster[nn_assign$nn.index[, 1]]
+  full_memb     <- hdb_fit$membership_prob[nn_assign$nn.index[, 1]]
+
+  cat("Full grid — zones:", max(full_clusters),
+      "| noise:", round(mean(full_clusters == 0) * 100, 1), "%\n")
+
+  bind_cols(
+    xy_clean, emb_df,
+    tibble(cluster_hard    = full_clusters,
+           membership_prob = full_memb)
+  ) %>%
+    mutate(
+      dataset      = label,
+      spatial_lags = include_lags,
+      zone         = if_else(cluster_hard == 0L, NA_integer_,
+                             as.integer(cluster_hard))
+    )
+}
+
+wrap_mz_result <- function(df) {
+  if (is.data.frame(df)) {
+    zones <- df$zone[!is.na(df$zone)]
+    return(list(result_df   = df,
+                n_zones     = length(unique(zones)),
+                pct_noise   = mean(is.na(df$zone)) * 100,
+                umap_fit    = NULL,
+                hdbscan_fit = NULL))
+  }
+  zones <- df$result_df$zone[!is.na(df$result_df$zone)]
+  df$n_zones   <- length(unique(zones))
+  df$pct_noise <- mean(is.na(df$result_df$zone)) * 100
+  df
+}
+
+# ── 10 UMAP+HDBSCAN runs ──────────────────────────────────
+mz_SP_RF_nolags <- run_umap_hdbscan(
+  pred_stack_SP, methods = "RF", soil_vars = soil_vars,
+  include_lags = FALSE, label = "SP_RF_nolags")
+
+mz_SP_RF_lags <- run_umap_hdbscan(
+  pred_stack_SP_lag, methods = "RF", soil_vars = soil_vars,
+  include_lags = TRUE, label = "SP_RF_lags")
+
+mz_SP_RK_nolags <- run_umap_hdbscan(
+  pred_stack_SP, methods = "RK", soil_vars = soil_vars,
+  include_lags = FALSE, label = "SP_RK_nolags")
+
+mz_SP_RK_lags <- run_umap_hdbscan(
+  pred_stack_SP_lag, methods = "RK", soil_vars = soil_vars,
+  include_lags = TRUE, label = "SP_RK_lags")
+
+mz_SP_OK_nolags <- run_umap_hdbscan(
+  pred_stack_SP, methods = "OK", soil_vars = soil_vars,
+  include_lags = FALSE, label = "SP_OK_nolags")
+
+mz_COMP_RF_nolags <- run_umap_hdbscan(
+  pred_stack_COMP, methods = "RF", soil_vars = soil_vars,
+  include_lags = FALSE, label = "COMP_RF_nolags")
+
+mz_COMP_RF_lags <- run_umap_hdbscan(
+  pred_stack_COMP_lag, methods = "RF", soil_vars = soil_vars,
+  include_lags = TRUE, label = "COMP_RF_lags")
+
+mz_COMP_RK_nolags <- run_umap_hdbscan(
+  pred_stack_COMP, methods = "RK", soil_vars = soil_vars,
+  include_lags = FALSE, label = "COMP_RK_nolags")
+
+mz_COMP_RK_lags <- run_umap_hdbscan(
+  pred_stack_COMP_lag, methods = "RK", soil_vars = soil_vars,
+  include_lags = TRUE, label = "COMP_RK_lags")
+
+mz_COMP_OK_nolags <- run_umap_hdbscan(
+  pred_stack_COMP, methods = "OK", soil_vars = soil_vars,
+  include_lags = FALSE, label = "COMP_OK_nolags")
+
+save.image("../outputs/workspace_phase6_complete.RData")
+beep("mario")
+
+mz_named_tuned <- list(
+  SP_RF_nolags   = wrap_mz_result(mz_SP_RF_nolags),
+  SP_RF_lags     = wrap_mz_result(mz_SP_RF_lags),
+  SP_RK_nolags   = wrap_mz_result(mz_SP_RK_nolags),
+  SP_RK_lags     = wrap_mz_result(mz_SP_RK_lags),
+  SP_OK_nolags   = wrap_mz_result(mz_SP_OK_nolags),
+  COMP_RF_nolags = wrap_mz_result(mz_COMP_RF_nolags),
+  COMP_RF_lags   = wrap_mz_result(mz_COMP_RF_lags),
+  COMP_RK_nolags = wrap_mz_result(mz_COMP_RK_nolags),
+  COMP_RK_lags   = wrap_mz_result(mz_COMP_RK_lags),
+  COMP_OK_nolags = wrap_mz_result(mz_COMP_OK_nolags)
+)
+
+purrr::imap(mz_named_tuned, function(x, nm) {
+  cat(nm, "| zones:", x$n_zones,
+      "| noise:", round(x$pct_noise, 1), "%\n")
+})
+```
+
+# ============================================================
+# PHASE 6c — HDBSCAN Retuning
+# ============================================================
+
+```{r hdbscan-retune}
+retune_hdbscan <- function(mz_obj, minPts_new,
+                            cluster_eps = 0,
+                            hdbscan_n   = 10000,
+                            label       = NULL) {
+
+  emb_df       <- mz_obj$result_df %>% select(UMAP1, UMAP2)
+  xy_clean     <- mz_obj$result_df %>% select(x, y)
+  spatial_lags <- mz_obj$result_df$spatial_lags[1]
+  lbl          <- if (!is.null(label)) label else
+                    mz_obj$result_df$dataset[1]
+
+  set.seed(20260401)
+  sample_idx <- sort(sample(nrow(emb_df),
+                             min(hdbscan_n, nrow(emb_df))))
+  emb_sample <- emb_df[sample_idx, ]
+
+  cat("Retuning:", lbl, "| minPts =", minPts_new, "...\n")
+  hdb_fit <- dbscan::hdbscan(
+    as.matrix(emb_sample),
+    minPts                    = minPts_new,
+    cluster_selection_epsilon = cluster_eps
+  )
+
+  nn_assign     <- FNN::get.knnx(
+    data  = as.matrix(emb_sample),
+    query = as.matrix(emb_df),
+    k     = 1
+  )
+  full_clusters <- hdb_fit$cluster[nn_assign$nn.index[, 1]]
+  full_memb     <- hdb_fit$membership_prob[nn_assign$nn.index[, 1]]
+
+  result_df <- bind_cols(
+    xy_clean, emb_df,
+    tibble(cluster_hard = full_clusters,
+           membership_prob = full_memb)
+  ) %>%
+    mutate(dataset      = lbl,
+           spatial_lags = spatial_lags,
+           zone         = if_else(cluster_hard == 0L,
+                                  NA_integer_,
+                                  as.integer(cluster_hard)))
+
+  list(result_df   = result_df,
+       hdbscan_fit = hdb_fit,
+       n_zones     = length(unique(full_clusters[full_clusters != 0])),
+       pct_noise   = mean(full_clusters == 0) * 100)
+}
+
+# ── Sensitivity scan ──────────────────────────────────────
+minpts_candidates <- c(50, 100, 200, 400, 600, 800, 1000)
+
+sensitivity_results <- purrr::map_dfr(minpts_candidates, function(mp) {
+  purrr::map_dfr(names(mz_named_tuned), function(nm) {
+    r <- retune_hdbscan(mz_named_tuned[[nm]], mp, label = nm)
+    tibble(label = nm, minPts = mp,
+           n_zones = r$n_zones, pct_noise = round(r$pct_noise, 1))
+  })
+})
+
+sensitivity_results %>%
+  select(label, minPts, n_zones) %>%
+  pivot_wider(names_from = label, values_from = n_zones) %>%
+  arrange(minPts) %>%
+  print(width = Inf)
+
+# Set minPts after reviewing sensitivity table
+minpts_final <- list(
+  SP_RF_nolags   = 200,
+  SP_RF_lags     = 200,
+  SP_RK_nolags   = 200,
+  SP_RK_lags     = 200,
+  SP_OK_nolags   = 200,
+  COMP_RF_nolags = 200,
+  COMP_RF_lags   = 200,
+  COMP_RK_nolags = 200,
+  COMP_RK_lags   = 200,
+  COMP_OK_nolags = 200
+)
+
+mz_named_source <- mz_named_tuned  # snapshot before overwriting
+
+mz_named_tuned <- purrr::imap(minpts_final, function(mp, nm) {
+  retune_hdbscan(mz_named_source[[nm]], mp, label = nm)
+})
+
+purrr::imap(mz_named_tuned, function(x, nm) {
+  cat(nm, "| zones:", x$n_zones,
+      "| noise:", round(x$pct_noise, 1), "%\n")
+})
+
+save.image("../outputs/workspace_phase6c_retuned.RData")
+beep("coin")
+```
+
+# ============================================================
+# PHASE 6b — Post-processing + Zone Uncertainty Summary
+# ============================================================
+
+```{r post-processing}
+post_process_zones <- function(result_df, zone_rast_crs = "EPSG:26917") {
+  n_total <- nrow(result_df)
+  n_noise <- sum(is.na(result_df$zone))
+  cat("Noise pixels before fill:", n_noise,
+      "(", round(100 * n_noise / n_total, 1), "% of field)\n")
+
+  if (n_noise == n_total) {
+    cat("WARNING: all pixels are noise — no zones found.\n")
+    return(list(result_df_filled = result_df,
+                zone_rast_raw    = NULL,
+                zone_rast_smooth = NULL))
+  }
+
+  assigned  <- result_df %>% filter(!is.na(zone))
+  noise_pts <- result_df %>% filter( is.na(zone))
+
+  if (nrow(noise_pts) > 0) {
+    nn_idx <- FNN::get.knnx(
+      data  = assigned  %>% select(UMAP1, UMAP2) %>% as.matrix(),
+      query = noise_pts %>% select(UMAP1, UMAP2) %>% as.matrix(),
+      k     = 1
+    )$nn.index
+    noise_pts$zone            <- assigned$zone[nn_idx]
+    noise_pts$membership_prob <- 0
+    result_df <- bind_rows(assigned, noise_pts)
+  }
+
+  cat("Noise pixels after fill: 0\n")
+
+  zone_rast        <- result_df %>%
+    select(x, y, zone) %>%
+    rast(type = "xyz", crs = zone_rast_crs)
+  zone_rast_smooth <- focal(zone_rast, w = 5,
+                             fun = "modal", na.rm = TRUE)
+
+  changed <- sum(values(zone_rast) != values(zone_rast_smooth),
+                 na.rm = TRUE)
+  cat("Pixels reassigned by majority filter:", changed,
+      "(", round(100 * changed / n_total, 1), "% of field)\n")
+
+  list(result_df_filled = result_df,
+       zone_rast_raw    = zone_rast,
+       zone_rast_smooth = zone_rast_smooth)
+}
+
+pp_named <- purrr::imap(mz_named_tuned, function(x, nm) {
+  cat("\n---", nm, "---\n")
+  post_process_zones(x$result_df)
+})
+
+write_zone_raster <- function(pp_obj, path) {
+  if (is.null(pp_obj$zone_rast_smooth)) {
+    cat("Skipping", path, "— no zones\n")
+    return(invisible(NULL))
+  }
+  writeRaster(pp_obj$zone_rast_smooth, path, overwrite = TRUE)
+  cat("Saved:", path, "\n")
+}
+
+purrr::iwalk(pp_named, function(pp, nm) {
+  write_zone_raster(pp, paste0("../outputs/zones_", nm, "_smooth.tif"))
+})
+
+# ── UMAP / spatial zone / confidence plots ────────────────
+plot_umap_zones <- function(res, title) {
+  res$result_df %>%
+    ggplot(aes(UMAP1, UMAP2, color = factor(zone),
+               alpha = membership_prob)) +
+    geom_point(size = 0.4) +
+    scale_alpha_continuous(range = c(0.2, 1)) +
+    theme_minimal() +
+    labs(title = title, color = "Zone",
+         alpha = "Membership\nconfidence") +
+    guides(color = guide_legend(
+      override.aes = list(size = 3, alpha = 1)))
+}
+
+plot_spatial_zones <- function(res, title) {
+  res$result_df %>%
+    filter(!is.na(zone)) %>%
+    ggplot(aes(x, y, fill = factor(zone))) +
+    geom_raster() + coord_equal() + theme_minimal() +
+    labs(title = title, fill = "Zone",
+         x = "Easting", y = "Northing")
+}
+
+plot_confidence <- function(res, title) {
+  res$result_df %>%
+    ggplot(aes(x, y, fill = membership_prob)) +
+    geom_raster() +
+    scale_fill_viridis_c(option = "magma", direction = -1) +
+    coord_equal() + theme_minimal() +
+    labs(title = title, fill = "Confidence",
+         x = "Easting", y = "Northing")
+}
+
+purrr::iwalk(mz_named_tuned, function(x, nm) {
+  print(plot_umap_zones(x,    paste("UMAP —", nm)))
+  print(plot_spatial_zones(x, paste("Zones —", nm)))
+  print(plot_confidence(x,    paste("Confidence —", nm)))
+})
+
+# ── Zone assignment uncertainty summary per config ────────
+# Summarises membership probability distribution per zone
+# to flag zones with high proportions of low-confidence
+# (noise-filled) pixels.
+
+zone_membership_summary <- purrr::imap_dfr(mz_named_tuned,
+  function(x, nm) {
+    x$result_df %>%
+      mutate(zone = if_else(is.na(zone),
+                            as.integer(-1L), zone)) %>%
+      group_by(zone) %>%
+      summarise(
+        n_pixels          = n(),
+        mean_memb_prob    = round(mean(membership_prob,
+                                       na.rm = TRUE), 3),
+        pct_low_conf      = round(
+          100 * mean(membership_prob < 0.3,
+                     na.rm = TRUE), 1),
+        .groups = "drop"
+      ) %>%
+      mutate(configuration = nm)
+  }
+)
+
+print(zone_membership_summary, n = 40)
+write_csv(zone_membership_summary,
+          "../outputs/zone_membership_uncertainty.csv")
+```
+
+# ============================================================
+# PHASE 7 — Baseline Comparison: PCA + k-means
+# ============================================================
+
+```{r pca-kmeans-baseline}
+run_pca_kmeans <- function(pred_df, methods = c("RF", "RK"),
+                            soil_vars, k_range = 2:8,
+                            label = "dataset") {
+  col_names     <- as.vector(outer(soil_vars, methods, paste, sep = "_"))
+  col_names     <- col_names[col_names %in% names(pred_df)]
+  mat           <- pred_df %>% select(all_of(col_names)) %>% as.matrix()
+  complete_rows <- complete.cases(mat)
+  xy_clean      <- pred_df %>% select(x, y) %>%
+    slice(which(complete_rows))
+
+  mat_scaled <- scale(mat[complete_rows, ])
+  col_ranges <- apply(mat_scaled, 2, function(x)
+                       diff(range(x, na.rm = TRUE)))
+  const_cols <- !is.finite(mat_scaled[1, ]) | col_ranges < 1e-10
+  if (any(const_cols)) {
+    cat("Dropping", sum(const_cols), "constant column(s):",
+        paste(colnames(mat_scaled)[const_cols], collapse = ", "), "\n")
+    mat_scaled <- mat_scaled[, !const_cols, drop = FALSE]
+  }
+  mat_scaled[!is.finite(mat_scaled)] <- 0
+
+  pca_out    <- prcomp(mat_scaled, center = FALSE, scale. = FALSE)
+  cum_var    <- cumsum(pca_out$sdev^2) / sum(pca_out$sdev^2)
+  n_comp     <- which(cum_var >= 0.95)[1]
+  pca_scores <- pca_out$x[, seq_len(n_comp), drop = FALSE]
+
+  set.seed(20260401)
+  sil_idx <- sample(nrow(pca_scores), min(5000, nrow(pca_scores)))
+  pca_sub <- pca_scores[sil_idx, ]
+
+  sil_scores <- purrr::map_dbl(k_range, function(k) {
+    set.seed(20260401)
+    km  <- kmeans(pca_sub, centers = k,
+                  nstart = 25, iter.max = 100)
+    sil <- cluster::silhouette(km$cluster, dist(pca_sub))
+    mean(sil[, 3])
+  })
+  best_k <- k_range[which.max(sil_scores)]
+  cat(label, "— best k:", best_k, "\n")
+
+  set.seed(20260401)
+  km_best <- kmeans(pca_scores, centers = best_k,
+                    nstart = 25, iter.max = 100)
+
+  result_df <- bind_cols(
+    xy_clean,
+    tibble(zone_kmeans = km_best$cluster)
+  ) %>% mutate(dataset = label, method = "PCA_kmeans")
+
+  list(result_df   = result_df,
+       pca         = pca_out,
+       km          = km_best,
+       sil_profile = tibble(k = k_range, silhouette = sil_scores),
+       best_k      = best_k)
+}
+
+baseline_SP_RF        <- run_pca_kmeans(pred_stack_SP,   "RF", soil_vars, label = "SP_RF")
+baseline_SP_RK        <- run_pca_kmeans(pred_stack_SP,   "RK", soil_vars, label = "SP_RK")
+baseline_SP_OK        <- run_pca_kmeans(pred_stack_SP,   "OK", soil_vars, label = "SP_OK")
+baseline_COMP_RF      <- run_pca_kmeans(pred_stack_COMP, "RF", soil_vars, label = "COMP_RF")
+baseline_COMP_RK      <- run_pca_kmeans(pred_stack_COMP, "RK", soil_vars, label = "COMP_RK")
+baseline_COMP_OK      <- run_pca_kmeans(pred_stack_COMP, "OK", soil_vars, label = "COMP_OK")
+baseline_SP_RF_lags   <- run_pca_kmeans(pred_stack_SP_lag,   "RF", soil_vars, label = "SP_RF_lags_kmeans")
+baseline_SP_RK_lags   <- run_pca_kmeans(pred_stack_SP_lag,   "RK", soil_vars, label = "SP_RK_lags_kmeans")
+baseline_COMP_RF_lags <- run_pca_kmeans(pred_stack_COMP_lag, "RF", soil_vars, label = "COMP_RF_lags_kmeans")
+baseline_COMP_RK_lags <- run_pca_kmeans(pred_stack_COMP_lag, "RK", soil_vars, label = "COMP_RK_lags_kmeans")
+
+# Silhouette profiles
+bind_rows(
+  baseline_SP_RF$sil_profile        %>% mutate(config = "SP_RF"),
+  baseline_SP_RK$sil_profile        %>% mutate(config = "SP_RK"),
+  baseline_SP_OK$sil_profile        %>% mutate(config = "SP_OK"),
+  baseline_COMP_RF$sil_profile      %>% mutate(config = "COMP_RF"),
+  baseline_COMP_RK$sil_profile      %>% mutate(config = "COMP_RK"),
+  baseline_COMP_OK$sil_profile      %>% mutate(config = "COMP_OK"),
+  baseline_SP_RF_lags$sil_profile   %>% mutate(config = "SP_RF_lags"),
+  baseline_SP_RK_lags$sil_profile   %>% mutate(config = "SP_RK_lags"),
+  baseline_COMP_RF_lags$sil_profile %>% mutate(config = "COMP_RF_lags"),
+  baseline_COMP_RK_lags$sil_profile %>% mutate(config = "COMP_RK_lags")
+) %>%
+  ggplot(aes(x = k, y = silhouette, color = config)) +
+  geom_line() + geom_point() +
+  theme_minimal() +
+  labs(title = "PCA+k-means silhouette profiles",
+       x = "k", y = "Mean silhouette")
+```
+
+```{r pca-kmeans-postprocess}
+post_process_kmeans <- function(result_df,
+                                 zone_rast_crs = "EPSG:26917") {
+  n_total   <- nrow(result_df)
+  zone_rast <- result_df %>%
+    select(x, y, zone = zone_kmeans) %>%
+    rast(type = "xyz", crs = zone_rast_crs)
+
+  zone_rast_smooth <- focal(zone_rast, w = 5,
+                             fun = "modal", na.rm = TRUE)
+  changed <- sum(values(zone_rast) != values(zone_rast_smooth),
+                 na.rm = TRUE)
+  cat("PCA+kmeans: pixels reassigned by majority filter:", changed,
+      "(", round(100 * changed / n_total, 1), "%)\n")
+
+  list(result_df_filled = result_df %>% mutate(zone = zone_kmeans),
+       zone_rast_raw    = zone_rast,
+       zone_rast_smooth = zone_rast_smooth)
+}
+
+pp_baseline <- list(
+  SP_RF          = post_process_kmeans(baseline_SP_RF$result_df),
+  SP_RK          = post_process_kmeans(baseline_SP_RK$result_df),
+  SP_OK          = post_process_kmeans(baseline_SP_OK$result_df),
+  COMP_RF        = post_process_kmeans(baseline_COMP_RF$result_df),
+  COMP_RK        = post_process_kmeans(baseline_COMP_RK$result_df),
+  COMP_OK        = post_process_kmeans(baseline_COMP_OK$result_df),
+  SP_RF_lags     = post_process_kmeans(baseline_SP_RF_lags$result_df),
+  SP_RK_lags     = post_process_kmeans(baseline_SP_RK_lags$result_df),
+  COMP_RF_lags   = post_process_kmeans(baseline_COMP_RF_lags$result_df),
+  COMP_RK_lags   = post_process_kmeans(baseline_COMP_RK_lags$result_df)
+)
+
+purrr::iwalk(pp_baseline, function(pp, nm) {
+  writeRaster(pp$zone_rast_smooth,
+              paste0("../outputs/zones_", nm, "_kmeans_smooth.tif"),
+              overwrite = TRUE)
+  cat("Saved:", nm, "\n")
+})
+```
+
+# ============================================================
+# PHASE 8 — Zone Validation Metrics
+# ============================================================
+
+```{r zone-validation}
+calc_variance_reduction <- function(pred_df, zone_vec,
+                                     soil_vars, methods) {
+  col_names  <- as.vector(outer(soil_vars, methods, paste, sep = "_"))
+  col_names  <- col_names[col_names %in% names(pred_df)]
+  mat        <- pred_df %>% select(all_of(col_names)) %>% as.matrix()
+  col_ranges <- apply(mat, 2, function(x)
+                       diff(range(x, na.rm = TRUE)))
+  mat        <- mat[, col_ranges > 1e-10, drop = FALSE]
+
+  keep      <- !is.na(zone_vec) & complete.cases(mat)
+  mat_k     <- mat[keep, ]
+  zones_k   <- zone_vec[keep]
+  total_var <- mean(apply(mat_k, 2, var, na.rm = TRUE))
+  within_var <- mean(sapply(unique(zones_k), function(z) {
+    mean(apply(mat_k[zones_k == z, , drop = FALSE],
+               2, var, na.rm = TRUE))
+  }))
+  1 - (within_var / total_var)
+}
+
+calc_silhouette_sub <- function(emb_df, zone_vec, n_sub = 5000) {
+  keep  <- !is.na(zone_vec)
+  emb_k <- emb_df[keep, ]
+  z_k   <- zone_vec[keep]
+  set.seed(20260401)
+  idx   <- sample(nrow(emb_k), min(n_sub, nrow(emb_k)))
+  sil   <- cluster::silhouette(z_k[idx], dist(emb_k[idx, ]))
+  mean(sil[, 3])
+}
+
+# UMAP VR + silhouette
+zone_validation_umap <- purrr::imap_dfr(mz_named_tuned,
+  function(x, nm) {
+    parts  <- strsplit(nm, "_")[[1]]
+    samp   <- parts[1]; method <- parts[2]
+    lag_yn <- length(parts) >= 3 && parts[3] == "lags"
+
+    pred_df <- switch(paste0(samp, "_", method),
+      SP_RF   = pred_stack_SP,   SP_RK = pred_stack_SP,
+      SP_OK   = pred_stack_SP,   COMP_RF = pred_stack_COMP,
+      COMP_RK = pred_stack_COMP, COMP_OK = pred_stack_COMP)
+
+    tibble(
+      configuration = nm, sampling = samp,
+      pred_method   = method, lags = lag_yn,
+      approach      = "UMAP+HDBSCAN",
+      VR = calc_variance_reduction(
+        pred_df, x$result_df$zone, soil_vars, method),
+      silhouette = calc_silhouette_sub(
+        x$result_df %>% select(UMAP1, UMAP2),
+        x$result_df$zone)
+    )
+  })
+
+# PCA+kmeans VR + silhouette
+baseline_list <- list(
+  SP_RF               = baseline_SP_RF,
+  SP_RK               = baseline_SP_RK,
+  SP_OK               = baseline_SP_OK,
+  COMP_RF             = baseline_COMP_RF,
+  COMP_RK             = baseline_COMP_RK,
+  COMP_OK             = baseline_COMP_OK,
+  SP_RF_lags_kmeans   = baseline_SP_RF_lags,
+  SP_RK_lags_kmeans   = baseline_SP_RK_lags,
+  COMP_RF_lags_kmeans = baseline_COMP_RF_lags,
+  COMP_RK_lags_kmeans = baseline_COMP_RK_lags
+)
+
+zone_validation_pca <- purrr::imap_dfr(baseline_list,
+  function(b, nm) {
+    clean   <- str_remove(nm, "_kmeans")
+    has_lag <- str_detect(clean, "_lags")
+    clean   <- str_remove(clean, "_lags")
+    parts   <- strsplit(clean, "_")[[1]]
+    samp    <- parts[1]; method <- parts[2]
+
+    pred_df <- switch(paste0(samp, "_", method),
+      SP_RF   = if (has_lag) pred_stack_SP_lag   else pred_stack_SP,
+      SP_RK   = if (has_lag) pred_stack_SP_lag   else pred_stack_SP,
+      SP_OK   = pred_stack_SP,
+      COMP_RF = if (has_lag) pred_stack_COMP_lag else pred_stack_COMP,
+      COMP_RK = if (has_lag) pred_stack_COMP_lag else pred_stack_COMP,
+      COMP_OK = pred_stack_COMP)
+
+    ok_cols <- pred_df %>%
+      select(any_of(paste0(soil_vars, "_", method))) %>% na.omit()
+    col_vars <- apply(ok_cols, 2, var, na.rm = TRUE)
+    ok_cols  <- ok_cols[, col_vars > 1e-10, drop = FALSE]
+
+    tibble(
+      configuration = nm, sampling = samp,
+      pred_method   = method, lags = has_lag,
+      approach      = "PCA+kmeans",
+      VR = calc_variance_reduction(
+        pred_df, b$result_df$zone_kmeans, soil_vars, method),
+      silhouette = calc_silhouette_sub(
+        prcomp(scale(ok_cols), center = FALSE)$x[, 1:2],
+        b$result_df$zone_kmeans)
+    )
+  })
+
+zone_validation_all <- bind_rows(zone_validation_umap,
+                                   zone_validation_pca) %>%
+  arrange(sampling, pred_method, lags, approach)
+
+print(zone_validation_all)
+write_csv(zone_validation_all,
+          "../outputs/zone_validation_metrics.csv")
+```
+
+# ============================================================
+# PHASE 8b — Agronomic Validation (held-out ap_val_sf)
+# ============================================================
+
+```{r agronomic-validation}
+# Load validate_zones_with_holdout from Chapter 1 workspace
+validate_zones_with_holdout <- function(zone_rast_smooth, val_sf,
+                                        pred_stack, soil_vars,
+                                        methods = c("RF", "RK"),
+                                        label = "dataset") {
+
+  # ── 1. Extract zone for each validation point ─────────────
+  val_vect    <- terra::vect(val_sf)
+  val_zone    <- terra::extract(zone_rast_smooth, val_vect)
+  val_sf$zone <- val_zone[, 2]
+
+  n_assigned  <- sum(!is.na(val_sf$zone))
+  cat(label, "— validation points with zone assignment:",
+      n_assigned, "of", nrow(val_sf), "\n")
+
+# Replace step 2 inside validate_zones_with_holdout
+
+  # ── 2. Per-zone summary of PREDICTED values ───────────────
+  col_names <- as.vector(outer(soil_vars, methods, paste, sep = "_"))
+  col_names <- col_names[col_names %in% names(pred_stack)]
+
+  # Extract zone from smoothed raster at pred_stack coordinates
+  # rather than joining by x/y — avoids floating point mismatch
+  pred_pts  <- terra::vect(
+    pred_stack %>% select(x, y),
+    geom = c("x", "y"), crs = "EPSG:26917"
+  )
+  pred_zone_extract <- terra::extract(zone_rast_smooth, pred_pts, ID = FALSE)
+  pred_stack_zoned  <- pred_stack %>%
+    mutate(zone = pred_zone_extract[[1]])
+
+  zone_profiles <- pred_stack_zoned %>%
+    filter(!is.na(zone)) %>%
+    group_by(zone) %>%
+    summarise(across(all_of(col_names), mean, na.rm = TRUE),
+              .groups = "drop")
+
+  # ── 3. Compare observed val points to zone predicted means ─
+  val_long <- val_sf %>%
+    st_drop_geometry() %>%
+    filter(!is.na(zone)) %>%
+    select(zone, all_of(soil_vars)) %>%
+    pivot_longer(-zone, names_to = "variable", values_to = "obs")
+
+  # FIX: use the actual method suffix, not hardcoded "_RF"
+  method_suffix <- paste0("_", methods[1])   # "_RF" or "_RK"
+
+  pred_long <- zone_profiles %>%
+    select(zone, ends_with(method_suffix)) %>%
+    pivot_longer(-zone, names_to = "col", values_to = "pred_zone_mean") %>%
+    mutate(variable = str_remove(col, method_suffix)) %>%
+    select(zone, variable, pred_zone_mean)
+
+  comparison <- val_long %>%
+    left_join(pred_long, by = c("zone", "variable")) %>%
+    group_by(zone, variable) %>%
+    summarise(
+      n_val_pts      = n(),
+      mean_obs       = mean(obs,                        na.rm = TRUE),
+      pred_zone_mean = first(pred_zone_mean),
+      bias           = mean(obs - pred_zone_mean,       na.rm = TRUE),
+      rmse_vs_zone   = sqrt(mean((obs - pred_zone_mean)^2, na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    mutate(dataset = label)
+
+  # ── 4. Kruskal-Wallis: do zones differ in observed values? ─
+  kw_results <- purrr::map_dfr(soil_vars, function(v) {
+    df <- val_sf %>%
+      st_drop_geometry() %>%
+      filter(!is.na(zone), !is.na(.data[[v]])) %>%
+      select(zone, value = all_of(v))
+
+    if (length(unique(df$zone)) < 2 || nrow(df) < 5) {
+      return(tibble(variable = v, kw_p = NA_real_, dataset = label))
+    }
+
+    kt <- kruskal.test(value ~ factor(zone), data = df)
+    tibble(variable = v, kw_p = kt$p.value, dataset = label)
+  })
+
+  list(
+    comparison     = comparison,
+    kw_results     = kw_results,
+    val_with_zones = val_sf
+  )
+}
+get_pred_stack <- function(nm) {
+  clean   <- nm %>%
+    str_remove("_kmeans") %>%
+    str_remove("_nolags") %>%
+    str_remove("_lags")
+  parts   <- strsplit(clean, "_")[[1]]
+  samp    <- parts[1]; method <- parts[2]
+  has_lag <- str_detect(nm, "_lags")
+
+  pred_df <- switch(paste0(samp, "_", method),
+    SP_RF   = if (has_lag) pred_stack_SP_lag   else pred_stack_SP,
+    SP_RK   = if (has_lag) pred_stack_SP_lag   else pred_stack_SP,
+    SP_OK   = pred_stack_SP,
+    COMP_RF = if (has_lag) pred_stack_COMP_lag else pred_stack_COMP,
+    COMP_RK = if (has_lag) pred_stack_COMP_lag else pred_stack_COMP,
+    COMP_OK = pred_stack_COMP)
+
+  list(pred_df = pred_df, method = method,
+       samp = samp, has_lag = has_lag)
+}
+
+# validate_zones_with_holdout() — must already be defined
+# in workspace or sourced separately.
+
+val_umap <- purrr::imap(pp_named, function(pp, nm) {
+  if (is.null(pp$zone_rast_smooth)) {
+    cat(nm, "— skipped (no zones)\n"); return(NULL)
+  }
+  cfg <- get_pred_stack(nm)
+  cat("\n--- UMAP+HDBSCAN:", nm, "---\n")
+  validate_zones_with_holdout(
+    pp$zone_rast_smooth, ap_val_sf,
+    cfg$pred_df, soil_vars,
+    methods = cfg$method, label = nm)
+})
+val_umap <- val_umap[!sapply(val_umap, is.null)]
+
+val_kmeans <- purrr::imap(pp_baseline, function(pp, nm) {
+  if (is.null(pp$zone_rast_smooth)) {
+    cat(nm, "— skipped (no zones)\n"); return(NULL)
+  }
+  cfg <- get_pred_stack(nm)
+  cat("\n--- PCA+kmeans:", nm, "---\n")
+  validate_zones_with_holdout(
+    pp$zone_rast_smooth, ap_val_sf,
+    cfg$pred_df, soil_vars,
+    methods = cfg$method,
+    label   = paste0(nm, "_kmeans"))
+})
+val_kmeans <- val_kmeans[!sapply(val_kmeans, is.null)]
+
+# Add OK configs missed in original loop
+# val_ok_missing <- list(
+#   SP_OK_nolags   = validate_zones_with_holdout(
+#     pp_named[["SP_OK_nolags"]]$zone_rast_smooth,
+#     ap_val_sf, pred_stack_SP, soil_vars,
+#     methods = "OK", label = "SP_OK_nolags"),
+#   COMP_OK_nolags = validate_zones_with_holdout(
+#     pp_named[["COMP_OK_nolags"]]$zone_rast_smooth,
+#     ap_val_sf, pred_stack_COMP, soil_vars,
+#     methods = "OK", label = "COMP_OK_nolags")
+# )
+
+val_named <- val_umap  # all 10 configs including OK
+all_val   <- c(val_named, val_kmeans)
+
+all_kw <- purrr::map_dfr(all_val, ~ .x$kw_results) %>%
+  mutate(
+    significant = kw_p < 0.05,
+    approach    = if_else(str_detect(dataset, "_kmeans"),
+                          "PCA+kmeans", "UMAP+HDBSCAN"),
+    clean       = dataset %>%
+                    str_remove("_kmeans") %>%
+                    str_remove("_nolags") %>%
+                    str_remove("_lags"),
+    sampling    = str_extract(clean, "^(SP|COMP)"),
+    pred_method = str_extract(clean, "(RF|RK|OK)"),
+    lags        = str_detect(dataset, "_lags")
+  ) %>%
+  select(-clean)
+
+all_comparisons      <- purrr::map_dfr(val_umap,   ~ .x$comparison)
+all_comparisons_pca  <- purrr::map_dfr(val_kmeans, ~ .x$comparison)
+all_comparisons_full <- bind_rows(all_comparisons, all_comparisons_pca)
+
+kw_summary <- all_kw %>%
+  group_by(dataset, approach, sampling, pred_method, lags) %>%
+  summarise(
+    n_significant   = sum(significant, na.rm = TRUE),
+    n_total         = n(),
+    pct_significant = round(100 * mean(significant, na.rm = TRUE)),
+    sig_vars        = paste(variable[significant], collapse = ", "),
+    .groups         = "drop"
+  ) %>%
+  arrange(approach, sampling, pred_method, lags)
+
+print(kw_summary, n = 30)
+write_csv(all_kw,      "../outputs/zone_kruskal_wallis_all.csv")
+write_csv(kw_summary,  "../outputs/kw_summary_all.csv")
+```
+
+# ============================================================
+# PHASE 8c — Per-Variable Observed VR + Effect Sizes
+# ============================================================
+
+```{r observed-vr-and-effect-sizes}
+calc_zone_consistency <- function(val_with_zones,
+                                   soil_vars, label) {
+  df <- val_with_zones %>%
+    st_drop_geometry() %>%
+    filter(!is.na(zone)) %>%
+    select(zone, all_of(soil_vars)) %>%
+    na.omit()
+
+  if (nrow(df) < 5 || length(unique(df$zone)) < 2) {
+    return(tibble(configuration = label,
+                  observed_VR_mean = NA_real_,
+                  observed_VR_med  = NA_real_,
+                  n_pos_VR         = NA_integer_))
+  }
+
+  total_var_vec <- df %>%
+    select(all_of(soil_vars)) %>%
+    summarise(across(everything(),
+                     ~ var(.x, na.rm = TRUE))) %>%
+    unlist()
+
+  per_var_vr <- purrr::map_dbl(soil_vars, function(v) {
+    within_var <- df %>%
+      group_by(zone) %>%
+      summarise(wv = var(.data[[v]], na.rm = TRUE),
+                .groups = "drop") %>%
+      pull(wv) %>%
+      mean(na.rm = TRUE)
+    1 - (within_var / total_var_vec[[v]])
+  })
+  names(per_var_vr) <- soil_vars
+
+  tibble(configuration    = label,
+         observed_VR_mean = round(mean(per_var_vr,   na.rm = TRUE), 3),
+         observed_VR_med  = round(median(per_var_vr, na.rm = TRUE), 3),
+         n_pos_VR         = sum(per_var_vr > 0, na.rm = TRUE))
+}
+
+obs_vr_all <- bind_rows(
+  purrr::imap_dfr(val_named,  ~ calc_zone_consistency(
+    .x$val_with_zones, soil_vars, .y)) %>%
+    rename(config_join = configuration),
+  purrr::imap_dfr(val_kmeans, ~ calc_zone_consistency(
+    .x$val_with_zones, soil_vars, paste0(.y, "_kmeans"))) %>%
+    rename(config_join = configuration)
+)
+
+# Zone prediction RMSE
+zone_pred_rmse <- all_comparisons_full %>%
+  filter(!is.na(rmse_vs_zone)) %>%
+  group_by(dataset) %>%
+  summarise(
+    mean_zone_rmse   = round(mean(rmse_vs_zone,   na.rm = TRUE), 3),
+    median_zone_rmse = round(median(rmse_vs_zone, na.rm = TRUE), 3),
+    .groups          = "drop"
+  ) %>%
+  rename(config_join = dataset)
+
+# R²
+zone_r2 <- all_comparisons_full %>%
+  filter(!is.na(pred_zone_mean), !is.na(mean_obs)) %>%
+  group_by(dataset) %>%
+  summarise(
+    r2_obs_pred = round(
+      cor(mean_obs, pred_zone_mean, use = "complete.obs")^2, 3),
+    .groups = "drop"
+  ) %>%
+  rename(config_join = dataset)
+
+# Per-variable observed VR for heatmap
+obs_vr_by_var_all <- bind_rows(
+  purrr::imap_dfr(val_named, function(x, nm) {
+    df <- x$val_with_zones %>% st_drop_geometry() %>%
+      filter(!is.na(zone)) %>%
+      select(zone, all_of(soil_vars)) %>% na.omit()
+    if (nrow(df) < 5 || length(unique(df$zone)) < 2) return(NULL)
+    tv <- df %>% select(all_of(soil_vars)) %>%
+      summarise(across(everything(), ~ var(.x, na.rm = TRUE))) %>%
+      unlist()
+    purrr::map_dfr(soil_vars, function(v) {
+      wv <- df %>% group_by(zone) %>%
+        summarise(wv = var(.data[[v]], na.rm = TRUE), .groups = "drop") %>%
+        pull(wv) %>% mean(na.rm = TRUE)
+      tibble(configuration = nm, variable = v,
+             obs_VR = round(1 - wv / tv[[v]], 3))
+    })
+  }),
+  purrr::imap_dfr(val_kmeans, function(x, nm) {
+    df <- x$val_with_zones %>% st_drop_geometry() %>%
+      filter(!is.na(zone)) %>%
+      select(zone, all_of(soil_vars)) %>% na.omit()
+    if (nrow(df) < 5 || length(unique(df$zone)) < 2) return(NULL)
+    tv <- df %>% select(all_of(soil_vars)) %>%
+      summarise(across(everything(), ~ var(.x, na.rm = TRUE))) %>%
+      unlist()
+    purrr::map_dfr(soil_vars, function(v) {
+      wv <- df %>% group_by(zone) %>%
+        summarise(wv = var(.data[[v]], na.rm = TRUE), .groups = "drop") %>%
+        pull(wv) %>% mean(na.rm = TRUE)
+      tibble(configuration = paste0(nm, "_kmeans"), variable = v,
+             obs_VR = round(1 - wv / tv[[v]], 3))
+    })
+  })
+)
+
+# Supplementary heatmap
+p_obs_vr <- obs_vr_by_var_all %>%
+  left_join(
+    bind_rows(
+      zone_validation_umap %>%
+        select(configuration, clustering = approach),
+      zone_validation_pca  %>%
+        mutate(configuration = if_else(
+          !str_detect(configuration, "_kmeans"),
+          paste0(configuration, "_kmeans"),
+          configuration)) %>%
+        select(configuration, clustering = approach)
+    ),
+    by = "configuration"
+  ) %>%
+  mutate(
+    config_label = str_replace_all(
+      configuration,
+      c("_nolags" = "", "_lags" = "+lags",
+            "_kmeans" = "",  "COMP_" = "COMP/", "SP_" = "SP/")),
+              clustering = if_else(
+                is.na(clustering),
+                if_else(str_detect(configuration, "_kmeans"),
+                        "PCA+kmeans",
+                        "UMAP+HDBSCAN"), clustering),
+    approach   = factor(clustering,
+                        levels = c("PCA+kmeans", "UMAP+HDBSCAN"))
+  ) %>%
+  ggplot(aes(x = config_label, y = variable, fill = obs_VR)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.2f", obs_VR)),
+            size = 2.2) +
+  facet_wrap(~ approach, scales = "free_x") +
+  scale_fill_gradient2(
+    low = "#d73027", mid = "#ffffbf", high = "#1a9850",
+    midpoint = 0, limits = c(-1, 1),
+    oob  = scales::squish, name = "Observed VR"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(axis.text.x      = element_text(angle = 45, hjust = 1, size = 7),
+        strip.background = element_rect(fill = "grey92"),
+        strip.text       = element_text(face = "bold"),
+        panel.grid       = element_blank()) +
+  labs(
+    title    = "Supplementary Figure S1. Per-variable observed variance reduction",
+    subtitle = "Held-out validation points (n = 59), fully independent of prediction surfaces",
+    x = NULL, y = "Soil variable"
+  )
+
+print(p_obs_vr)
+ggsave("../outputs/figS1_observed_vr_heatmap.png",
+       p_obs_vr, width = 12, height = 4, dpi = 300)
+write_csv(obs_vr_by_var_all,
+          "../outputs/observed_vr_per_variable.csv")
+```
+
+# ============================================================
+# Final Summary + Results Table
+# ============================================================
+
+```{r final-summary-and-table}
+# ── Build summary tables ───────────────────────────────────
+summary_umap <- purrr::imap_dfr(mz_named_tuned, function(x, nm) {
+  parts  <- strsplit(nm, "_")[[1]]
+  samp   <- parts[1]; method <- parts[2]
+  lag_yn <- length(parts) >= 3 && parts[3] == "lags"
+  tibble(configuration     = nm,
+         clustering        = "UMAP+HDBSCAN",
+         sampling_design   = ifelse(samp == "SP",
+                                    "Single-point", "Composite"),
+         pred_method       = method,
+         spatial_lags      = lag_yn,
+         minPts_used       = minpts_final[[nm]],
+         n_zones           = x$n_zones,
+         pct_noise_prefill = round(x$pct_noise, 1))
+}) %>%
+  left_join(
+    all_kw %>% filter(approach == "UMAP+HDBSCAN") %>%
+      group_by(dataset) %>%
+      summarise(n_sig_vars = sum(significant, na.rm = TRUE),
+                sig_vars   = paste(variable[significant], collapse = ", "),
+                .groups    = "drop") %>%
+      rename(configuration = dataset),
+    by = "configuration"
+  ) %>%
+  mutate(
+    n_sig_vars = replace_na(n_sig_vars, 0L),
+    sig_vars   = replace_na(sig_vars,   "none"),
+    sig_vars   = ifelse(sig_vars == "" | is.na(sig_vars), "none", sig_vars)
+  ) %>%
+  left_join(
+    zone_validation_all %>% filter(approach == "UMAP+HDBSCAN") %>%
+      select(configuration, VR, silhouette),
+    by = "configuration"
+  )
+
+summary_pca <- purrr::imap_dfr(baseline_list, function(b, nm) {
+  clean   <- str_remove(nm, "_kmeans")
+  has_lag <- str_detect(clean, "_lags")
+  clean   <- str_remove(clean, "_lags")
+  parts   <- strsplit(clean, "_")[[1]]
+  samp    <- parts[1]; method <- parts[2]
+  tibble(configuration     = nm,
+         clustering        = "PCA+kmeans",
+         sampling_design   = ifelse(samp == "SP",
+                                    "Single-point", "Composite"),
+         pred_method       = method,
+         spatial_lags      = has_lag,
+         minPts_used       = NA_real_,
+         n_zones           = b$best_k,
+         pct_noise_prefill = 0)
+}) %>%
+  left_join(
+    all_kw %>% filter(approach == "PCA+kmeans") %>%
+      group_by(dataset) %>%
+      summarise(n_sig_vars = sum(significant, na.rm = TRUE),
+                sig_vars   = paste(variable[significant], collapse = ", "),
+                .groups    = "drop") %>%
+      rename(configuration = dataset),
+    by = "configuration"
+  ) %>%
+  mutate(
+    n_sig_vars = replace_na(n_sig_vars, 0L),
+    sig_vars   = replace_na(sig_vars,   "none"),
+    sig_vars   = ifelse(sig_vars == "" | is.na(sig_vars), "none", sig_vars)
+  ) %>%
+  left_join(
+    zone_validation_all %>% filter(approach == "PCA+kmeans") %>%
+      select(configuration, VR, silhouette),
+    by = "configuration"
+  )
+
+# ── Join all metrics ───────────────────────────────────────
+final_summary <- bind_rows(summary_umap, summary_pca) %>%
+  mutate(
+    config_join = case_when(
+      clustering == "PCA+kmeans" &
+        !str_detect(configuration, "_kmeans") ~
+        paste0(configuration, "_kmeans"),
+      TRUE ~ configuration
+    ),
+    sig_vars = ifelse(sig_vars == "" | is.na(sig_vars),
+                      "none", sig_vars)
+  ) %>%
+  left_join(zone_pred_rmse, by = "config_join") %>%
+  left_join(obs_vr_all,     by = "config_join") %>%
+  left_join(zone_r2 %>% select(config_join, r2_obs_pred),
+            by = "config_join") %>%
+  select(-config_join)
+
+# ── Composite ranking ─────────────────────────────────────
+final_ranked <- final_summary %>%
+  mutate(
+    vr_rank     = rank(-VR,              na.last = "keep"),
+    sil_rank    = rank(-silhouette,      na.last = "keep"),
+    kw_rank     = rank(-n_sig_vars,      na.last = "keep"),
+    rmse_rank   = rank(median_zone_rmse, na.last = "keep"),
+    obs_vr_rank = rank(-observed_VR_med, na.last = "keep"),
+    npos_rank   = rank(-n_pos_VR,        na.last = "keep"),
+    r2_rank     = rank(-r2_obs_pred,     na.last = "keep"),
+    Rank        = round(vr_rank + sil_rank + kw_rank +
+                          rmse_rank + obs_vr_rank +
+                          npos_rank + r2_rank, 1)
+  ) %>%
+  select(configuration, Rank)
+
+cat("\n=== Composite ranking — all configurations ===\n")
+final_summary %>%
+  left_join(final_ranked, by = "configuration") %>%
+  arrange(Rank) %>%
+  select(configuration, clustering, VR, silhouette,
+         n_sig_vars, median_zone_rmse,
+         observed_VR_med, n_pos_VR, r2_obs_pred, Rank) %>%
+  mutate(across(where(is.double), ~ round(.x, 3))) %>%
+  print(n = 20)
+
+write_csv(final_summary,
+          "../outputs/final_results_summary_complete.csv")
+
+# ── gt Results Table ───────────────────────────────────────
+table_data <- final_summary %>%
+  left_join(final_ranked, by = "configuration") %>%
+  mutate(
+    Approach  = clustering,
+    Sampling  = ifelse(sampling_design == "Single-point",
+                       "SP", "COMP"),
+    Method    = pred_method,
+    Lags      = ifelse(spatial_lags, "Yes", "No"),
+    Zones     = n_zones,
+    VR_pred   = round(VR,               3),
+    Sil       = round(silhouette,       3),
+    N_sig     = n_sig_vars,
+    RMSE_zone = round(median_zone_rmse, 1),
+    VR_obs    = round(observed_VR_med,  3),
+    N_pos     = n_pos_VR,
+    R2        = round(r2_obs_pred,      3)
+  ) %>%
+  select(Approach, Sampling, Method, Lags, Zones,
+         VR_pred, Sil, N_sig, RMSE_zone,
+         VR_obs, N_pos, R2, Rank) %>%
+  arrange(Approach, Sampling, Method, Lags)
+
+best <- list(
+  VR_pred   = max(table_data$VR_pred,   na.rm = TRUE),
+  Sil       = max(table_data$Sil,       na.rm = TRUE),
+  N_sig     = max(table_data$N_sig,     na.rm = TRUE),
+  RMSE_zone = min(table_data$RMSE_zone, na.rm = TRUE),
+  VR_obs    = max(table_data$VR_obs,    na.rm = TRUE),
+  N_pos     = max(table_data$N_pos,     na.rm = TRUE),
+  R2        = max(table_data$R2,        na.rm = TRUE),
+  Rank      = min(table_data$Rank,      na.rm = TRUE)
+)
+
+tbl <- table_data %>%
+  gt(groupname_col = "Approach") %>%
+  cols_label(
+    Sampling  = "Sampling",   Method    = "Pred. method",
+    Lags      = "Lags",       Zones     = md("*k*"),
+    VR_pred   = md("VR~pred~"), Sil     = "Silhouette",
+    N_sig     = md("*N*~sig~"), RMSE_zone = md("RMSE~zone~"),
+    VR_obs    = md("VR~obs~ (median)"),
+    N_pos     = md("*N*~pos~"), R2      = md("*R*²"),
+    Rank      = "Rank"
+  ) %>%
+  tab_spanner(label = md("**Configuration**"),
+              columns = c(Sampling, Method, Lags, Zones)) %>%
+  tab_spanner(
+    label   = md("**Zone structure** *(all grid pixels)*"),
+    columns = c(VR_pred, Sil)) %>%
+  tab_spanner(
+    label   = md("**Agronomic validation** *(held-out, n = 59)*"),
+    columns = c(N_sig, RMSE_zone, VR_obs, N_pos, R2)) %>%
+  tab_spanner(label = md("**Overall**"), columns = Rank) %>%
+  tab_style(
+    style     = list(cell_fill(color = "#d6eaf8"),
+                     cell_text(weight = "bold")),
+    locations = cells_body(
+      rows = Sampling == "COMP" & Method == "RF" &
+               Lags == "Yes" & Approach == "UMAP+HDBSCAN")
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#fde8e8"),
+    locations = cells_body(columns = VR_obs,
+                           rows = !is.na(VR_obs) & VR_obs < 0)
+  ) %>%
+  tab_style(
+    style     = cell_text(color = "#c0392b"),
+    locations = cells_body(columns = VR_obs,
+                           rows = !is.na(VR_obs) & VR_obs < 0)
+  ) %>%
+  fmt_missing(columns = everything(), missing_text = "—") %>%
+  fmt_number(columns = c(VR_pred, Sil, VR_obs, R2), decimals = 3) %>%
+  fmt_number(columns = RMSE_zone, decimals = 1) %>%
+  fmt_number(columns = Rank,      decimals = 1) %>%
+  fmt_integer(columns = c(Zones, N_sig, N_pos)) %>%
+  tab_caption(
+    md("**Table 1.** Zone quality metrics for all 20 management zone configurations (5-variable agronomic subset: LB-Ceq, pH, Ca, K, P). SP = single-point; COMP = composite; RF = random forest; RK = regression kriging; OK = ordinary kriging. *k* = zones after post-processing. Blue row = best overall configuration. Red = negative VR~obs~.")
+  ) %>%
+  tab_options(
+    table.font.size                   = px(11),
+    column_labels.font.size           = px(11),
+    table.width                       = pct(100),
+    data_row.padding                  = px(4),
+    table.border.top.style            = "solid",
+    table.border.top.width            = px(2),
+    table.border.top.color            = "#2c3e50",
+    column_labels.border.bottom.style = "solid",
+    column_labels.border.bottom.width = px(1),
+    column_labels.border.bottom.color = "#7f8c8d"
+  )
+
+tbl
+gt::gtsave(tbl, "../outputs/table1_zone_metrics.html")
+cat("Table saved.\n")
+
+save.image("../outputs/workspace_final.RData")
+beep("complete")
+
+#UMAP is more sensitive to variable reduction than PCA+kmeans — PCA+kmeans performance is relatively stable across both variable sets, while UMAP configurations shift substantially. This makes sense because UMAP's manifold learning is more dependent on the full multivariate structure of the input space
+# Lag augmentation loses its benefit — COMP_RF_lags was your Chapter 1 winner but drops to 0 sig vars here. The spatial lag features may have been capturing structure in the dropped variables (lbc_1, mn, zn) more than in the agronomic subset
+# SP configurations become more competitive — SP_RF_nolags and SP_RK_nolags now match or beat COMP configs on n_sig, suggesting composite sampling's advantage diminishes when the variable set is reduced
+# The best agronomic config is SP_RF_nolags or SP_RK_nolags with 3 significant variables each
+```
+
+# ============================================================
+# PHASE 9 — Three-panel thesis figure
+# ============================================================
+
+```{r thesis-figure}
+fig_data <- final_summary %>%
+  left_join(final_ranked, by = "configuration") %>%
+  mutate(
+    x_group = factor(
+      paste0(pred_method, ifelse(spatial_lags, "+lags", "")),
+      levels = c("RF", "RF+lags", "RK", "RK+lags", "OK")
+    ),
+    sampling_f   = factor(sampling_design,
+                          levels = c("Single-point", "Composite")),
+    clustering_f = factor(clustering,
+                          levels = c("PCA+kmeans", "UMAP+HDBSCAN"))
+  )
+
+clust_colors <- c("PCA+kmeans"   = "#4E9AF1",
+                  "UMAP+HDBSCAN" = "#E05C3A")
+lag_alpha    <- c("No lags" = 0.5, "With lags" = 1.0)
+
+lag_aes <- aes(
+  x     = x_group,
+  fill  = clustering_f,
+  alpha = factor(spatial_lags,
+                 levels = c(FALSE, TRUE),
+                 labels = c("No lags", "With lags"))
+)
+
+base_theme <- theme_bw(base_size = 9) +
+  theme(
+    legend.position    = "none",
+    strip.background   = element_rect(fill = "grey92"),
+    strip.text         = element_text(size = 8, face = "bold"),
+    axis.text.x        = element_text(size = 7, angle = 30, hjust = 1),
+    panel.grid.major.x = element_blank()
+  )
+
+pA <- fig_data %>%
+  ggplot(lag_aes) + aes(y = VR) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_hline(yintercept = 0.40, linetype = "dashed",
+             color = "grey50", linewidth = 0.4) +
+  facet_wrap(~ sampling_f) +
+  scale_fill_manual(values = clust_colors, name = "Clustering") +
+  scale_alpha_manual(values = lag_alpha, name = "Spatial lags") +
+  scale_y_continuous(limits = c(0, 0.85), breaks = seq(0, 0.8, 0.2)) +
+  labs(title = "A).  Variance Reduction",
+       subtitle = "Higher = zones more internally homogeneous",
+       x = NULL, y = "VR") +
+  base_theme
+
+pB <- fig_data %>%
+  ggplot(lag_aes) + aes(y = silhouette) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_hline(yintercept = 0.50, linetype = "dashed",
+             color = "grey50", linewidth = 0.4) +
+  facet_wrap(~ sampling_f) +
+  scale_fill_manual(values = clust_colors, name = "Clustering") +
+  scale_alpha_manual(values = lag_alpha, name = "Spatial lags") +
+  scale_y_continuous(limits = c(0, 0.65), breaks = seq(0, 0.6, 0.2)) +
+  labs(title = "B).  Silhouette Coefficient",
+       subtitle = "Higher = zones more spatially distinct",
+       x = NULL, y = "Silhouette") +
+  base_theme
+
+pC <- fig_data %>%
+  ggplot(lag_aes) + aes(y = n_sig_vars) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_text(aes(label = ifelse(n_sig_vars > 0,
+                                as.character(n_sig_vars), "")),
+            position = position_dodge(0.8),
+            vjust = -0.4, size = 2.5, color = "grey30") +
+  facet_wrap(~ sampling_f) +
+  scale_fill_manual(values = clust_colors, name = "Clustering") +
+  scale_alpha_manual(values = lag_alpha, name = "Spatial lags") +
+  scale_y_continuous(breaks = 0:5,
+                     limits = c(0, length(soil_vars) + 0.5)) +
+  labs(title = paste0("C). Significant Soil Properties (of ",
+                       length(soil_vars), ") (KW, p < 0.05)"),
+       subtitle = "Validation points: n = 59",
+       x = "Prediction method",
+       y = "# of properties significant") +
+  base_theme
+
+# Shared legend
+legend_plot <- fig_data %>%
+  ggplot(lag_aes) + aes(y = VR) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  scale_fill_manual(values = clust_colors, name = "Clustering") +
+  scale_alpha_manual(values = lag_alpha,   name = "Spatial lags") +
+  theme_bw(base_size = 9) +
+  theme(legend.position  = "bottom",
+        legend.box       = "horizontal",
+        legend.title     = element_text(size = 8, face = "bold"),
+        legend.text      = element_text(size = 8),
+        legend.key.size  = unit(0.4, "cm"))
+
+shared_legend <- cowplot::get_legend(legend_plot)
+
+fig_combined <- cowplot::plot_grid(
+  pA / pB / pC,
+  shared_legend,
+  ncol    = 1,
+  rel_heights = c(10, 1)
+)
+
+print(fig_combined)
+ggsave("../outputs/fig_zone_quality_metrics.png",
+       fig_combined, width = 9, height = 11, dpi = 300)
+cat("Figure saved.\n")
+```
+
+```{r}
+# For a given config, correlate each soil var prediction with UMAP coords
+umap_contributions <- purrr::map_dfr(soil_vars, function(v) {
+  pred_col <- paste0(v, "_RF")  # or _RK, _OK
+  umap_df  <- mz_named_tuned[["COMP_RF_lags"]]$result_df
+  
+  pred_vals <- pred_stack_COMP_lag %>%
+    filter(complete.cases(.)) %>%
+    pull(pred_col)
+  
+  tibble(
+    variable = v,
+    cor_UMAP1 = cor(pred_vals, umap_df$UMAP1, use = "complete.obs"),
+    cor_UMAP2 = cor(pred_vals, umap_df$UMAP2, use = "complete.obs")
+  )
+})
+print(umap_contributions)
+
+# Drop one variable at a time, rerun UMAP, record VR
+loo_results <- purrr::map_dfr(soil_vars, function(drop_var) {
+  vars_subset <- soil_vars[soil_vars != drop_var]
+  
+  mz <- run_umap_hdbscan(
+    pred_stack_COMP_lag,
+    methods      = "RF",
+    soil_vars    = vars_subset,
+    include_lags = TRUE,
+    label        = paste0("drop_", drop_var)
+  )
+  
+  pp <- post_process_zones(mz)
+  vr <- calc_variance_reduction(
+    pred_stack_COMP_lag, mz$zone, vars_subset, "RF")
+  
+  tibble(dropped = drop_var, n_vars = length(vars_subset), VR = vr)
+})
+print(loo_results)
+
+pred_cols <- paste0(soil_vars, "_RF")
+
+pca_contributions <- pred_stack_COMP %>%
+  select(all_of(pred_cols)) %>%
+  na.omit() %>%
+  scale() %>%
+  prcomp()
+
+# Loadings on first 2 PCs
+loadings <- as.data.frame(pca_contributions$rotation[, 1:2]) %>%
+  rownames_to_column("variable") %>%
+  mutate(variable = str_remove(variable, "_RF"),
+         loading_magnitude = sqrt(PC1^2 + PC2^2)) %>%
+  arrange(desc(loading_magnitude))
+
+print(umap_contributions)
+print(loo_results)
+print(loadings)
+# pH and K are the primary drivers of zone structure (UMAP1), while the broad fertility variables (Ca, Mg, P, lb_ceq) collectively define UMAP2. Zn and Ca may be candidates for exclusion in future work as they appear to add noise rather than structure — but removing the full agronomic subset simultaneously collapsed both axes, explaining the Chapter 2 performance drop.
+```
+```{r}
+#pH vs P availability:
+bind_rows(
+  soil_prop_SP   %>% st_drop_geometry() %>% mutate(dataset = "Single-Point"),
+  soil_prop_COMP %>% st_drop_geometry() %>% mutate(dataset = "Composite")
+) %>%
+  mutate(dataset = factor(dataset, levels = c("Single-Point", "Composite"))) %>%
+  ggplot(aes(x = p_h_2, y = p, color = dataset)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
+  scale_color_manual(values = c("Single-Point" = "#2980b9",
+                                 "Composite"    = "#e74c3c")) +
+  facet_wrap(~ dataset) +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position  = "none",
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold", size = 10)
+  ) +
+  labs(
+    title    = "Phosphorus vs pH by sampling design",
+    subtitle = "Linear trend shown with 95% confidence interval",
+    x        = "pH",
+    y        = expression("Phosphorus (mg (ppm))")
+  )
+
+# ── Correlation coefficients ──────────────────────────────
+bind_rows(
+  soil_prop_SP   %>% st_drop_geometry() %>% mutate(dataset = "Single-Point"),
+  soil_prop_COMP %>% st_drop_geometry() %>% mutate(dataset = "Composite")
+) %>%
+  group_by(dataset) %>%
+  summarise(
+    r       = round(cor(p_h_2, p, use = "complete.obs"), 3),
+    r2      = round(cor(p_h_2, p, use = "complete.obs")^2, 3),
+    p_value = round(cor.test(p_h_2, p)$p.value, 4),
+    n       = n(),
+    .groups = "drop"
+  ) %>%
+  print()
+
+# ── Plot with polynomial curve ────────────────────────────
+# Second-degree polynomial captures the bell-shaped
+# availability curve — P availability peaks around pH 6–7
+# and declines in strongly acid or alkaline conditions
+
+plot_dat <- bind_rows(
+  soil_prop_SP   %>% st_drop_geometry() %>% mutate(dataset = "Single-Point"),
+  soil_prop_COMP %>% st_drop_geometry() %>% mutate(dataset = "Composite")
+) %>%
+  mutate(dataset = factor(dataset,
+                          levels = c("Single-Point", "Composite")))
+
+# Compute r per dataset for annotation
+cor_dat <- plot_dat %>%
+  group_by(dataset) %>%
+  summarise(
+    r       = round(cor(p_h_2, p, use = "complete.obs"), 3),
+    p_value = cor.test(p_h_2, p)$p.value,
+    label   = paste0("r = ", r,
+                     ifelse(p_value < 0.001, "***",
+                     ifelse(p_value < 0.01,  "**",
+                     ifelse(p_value < 0.05,  "*", "")))),
+    x       = max(plot_dat$p_h_2, na.rm = TRUE) - 0.15,
+    y       = max(plot_dat$p,     na.rm = TRUE) - 2,
+    .groups = "drop"
+  )
+
+ggplot(plot_dat, aes(x = p_h_2, y = p, color = dataset)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_smooth(method  = "lm",
+              formula = y ~ poly(x, 2),
+              se      = TRUE,
+              linewidth = 0.9) +
+  geom_text(data = cor_dat,
+            aes(x = x, y = y, label = label),
+            inherit.aes = FALSE,
+            size = 3.5, hjust = 1, fontface = "italic") +
+  scale_color_manual(values = c("Single-Point" = "#2980b9",
+                                 "Composite"    = "#e74c3c")) +
+  facet_wrap(~ dataset) +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position  = "none",
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold", size = 10)
+  ) +
+  labs(
+    title    = "Phosphorus availability vs pH by sampling design",
+    subtitle = "Polynomial (degree 2) fit — captures bell-shaped P availability curve",
+    x        = "pH",
+    y        = expression("Phosphorus (mg kg"^{-1}*")"),
+    caption  = "P availability peaks near pH 6–7; declines under acidic or alkaline conditions (Brady & Weil, 2008)"
+  )
+```
+```{r}
+#all nutrient correlation
+
+# ── All soil property pairwise correlations ───────────────
+soil_var_labels <- c(
+  "lbc_1"  = "LBC-1",
+  "lb_ceq" = "LBC Eq.",
+  "p_h_2"  = "pH",
+  "ca"     = "Calcium",
+  "k"      = "Potassium",
+  "mg"     = "Magnesium",
+  "mn"     = "Manganese",
+  "p"      = "Phosphorus",
+  "zn"     = "Zinc"
+)
+
+# ── Correlation matrix + p-values ─────────────────────────
+cor_pval <- function(dat, vars) {
+  n <- length(vars)
+  r_mat <- matrix(NA, n, n, dimnames = list(vars, vars))
+  p_mat <- matrix(NA, n, n, dimnames = list(vars, vars))
+  
+  for (i in seq_len(n)) {
+    for (j in seq_len(n)) {
+      if (i == j) {
+        r_mat[i, j] <- 1
+        p_mat[i, j] <- NA
+      } else {
+        ct <- cor.test(dat[[vars[i]]], dat[[vars[j]]],
+                       use = "complete.obs")
+        r_mat[i, j] <- ct$estimate
+        p_mat[i, j] <- ct$p.value
+      }
+    }
+  }
+  list(r = r_mat, p = p_mat)
+}
+
+cor_SP   <- cor_pval(soil_prop_SP   %>% st_drop_geometry(), soil_vars)
+cor_COMP <- cor_pval(soil_prop_COMP %>% st_drop_geometry(), soil_vars)
+
+# ── Tidy for ggplot ───────────────────────────────────────
+tidy_cor <- function(cor_list, dataset_label) {
+  as.data.frame(cor_list$r) %>%
+    rownames_to_column("var1") %>%
+    pivot_longer(-var1, names_to = "var2", values_to = "r") %>%
+    left_join(
+      as.data.frame(cor_list$p) %>%
+        rownames_to_column("var1") %>%
+        pivot_longer(-var1, names_to = "var2", values_to = "p_value"),
+      by = c("var1", "var2")
+    ) %>%
+    mutate(
+      dataset  = dataset_label,
+      sig      = case_when(
+        is.na(p_value)  ~ "",
+        p_value < 0.001 ~ "***",
+        p_value < 0.01  ~ "**",
+        p_value < 0.05  ~ "*",
+        TRUE            ~ ""
+      ),
+      label    = ifelse(var1 == var2, "",
+                        paste0(sprintf("%.2f", r), sig)),
+      var1     = recode(var1, !!!soil_var_labels),
+      var2     = recode(var2, !!!soil_var_labels),
+      var1     = factor(var1, levels = soil_var_labels),
+      var2     = factor(var2, levels = soil_var_labels)
+    )
+}
+
+cor_tidy <- bind_rows(
+  tidy_cor(cor_SP,   "Single-Point"),
+  tidy_cor(cor_COMP, "Composite")
+) %>%
+  mutate(dataset = factor(dataset,
+                          levels = c("Single-Point", "Composite")))
+
+# ── Plot ──────────────────────────────────────────────────
+ggplot(cor_tidy, aes(x = var1, y = var2, fill = r)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = label),
+            size = 2.5, color = "grey10") +
+  scale_fill_gradient2(
+    low      = "#d73027",
+    mid      = "#ffffbf",
+    high     = "#1a9850",
+    midpoint = 0,
+    limits   = c(-1, 1),
+    oob      = scales::squish,
+    name     = "Pearson r",
+    na.value = "grey90"
+  ) +
+  facet_wrap(~ dataset) +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.x      = element_text(angle = 30, hjust = 1,
+                                     size = 9),
+    axis.text.y      = element_text(size = 9),
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold", size = 10),
+    panel.grid       = element_blank(),
+    legend.position  = "right"
+  ) +
+  labs(
+    title    = "Pairwise soil property correlations by sampling design",
+    subtitle = "Values shown with significance: *p<0.05  **p<0.01  ***p<0.001",
+    x        = NULL,
+    y        = NULL
+  )
+
+ggsave("../outputs/fig_soil_pairwise_correlations.png",
+       width = 12, height = 6, dpi = 300)
+
+#save all results in csv
+write_csv(cor_tidy, "../outputs/soil_property_correlations.csv")
+```
+
+
+```{r}
+#RK residual variograms + fits
+# ── RK Residual Variogram Summary ─────────────────────────
+# Extract fitted residual variogram parameters from
+# final_models_SP and final_models_COMP for all soil vars
+
+extract_rk_vg_metrics <- function(final_models, soil_vars, label) {
+  purrr::map_dfr(soil_vars, function(v) {
+    fit <- final_models[[v]]$rk$fit_resid
+    if (is.null(fit)) {
+      return(tibble(
+        variable = v, dataset = label,
+        model = NA, nugget = NA, psill = NA,
+        total_sill = NA, range_m = NA,
+        nugget_sill_ratio = NA
+      ))
+    }
+    nug_row  <- fit %>% filter(model == "Nug")
+    str_row  <- fit %>% filter(model != "Nug")
+    nugget   <- if (nrow(nug_row) > 0) nug_row$psill else 0
+    psill    <- if (nrow(str_row) > 0) str_row$psill else NA
+    rng      <- if (nrow(str_row) > 0) str_row$range else NA
+    mod_type <- if (nrow(str_row) > 0) as.character(str_row$model) else NA
+    tibble(
+      variable          = v,
+      dataset           = label,
+      model             = mod_type,
+      nugget            = round(nugget, 4),
+      psill             = round(psill,  4),
+      total_sill        = round(nugget + psill, 4),
+      range_m           = round(rng, 1),
+      nugget_sill_ratio = round(nugget / (nugget + psill), 3)
+    )
+  })
+}
+
+rk_vg_summary <- bind_rows(
+  extract_rk_vg_metrics(final_models_SP,   soil_vars, "SP"),
+  extract_rk_vg_metrics(final_models_COMP, soil_vars, "COMP")
+) %>%
+  mutate(
+    spatial_dependence = case_when(
+      is.na(nugget_sill_ratio)      ~ "No convergent model",
+      nugget_sill_ratio < 0.25      ~ "Strong",
+      nugget_sill_ratio < 0.75      ~ "Moderate",
+      TRUE                          ~ "Weak — kriging limited"
+    ),
+    variable = recode(variable,
+      "lbc_1"  = "LBC-1",
+      "lb_ceq" = "LBC Equivalent",
+      "p_h_2"  = "pH",
+      "ca"     = "Calcium",
+      "k"      = "Potassium",
+      "mg"     = "Magnesium",
+      "mn"     = "Manganese",
+      "p"      = "Phosphorus",
+      "zn"     = "Zinc"
+    ),
+    dataset = factor(dataset, levels = c("SP", "COMP"))
+  )
+
+print(rk_vg_summary, n = 20)
+
+# ── Plot 1: Nugget:Sill ratio comparison SP vs COMP ───────
+p_rk_nugget <- rk_vg_summary %>%
+  filter(!is.na(nugget_sill_ratio)) %>%
+  ggplot(aes(x = reorder(variable, nugget_sill_ratio),
+             y = nugget_sill_ratio,
+             fill = dataset)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_hline(yintercept = 0.75, linetype = "dashed",
+             color = "grey40", linewidth = 0.5) +
+  geom_hline(yintercept = 0.25, linetype = "dotted",
+             color = "grey60", linewidth = 0.5) +
+  annotate("text", x = 0.6, y = 0.77,
+           label = "Weak threshold (0.75)",
+           size = 2.8, color = "grey40", hjust = 0) +
+  annotate("text", x = 0.6, y = 0.27,
+           label = "Strong threshold (0.25)",
+           size = 2.8, color = "grey60", hjust = 0) +
+  scale_fill_manual(values = c("SP"   = "#2980b9",
+                                "COMP" = "#e74c3c"),
+                    name = "Sampling design") +
+  scale_y_continuous(limits = c(0, 1),
+                     breaks = seq(0, 1, 0.25)) +
+  coord_flip() +
+  theme_bw(base_size = 10) +
+  theme(
+    strip.background = element_rect(fill = "grey92"),
+    legend.position  = "bottom"
+  ) +
+  labs(
+    title    = "RK Residual Variogram — Nugget:Sill Ratio",
+    subtitle = "After RF trend removal. Cambardella et al. (1994) thresholds shown.",
+    x        = NULL,
+    y        = "Nugget:Sill ratio"
+  )
+
+print(p_rk_nugget)
+
+# ── Plot 2: Range comparison SP vs COMP ───────────────────
+p_rk_range <- rk_vg_summary %>%
+  filter(!is.na(range_m)) %>%
+  ggplot(aes(x = reorder(variable, range_m),
+             y = range_m,
+             fill = dataset)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  scale_fill_manual(values = c("SP"   = "#2980b9",
+                                "COMP" = "#e74c3c"),
+                    name = "Sampling design") +
+  coord_flip() +
+  theme_bw(base_size = 10) +
+  theme(
+    legend.position  = "bottom"
+  ) +
+  labs(
+    title    = "RK Residual Variogram — Spatial Range",
+    subtitle = "Distance at which residual spatial dependence ceases",
+    x        = NULL,
+    y        = "Range (m)"
+  )
+
+print(p_rk_range)
+
+# ── Plot 3: Side by side OK vs RK nugget:sill comparison ──
+ok_vg <- vg_summary_all %>%
+  mutate(
+    variable = recode(variable,
+      "lbc_1"  = "LBC-1",
+      "lb_ceq" = "LBC Equivalent",
+      "p_h_2"  = "pH",
+      "ca"     = "Calcium",
+      "k"      = "Potassium",
+      "mg"     = "Magnesium",
+      "mn"     = "Manganese",
+      "p"      = "Phosphorus",
+      "zn"     = "Zinc"
+    ),
+    method = "OK"
+  ) %>%
+  select(variable, dataset, nugget_sill_ratio, method)
+
+rk_vg <- rk_vg_summary %>%
+  select(variable, dataset, nugget_sill_ratio) %>%
+  mutate(method = "RK residual")
+
+bind_rows(ok_vg, rk_vg) %>%
+  filter(!is.na(nugget_sill_ratio)) %>%
+  mutate(
+    method  = factor(method, levels = c("OK", "RK residual")),
+    dataset = factor(dataset, levels = c("SP", "COMP"))
+  ) %>%
+  ggplot(aes(x = variable, y = nugget_sill_ratio,
+             fill = method)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_hline(yintercept = 0.75, linetype = "dashed",
+             color = "grey40", linewidth = 0.4) +
+  scale_fill_manual(values = c("OK"          = "#8e44ad",
+                                "RK residual" = "#27ae60"),
+                    name = "Method") +
+  facet_wrap(~ dataset) +
+  coord_flip() +
+  theme_bw(base_size = 10) +
+  theme(
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold"),
+    legend.position  = "bottom"
+  ) +
+  labs(
+    title    = "Nugget:Sill ratio — OK vs RK residual variograms",
+    subtitle = "Lower = stronger spatial structure. Dashed = weak threshold (0.75).",
+    x        = NULL,
+    y        = "Nugget:Sill ratio"
+  )
+
+ggsave("../outputs/fig_rk_residual_variograms.png",
+       width = 10, height = 6, dpi = 300)
+
+write_csv(rk_vg_summary,
+          "../outputs/rk_residual_variogram_summary.csv")
+
+
+# ── 1. OK variogram parameters (already computed) ─────────
+vg_summary_all %>%
+  mutate(method = "OK") %>%
+  select(variable, dataset, method, 
+         nugget_sill_ratio, range_m) %>%
+  print(n = 20)
+
+# ── 2. RK residual — already have from CSV ────────────────
+# Already sent
+# Option 1 — paste output
+print(rk_vg_summary, n = 20)
+
+# Option 2 — save and upload
+write_csv(rk_vg_summary, 
+          "../outputs/rk_residual_variogram_summary.csv")
+# ── 3. RF residual Moran's I (spatial autocorrelation) ────
+# This is the closest RF equivalent — tells you how much
+# spatial structure remains after RF prediction
+bind_rows(
+  rf_moran_SP_correct   %>% mutate(dataset = "SP"),
+  rf_moran_COMP_correct %>% mutate(dataset = "COMP")
+) %>%
+  mutate(
+    variable = recode(variable,
+      "lbc_1"  = "LBC-1",
+      "lb_ceq" = "LBC Equivalent",
+      "p_h_2"  = "pH",
+      "ca"     = "Calcium",
+      "k"      = "Potassium",
+      "mg"     = "Magnesium",
+      "mn"     = "Manganese",
+      "p"      = "Phosphorus",
+      "zn"     = "Zinc"
+    ),
+    method = "RF residual Moran's I"
+  ) %>%
+  select(variable, dataset, method, moran_I, p_value) %>%
+  print(n = 20)
+```
+
