@@ -412,6 +412,77 @@ results_all %>%
   labs(title = "Spatial CV: R² by dataset and method",
        x = "Method", y = expression(R^2)) +
   theme(legend.position = "none")
+
+library(rstatix)
+
+# Reshape CV results for statistical comparison
+cv_long <- cv_summary %>%
+  mutate(method_design = paste(method, dataset, sep = "_"))
+
+# Friedman test — does method × sampling design affect R²?
+friedman_result <- cv_long %>%
+  friedman_test(median_R2 ~ method_design | variable)
+
+print(friedman_result)
+
+# Post-hoc pairwise Wilcoxon signed-rank tests
+posthoc_result <- cv_long %>%
+  wilcox_test(median_R2 ~ method_design,
+              paired = TRUE,
+              p.adjust.method = "bonferroni") %>%
+  add_significance()
+
+print(posthoc_result, n = 30)
+# SP vs COMP comparison within each method
+sp_comp_comparison <- cv_summary %>%
+  select(variable, method, dataset, median_R2) %>%
+  pivot_wider(names_from = dataset,
+              values_from = median_R2) %>%
+  group_by(method) %>%
+  summarise(
+    wilcox_p = wilcox.test(SP, COMP,
+                            paired = TRUE,
+                            exact = FALSE)$p.value,
+    median_diff = median(SP - COMP, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(significant = wilcox_p < 0.05)
+
+print(sp_comp_comparison)
+# Method comparison within SP and COMP
+method_comparison <- cv_summary %>%
+  select(variable, method, dataset, median_R2) %>%
+  group_by(dataset) %>%
+  summarise(
+    # RF vs OK
+    rf_ok_p = wilcox.test(
+      median_R2[method == "RF"],
+      median_R2[method == "OK"],
+      paired = TRUE, exact = FALSE)$p.value,
+    # RF vs RK
+    rf_rk_p = wilcox.test(
+      median_R2[method == "RF"],
+      median_R2[method == "RK"],
+      paired = TRUE, exact = FALSE)$p.value,
+    # RK vs OK
+    rk_ok_p = wilcox.test(
+      median_R2[method == "RK"],
+      median_R2[method == "OK"],
+      paired = TRUE, exact = FALSE)$p.value,
+    .groups = "drop"
+  )
+
+print(method_comparison)
+
+# SP outperforms COMP for RF
+#SP outperforms COMP for RK
+#RF_SP vs RK_COMP (p = 0.055) — borderline
+
+#RF: significant (p = 0.033, median diff = 0.098) — SP outperforms COMP by about 0.10 R² units for RF, statistically significant
+# RK: significant (p = 0.044, median diff = 0.050) — SP outperforms COMP for RK, statistically significant
+# OK: not significant (p = 0.477) — no meaningful SP vs COMP difference for OK
+#COMP: RF vs RK significant (p = 0.044) — RK outperforms RF under COMP sampling
 ```
 
 # ============================================================
@@ -587,6 +658,8 @@ val_results_all <- bind_rows(
 
 write_csv(val_results_all, "../outputs/validation_results_held_out.csv")
 val_results_all %>% arrange(variable, dataset, desc(R2))
+
+#Unlike internal CV where OK occasionally outperformed RF/RK (e.g. K COMP, pH), the held-out validation tells a cleaner story — RF and RK almost universally produce higher R² than OK across all variables and both sampling designs. This is the more reliable finding since it comes from truly independent data.
 ```
 
 # ============================================================
