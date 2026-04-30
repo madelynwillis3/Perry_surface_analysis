@@ -665,6 +665,8 @@ write_csv(val_results_all, "../outputs/validation_results_held_out.csv")
 
 val_results_all %>%
   arrange(variable, dataset, desc(R2))
+#save as csv:
+write_csv(val_results_all, "../outputs/validation_results_held_out.csv")
 
 ```
 
