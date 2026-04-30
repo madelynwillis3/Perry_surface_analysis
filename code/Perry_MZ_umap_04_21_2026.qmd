@@ -1463,6 +1463,888 @@ bind_rows(
 # All three are complementary, not directly comparable on the same scale
 
 ```
+```{r}
+#uncertainty figure for raw maps:
+# ── Unified uncertainty figure ─────────────────────────────
+# Combines RF bootstrap SD, QRF PI width, and kriging SE
+# for OK and RK into one comparable figure
+
+soil_var_labels <- c(
+  "lbc_1"  = "LBC-1",
+  "lb_ceq" = "LBC Eq.",
+  "p_h_2"  = "pH",
+  "ca"     = "Calcium",
+  "k"      = "Potassium",
+  "mg"     = "Magnesium",
+  "mn"     = "Manganese",
+  "p"      = "Phosphorus",
+  "zn"     = "Zinc"
+)
+
+# ── 1. RF uncertainty — bootstrap SD and QRF PI ───────────
+rf_uncertainty <- uncertainty_summary %>%
+  mutate(
+    pred_method = "RF",
+    metric_type = method
+  ) %>%
+  select(variable, dataset, pred_method,
+         metric_type, median_unc)
+
+# ── 2. Kriging SE — OK and RK ─────────────────────────────
+krig_se_long <- bind_rows(
+  krig_var_SP %>%
+    select(ends_with("_ok_krig_var")) %>%
+    summarise(across(everything(),
+                     ~ median(sqrt(.), na.rm = TRUE))) %>%
+    pivot_longer(everything(),
+                 names_to = "name",
+                 values_to = "median_unc") %>%
+    mutate(dataset = "SP", pred_method = "OK"),
+
+  krig_var_COMP %>%
+    select(ends_with("_ok_krig_var")) %>%
+    summarise(across(everything(),
+                     ~ median(sqrt(.), na.rm = TRUE))) %>%
+    pivot_longer(everything(),
+                 names_to = "name",
+                 values_to = "median_unc") %>%
+    mutate(dataset = "COMP", pred_method = "OK"),
+
+  krig_var_SP %>%
+    select(ends_with("_rk_krig_var")) %>%
+    summarise(across(everything(),
+                     ~ median(sqrt(.), na.rm = TRUE))) %>%
+    pivot_longer(everything(),
+                 names_to = "name",
+                 values_to = "median_unc") %>%
+    mutate(dataset = "SP", pred_method = "RK"),
+
+  krig_var_COMP %>%
+    select(ends_with("_rk_krig_var")) %>%
+    summarise(across(everything(),
+                     ~ median(sqrt(.), na.rm = TRUE))) %>%
+    pivot_longer(everything(),
+                 names_to = "name",
+                 values_to = "median_unc") %>%
+    mutate(dataset = "COMP", pred_method = "RK")
+) %>%
+  mutate(
+    variable    = str_extract(name,
+                               paste(soil_vars, collapse = "|")),
+    metric_type = "Kriging SE"
+  ) %>%
+  filter(!is.na(variable), is.finite(median_unc)) %>%
+  select(variable, dataset, pred_method,
+         metric_type, median_unc)
+
+# ── 3. Combine all uncertainty metrics ────────────────────
+uncertainty_all <- bind_rows(
+  rf_uncertainty %>%
+    filter(metric_type == "Bootstrap SD"),
+  krig_se_long
+) %>%
+  mutate(
+    variable    = recode(variable, !!!soil_var_labels),
+    variable    = factor(variable, levels = soil_var_labels),
+    pred_method = factor(pred_method,
+                         levels = c("RF", "OK", "RK")),
+    dataset     = factor(dataset,
+                         levels = c("SP", "COMP"),
+                         labels = c("Single-Point",
+                                    "Composite")),
+    metric_type = factor(metric_type,
+                         levels = c("Bootstrap SD",
+                                    "Kriging SE"))
+  )
+
+# ── 4. Plot ───────────────────────────────────────────────
+p_uncertainty <- uncertainty_all %>%
+  ggplot(aes(x = variable,
+             y = median_unc,
+             fill = pred_method)) +
+  geom_col(position = position_dodge(0.8),
+           width = 0.7) +
+  scale_fill_manual(
+    values = c("RF" = "#2980b9",
+               "OK" = "#8e44ad",
+               "RK" = "#27ae60"),
+    name = "Prediction method"
+  ) +
+  facet_grid(metric_type ~ dataset, scales = "free_y") +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.x      = element_text(angle = 35, hjust = 1,
+                                     size = 8),
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold", size = 9),
+    legend.position  = "bottom",
+    panel.grid.major.x = element_blank()
+  ) +
+  labs(
+    title    = "Prediction uncertainty by method and sampling design",
+    subtitle = paste0("Bootstrap SD (RF only) and kriging SE (OK, RK).",
+                      " Median across all grid pixels.\n",
+                      "NA = no convergent variogram model."),
+    x        = NULL,
+    y        = "Median uncertainty (ppm; pH = dimensionless)"
+  )
+
+print(p_uncertainty)
+
+ggsave("../outputs/fig_uncertainty_by_method.png",
+       p_uncertainty,
+       width  = 12,
+       height = 7,
+       dpi    = 300)
+
+#RK uncertainty:
+# ── RK total uncertainty = RF trend SD + RK kriging SE ────
+# Assumes independence between trend and residual uncertainty
+# Total SE = sqrt(boot_SD² + krig_SE²)
+
+rk_total_uncertainty <- bind_rows(
+  # SP
+  boot_uncertainty_SP %>%
+    select(x, y, ends_with("_boot_sd")) %>%
+    pivot_longer(-c(x, y),
+                 names_to = "variable",
+                 values_to = "boot_sd") %>%
+    mutate(variable = str_remove(variable, "_boot_sd"),
+           dataset  = "SP") %>%
+    left_join(
+      krig_var_SP %>%
+        select(x, y, ends_with("_rk_krig_var")) %>%
+        pivot_longer(-c(x, y),
+                     names_to = "variable",
+                     values_to = "krig_var") %>%
+        mutate(variable = str_remove(variable,
+                                      "_rk_krig_var"),
+               dataset  = "SP"),
+      by = c("x", "y", "variable", "dataset")
+    ),
+
+  # COMP
+  boot_uncertainty_COMP %>%
+    select(x, y, ends_with("_boot_sd")) %>%
+    pivot_longer(-c(x, y),
+                 names_to = "variable",
+                 values_to = "boot_sd") %>%
+    mutate(variable = str_remove(variable, "_boot_sd"),
+           dataset  = "COMP") %>%
+    left_join(
+      krig_var_COMP %>%
+        select(x, y, ends_with("_rk_krig_var")) %>%
+        pivot_longer(-c(x, y),
+                     names_to = "variable",
+                     values_to = "krig_var") %>%
+        mutate(variable = str_remove(variable,
+                                      "_rk_krig_var"),
+               dataset  = "COMP"),
+      by = c("x", "y", "variable", "dataset")
+    )
+) %>%
+  mutate(
+    # Total RK uncertainty via quadrature
+    # krig_var is variance so sqrt = SE
+    rk_total_se = sqrt(boot_sd^2 + 
+                       coalesce(krig_var, 0))
+  )
+
+# ── Summarise per variable and dataset ────────────────────
+rk_uncertainty_summary <- rk_total_uncertainty %>%
+  group_by(variable, dataset) %>%
+  summarise(
+    mean_rk_se   = round(mean(rk_total_se,
+                               na.rm = TRUE), 3),
+    median_rk_se = round(median(rk_total_se,
+                                 na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pred_method = "RK",
+    metric_type = "Total SE (boot + krig)"
+  )
+
+print(rk_uncertainty_summary, n = 20)
+write_csv(rk_uncertainty_summary,
+          "../outputs/rk_total_uncertainty.csv")
+#Taylor, J.R. (1997). An Introduction to Error Analysis: The Study of Uncertainties in Physical Measurements (2nd ed.). University Science Books. 
+
+# ── Rebuild uncertainty_all with RK total SE added ────────
+rk_krig_se <- krig_se_long %>%
+  filter(pred_method == "RK") %>%
+  mutate(metric_type = "Kriging SE (residual only)",
+         pred_method_label = "RK (kriging SE only)")
+
+rk_total_se <- rk_uncertainty_summary %>%
+  mutate(
+    median_unc        = median_rk_se,
+    metric_type       = "Total SE (RF + kriging)",
+    pred_method_label = "RK (total SE)"
+  ) %>%
+  mutate(
+    variable = recode(variable, !!!soil_var_labels),
+    variable = factor(variable, levels = soil_var_labels),
+    dataset  = factor(dataset,
+                      levels = c("SP", "COMP"),
+                      labels = c("Single-Point", "Composite"))
+  ) %>%
+  select(variable, dataset, pred_method,
+         metric_type, median_unc, pred_method_label)
+
+uncertainty_all_v2 <- bind_rows(
+  # RF bootstrap SD — fix dataset labels here
+  rf_uncertainty %>%
+    filter(metric_type == "Bootstrap SD") %>%
+    mutate(
+      pred_method_label = "RF",
+      dataset = factor(
+        recode(dataset,
+               "SP"   = "Single-Point",
+               "COMP" = "Composite"),
+        levels = c("Single-Point", "Composite")
+      ),
+      variable = recode(variable, !!!soil_var_labels),
+      variable = factor(variable, levels = soil_var_labels)
+    ),
+
+  # OK kriging SE
+  krig_se_long %>%
+    filter(pred_method == "OK") %>%
+    mutate(
+      metric_type       = "Kriging SE",
+      pred_method_label = "OK",
+      variable          = recode(variable, !!!soil_var_labels),
+      variable          = factor(variable,
+                                  levels = soil_var_labels),
+      dataset           = factor(
+        recode(dataset,
+               "SP"   = "Single-Point",
+               "COMP" = "Composite"),
+        levels = c("Single-Point", "Composite")
+      )
+    ),
+
+  # RK kriging SE — residual only
+  rk_krig_se %>%
+    mutate(
+      metric_type       = "Kriging SE",
+      variable          = recode(variable, !!!soil_var_labels),
+      variable          = factor(variable,
+                                  levels = soil_var_labels),
+      dataset           = factor(
+        recode(dataset,
+               "SP"   = "Single-Point",
+               "COMP" = "Composite"),
+        levels = c("Single-Point", "Composite")
+      )
+    ) %>%
+    select(variable, dataset, pred_method,
+           metric_type, median_unc, pred_method_label),
+
+  # RK total SE — already has correct labels from earlier
+  rk_total_se %>%
+    mutate(metric_type = "Kriging SE")
+
+) %>%
+  mutate(
+    pred_method_label = factor(
+      pred_method_label,
+      levels = c("RF",
+                 "OK",
+                 "RK (kriging SE only)",
+                 "RK (total SE)")
+    )
+  )
+
+# ── Plot ──────────────────────────────────────────────────
+method_colors <- c(
+  "RF"                   = "#8e44ad",  # purple
+  "OK"                   = "#2980b9",  # blue
+  "RK (kriging SE only)" = "#82e0aa",  # light green
+  "RK (total SE)"        = "#1e8449"   # dark green
+)
+
+p_uncertainty_v2 <- uncertainty_all_v2 %>%
+  filter(!is.na(median_unc), is.finite(median_unc)) %>%
+  ggplot(aes(x       = variable,
+             y       = median_unc,
+             fill    = pred_method_label)) +
+  geom_col(position = position_dodge(0.85),
+           width     = 0.8) +
+  scale_fill_manual(
+    values = method_colors,
+    name   = "Prediction method",
+    labels = c(
+      "RF"                   = "RF (bootstrap SD)",
+      "OK"                   = "OK (kriging SE)",
+      "RK (kriging SE only)" = "RK (residual kriging SE)",
+      "RK (total SE)"        = "RK (total SE = RF + kriging)"
+    )
+  ) +
+  facet_grid(metric_type ~ dataset, scales = "free_y") +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.x        = element_text(angle = 35, hjust = 1,
+                                       size = 8),
+    strip.background   = element_rect(fill = "grey92"),
+    strip.text         = element_text(face = "bold", size = 9),
+    legend.position    = "bottom",
+    legend.text        = element_text(size = 8),
+    legend.key.size    = unit(0.4, "cm"),
+    panel.grid.major.x = element_blank()
+  ) +
+  guides(fill = guide_legend(nrow = 2)) +
+  labs(
+    title    = "Prediction uncertainty by method and sampling design",
+    subtitle = paste0(
+      "Row 1: Bootstrap SD (RF only). ",
+      "Row 2: Kriging SE — OK, RK residual component (light green),\n",
+      "and RK total SE combining RF bootstrap SD and residual ",
+      "kriging SE in quadrature (dark green). ",
+      "Median across all grid pixels.\n ",
+      "Missing bars = no convergent variogram model."
+    ),
+    x = NULL,
+    y = "Median uncertainty (ppm; pH = dimensionless)"
+  )
+
+print(p_uncertainty_v2)
+
+ggsave("../outputs/fig_uncertainty_by_method_v2.png",
+       p_uncertainty_v2,
+       width  = 13,
+       height = 8,
+       dpi    = 300)
+
+
+
+# ── 1. RF uncertainty — QRF PI width (primary metric) ─────
+rf_uncertainty_qrf <- uncertainty_summary %>%
+  filter(method == "QRF 80% PI width") %>%
+  mutate(
+    pred_method       = "RF",
+    metric_type       = "QRF 80% PI width",
+    pred_method_label = "RF"
+  ) %>%
+  select(variable, dataset, pred_method,
+         metric_type, median_unc, pred_method_label)
+
+# ── 2. RK total uncertainty using QRF PI width ────────────
+# Total RK uncertainty = sqrt(QRF_PI² + krig_var)
+# Using QRF PI as RF trend uncertainty instead of bootstrap SD
+# since QRF PI is the more standard RF uncertainty metric
+
+rk_total_uncertainty_qrf <- bind_rows(
+  # SP
+  qrf_uncertainty_SP %>%
+    select(x, y, ends_with("_pi_width")) %>%
+    pivot_longer(-c(x, y),
+                 names_to  = "variable",
+                 values_to = "qrf_pi") %>%
+    mutate(variable = str_remove(variable, "_pi_width"),
+           dataset  = "SP") %>%
+    left_join(
+      krig_var_SP %>%
+        select(x, y, ends_with("_rk_krig_var")) %>%
+        pivot_longer(-c(x, y),
+                     names_to  = "variable",
+                     values_to = "krig_var") %>%
+        mutate(variable = str_remove(variable,
+                                      "_rk_krig_var"),
+               dataset  = "SP"),
+      by = c("x", "y", "variable", "dataset")
+    ),
+
+  # COMP
+  qrf_uncertainty_COMP %>%
+    select(x, y, ends_with("_pi_width")) %>%
+    pivot_longer(-c(x, y),
+                 names_to  = "variable",
+                 values_to = "qrf_pi") %>%
+    mutate(variable = str_remove(variable, "_pi_width"),
+           dataset  = "COMP") %>%
+    left_join(
+      krig_var_COMP %>%
+        select(x, y, ends_with("_rk_krig_var")) %>%
+        pivot_longer(-c(x, y),
+                     names_to  = "variable",
+                     values_to = "krig_var") %>%
+        mutate(variable = str_remove(variable,
+                                      "_rk_krig_var"),
+               dataset  = "COMP"),
+      by = c("x", "y", "variable", "dataset")
+    )
+) %>%
+  mutate(
+    rk_total_se = sqrt(qrf_pi^2 +
+                       coalesce(krig_var, 0))
+  )
+
+# ── Summarise RK total SE ─────────────────────────────────
+rk_uncertainty_summary_qrf <- rk_total_uncertainty_qrf %>%
+  group_by(variable, dataset) %>%
+  summarise(
+    mean_rk_se   = round(mean(rk_total_se,   na.rm = TRUE), 3),
+    median_rk_se = round(median(rk_total_se, na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pred_method = "RK",
+    metric_type = "Total SE (QRF PI + kriging)"
+  )
+
+print(rk_uncertainty_summary_qrf, n = 20)
+write_csv(rk_uncertainty_summary_qrf,
+          "../outputs/rk_total_uncertainty_qrf.csv")
+
+# ── 3. Rebuild RK objects ─────────────────────────────────
+rk_krig_se <- krig_se_long %>%
+  filter(pred_method == "RK") %>%
+  mutate(
+    metric_type       = "Kriging SE",
+    pred_method_label = "RK (kriging SE only)"
+  )
+
+rk_total_se_qrf <- rk_uncertainty_summary_qrf %>%
+  mutate(
+    median_unc        = median_rk_se,
+    metric_type       = "Kriging SE",
+    pred_method_label = "RK (total SE)"
+  ) %>%
+  mutate(
+    variable = recode(variable, !!!soil_var_labels),
+    variable = factor(variable, levels = soil_var_labels),
+    dataset  = factor(dataset,
+                      levels = c("SP", "COMP"),
+                      labels = c("Single-Point", "Composite"))
+  ) %>%
+  select(variable, dataset, pred_method,
+         metric_type, median_unc, pred_method_label)
+
+# ── 4. Combine all uncertainty metrics ────────────────────
+uncertainty_all_v3 <- bind_rows(
+
+  # RF QRF PI width
+  rf_uncertainty_qrf %>%
+    mutate(
+      dataset  = factor(
+        recode(dataset,
+               "SP"   = "Single-Point",
+               "COMP" = "Composite"),
+        levels = c("Single-Point", "Composite")
+      ),
+      variable = recode(variable, !!!soil_var_labels),
+      variable = factor(variable, levels = soil_var_labels),
+      metric_type = "QRF 80% PI width"
+    ),
+
+  # OK kriging SE
+  krig_se_long %>%
+    filter(pred_method == "OK") %>%
+    mutate(
+      metric_type       = "Kriging SE",
+      pred_method_label = "OK",
+      variable          = recode(variable, !!!soil_var_labels),
+      variable          = factor(variable,
+                                  levels = soil_var_labels),
+      dataset           = factor(
+        recode(dataset,
+               "SP"   = "Single-Point",
+               "COMP" = "Composite"),
+        levels = c("Single-Point", "Composite")
+      )
+    ),
+
+  # RK kriging SE — residual only
+  rk_krig_se %>%
+    mutate(
+      variable = recode(variable, !!!soil_var_labels),
+      variable = factor(variable, levels = soil_var_labels),
+      dataset  = factor(
+        recode(dataset,
+               "SP"   = "Single-Point",
+               "COMP" = "Composite"),
+        levels = c("Single-Point", "Composite")
+      )
+    ) %>%
+    select(variable, dataset, pred_method,
+           metric_type, median_unc, pred_method_label),
+
+  # RK total SE — QRF PI + kriging
+  rk_total_se_qrf
+
+) %>%
+  mutate(
+    pred_method_label = factor(
+      pred_method_label,
+      levels = c("RF",
+                 "OK",
+                 "RK (kriging SE only)",
+                 "RK (total SE)")
+    ),
+    metric_type = factor(
+      metric_type,
+      levels = c("QRF 80% PI width", "Kriging SE")
+    )
+  )
+
+# ── 5. Plot ───────────────────────────────────────────────
+method_colors <- c(
+  "RF"                   = "#8e44ad",  # purple
+  "OK"                   = "#2980b9",  # blue
+  "RK (kriging SE only)" = "#82e0aa",  # light green
+  "RK (total SE)"        = "#1e8449"   # dark green
+)
+
+p_uncertainty_v3 <- uncertainty_all_v3 %>%
+  filter(!is.na(median_unc), is.finite(median_unc)) %>%
+  ggplot(aes(x    = variable,
+             y    = median_unc,
+             fill = pred_method_label)) +
+  geom_col(position = position_dodge(0.85),
+           width     = 0.8) +
+  scale_fill_manual(
+    values = method_colors,
+    name   = "Prediction method",
+    labels = c(
+      "RF"                   = "RF (QRF 80% PI width)",
+      "OK"                   = "OK (kriging SE)",
+      "RK (kriging SE only)" = "RK (residual kriging SE only)",
+      "RK (total SE)"        = "RK (total SE = QRF PI + kriging SE)"
+    )
+  ) +
+  facet_grid(metric_type ~ dataset, scales = "free_y") +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.x        = element_text(angle = 35, hjust = 1,
+                                       size = 8),
+    strip.background   = element_rect(fill = "grey92"),
+    strip.text         = element_text(face = "bold", size = 9),
+    legend.position    = "bottom",
+    legend.text        = element_text(size = 8),
+    legend.key.size    = unit(0.4, "cm"),
+    panel.grid.major.x = element_blank()
+  ) +
+  guides(fill = guide_legend(nrow = 2)) +
+  labs(
+    title    = "Prediction uncertainty by method and sampling design",
+    subtitle = paste0(
+      "Row 1: QRF 80% prediction interval width (RF only).\n",
+      "Row 2: Kriging SE — OK (blue), RK residual kriging SE (light green),\n",
+      "and RK total SE combining QRF PI width and residual ",
+      "kriging SE in quadrature (dark green).\n",
+      "Median across all grid pixels. ",
+      "Missing bars = no convergent variogram model."
+    ),
+    x = NULL,
+    y = "Median uncertainty (ppm; pH = dimensionless)"
+  )
+
+print(p_uncertainty_v3)
+
+ggsave("../outputs/fig_uncertainty_by_method_v3.png",
+       p_uncertainty_v3,
+       width  = 13,
+       height = 8,
+       dpi    = 300)
+# Convert QRF 80% PI width to approximate SE
+# 80% PI = ±1.28 SD on each side = 2.56 SD total
+# Therefore SE ≈ PI_width / 2.56
+
+rk_total_uncertainty_corrected <- bind_rows(
+  qrf_uncertainty_SP %>%
+    select(x, y, ends_with("_pi_width")) %>%
+    pivot_longer(-c(x, y),
+                 names_to  = "variable",
+                 values_to = "qrf_pi") %>%
+    mutate(variable = str_remove(variable, "_pi_width"),
+           dataset  = "SP") %>%
+    left_join(
+      krig_var_SP %>%
+        select(x, y, ends_with("_rk_krig_var")) %>%
+        pivot_longer(-c(x, y),
+                     names_to  = "variable",
+                     values_to = "krig_var") %>%
+        mutate(variable = str_remove(variable,
+                                      "_rk_krig_var"),
+               dataset  = "SP"),
+      by = c("x", "y", "variable", "dataset")
+    ),
+
+  qrf_uncertainty_COMP %>%
+    select(x, y, ends_with("_pi_width")) %>%
+    pivot_longer(-c(x, y),
+                 names_to  = "variable",
+                 values_to = "qrf_pi") %>%
+    mutate(variable = str_remove(variable, "_pi_width"),
+           dataset  = "COMP") %>%
+    left_join(
+      krig_var_COMP %>%
+        select(x, y, ends_with("_rk_krig_var")) %>%
+        pivot_longer(-c(x, y),
+                     names_to  = "variable",
+                     values_to = "krig_var") %>%
+        mutate(variable = str_remove(variable,
+                                      "_rk_krig_var"),
+               dataset  = "COMP"),
+      by = c("x", "y", "variable", "dataset")
+    )
+) %>%
+  mutate(
+    # Convert QRF PI width to approximate SE
+    # 80% PI = z(0.90) - z(0.10) = 1.282 - (-1.282) = 2.564 SD
+    qrf_se      = qrf_pi / 2.564,
+
+    # Combine in quadrature on SE scale
+    rk_total_se = sqrt(qrf_se^2 + coalesce(krig_var, 0)),
+
+    # Convert back to PI scale for interpretability
+    # multiply by 2.564 to report as 80% PI equivalent
+    rk_total_pi = rk_total_se * 2.564
+  )
+
+# ── Summarise ─────────────────────────────────────────────
+rk_uncertainty_summary_corrected <- rk_total_uncertainty_corrected %>%
+  group_by(variable, dataset) %>%
+  summarise(
+    median_rk_total_se = round(median(rk_total_se, na.rm = TRUE), 3),
+    median_rk_total_pi = round(median(rk_total_pi, na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  mutate(pred_method = "RK")
+
+print(rk_uncertainty_summary_corrected, n = 20)
+write_csv(rk_uncertainty_summary_corrected,
+          "../outputs/rk_total_uncertainty_corrected.csv")
+
+# ── Option C revised: RF + RK QRF PI in top row ───────────
+# RK also uses RF as trend component so QRF PI applies
+# Panel 1: QRF 80% PI width — RF and RK
+# Panel 2: Kriging SE — OK and RK residual only
+
+# ── 1. QRF PI width — RF and RK ───────────────────────────
+qrf_panel <- uncertainty_summary %>%
+  filter(method == "QRF 80% PI width") %>%
+  mutate(
+    # RF QRF PI is the trend uncertainty for both RF and RK
+    pred_method_label = "RF / RK trend (QRF PI)",
+    metric_type       = "RF Trend Uncertainty\n(QRF 80% Prediction Interval Width)",
+    variable          = recode(variable, !!!soil_var_labels),
+    variable          = factor(variable, levels = soil_var_labels),
+    dataset           = factor(
+      recode(dataset,
+             "SP"   = "Single-Point",
+             "COMP" = "Composite"),
+      levels = c("Single-Point", "Composite")
+    )
+  ) %>%
+  select(variable, dataset, pred_method_label,
+         metric_type, median_unc)
+
+# ── 2. Kriging SE — OK and RK residual ────────────────────
+krig_se_panel <- bind_rows(
+
+  # OK kriging SE
+  krig_se_long %>%
+    filter(pred_method == "OK") %>%
+    mutate(pred_method_label = "OK (kriging SE)"),
+
+  # RK residual kriging SE
+  krig_se_long %>%
+    filter(pred_method == "RK") %>%
+    mutate(pred_method_label = "RK (residual kriging SE)")
+
+) %>%
+  mutate(
+    metric_type = "Geostatistical Uncertainty\n(Kriging Standard Error)",
+    variable    = recode(variable, !!!soil_var_labels),
+    variable    = factor(variable, levels = soil_var_labels),
+    dataset     = factor(
+      recode(dataset,
+             "SP"   = "Single-Point",
+             "COMP" = "Composite"),
+      levels = c("Single-Point", "Composite")
+    )
+  ) %>%
+  select(variable, dataset, pred_method_label,
+         metric_type, median_unc)
+
+# ── 3. Combine ────────────────────────────────────────────
+uncertainty_option_c2 <- bind_rows(
+  qrf_panel,
+  krig_se_panel
+) %>%
+  mutate(
+    pred_method_label = factor(
+      pred_method_label,
+      levels = c(
+        "RF / RK trend (QRF PI)",
+        "OK (kriging SE)",
+        "RK (residual kriging SE)"
+      )
+    ),
+    metric_type = factor(
+      metric_type,
+      levels = c(
+        "RF Trend Uncertainty\n(QRF 80% Prediction Interval Width)",
+        "Geostatistical Uncertainty\n(Kriging Standard Error)"
+      )
+    )
+  )
+
+# ── 4. Colors ─────────────────────────────────────────────
+method_colors_c2 <- c(
+  "RF / RK trend (QRF PI)"   = "#8e44ad",  # purple
+  "OK (kriging SE)"          = "#2980b9",  # blue
+  "RK (residual kriging SE)" = "#27ae60"   # green
+)
+
+# ── 5. Plot ───────────────────────────────────────────────
+p_uncertainty_c2 <- uncertainty_option_c2 %>%
+  filter(!is.na(median_unc), is.finite(median_unc)) %>%
+  ggplot(aes(x    = variable,
+             y    = median_unc,
+             fill = pred_method_label)) +
+  geom_col(position = position_dodge(0.8),
+           width     = 0.75) +
+  scale_fill_manual(
+    values = method_colors_c2,
+    name   = "Prediction method / uncertainty component",
+    labels = c(
+      "RF / RK trend (QRF PI)"   = "RF and RK trend (QRF 80% PI width)",
+      "OK (kriging SE)"          = "OK (kriging SE)",
+      "RK (residual kriging SE)" = "RK (residual kriging SE)"
+    )
+  ) +
+  facet_grid(metric_type ~ dataset, scales = "free_y") +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.x        = element_text(angle = 35, hjust = 1,
+                                       size = 8),
+    strip.background   = element_rect(fill = "grey92"),
+    strip.text         = element_text(face = "bold", size = 9),
+    strip.text.y       = element_text(size = 8),
+    legend.position    = "bottom",
+    legend.text        = element_text(size = 9),
+    legend.key.size    = unit(0.45, "cm"),
+    panel.grid.major.x = element_blank()
+  ) +
+  guides(fill = guide_legend(nrow = 1)) +
+  labs(
+    title    = "Spatial prediction uncertainty by method and sampling design",
+    subtitle = paste0(
+      "Top row: QRF 80% PI width — applies to RF predictions and ",
+      "the RF trend component of RK (Meinshausen, 2006; ",
+      "Vaysse & Lagacherie, 2017).\n",
+      "Bottom row: Kriging SE — OK full kriging SE (blue) and ",
+      "RK residual kriging SE after RF trend removal (green).\n",
+      "Note: rows are not directly comparable — QRF PI captures ",
+      "conditional distributional uncertainty; kriging SE captures ",
+      "geometric data configuration uncertainty.\n",
+      "Missing bars = no convergent variogram model. ",
+      "Median across all grid pixels."
+    ),
+    x = NULL,
+    y = "Median uncertainty (ppm; pH = dimensionless)"
+  )
+
+print(p_uncertainty_c2)
+
+ggsave("../outputs/fig_uncertainty_option_c2.png",
+       p_uncertainty_c2,
+       width  = 13,
+       height = 8,
+       dpi    = 300)
+
+
+# ── Compute mean per variable per dataset for scaling ─────
+means_SP <- soil_prop_SP %>%
+  st_drop_geometry() %>%
+  select(all_of(soil_vars)) %>%
+  summarise(across(everything(), mean, na.rm = TRUE)) %>%
+  pivot_longer(everything(),
+               names_to  = "variable",
+               values_to = "mean_val") %>%
+  mutate(dataset = "Single-Point")
+
+means_COMP <- soil_prop_COMP %>%
+  st_drop_geometry() %>%
+  select(all_of(soil_vars)) %>%
+  summarise(across(everything(), mean, na.rm = TRUE)) %>%
+  pivot_longer(everything(),
+               names_to  = "variable",
+               values_to = "mean_val") %>%
+  mutate(dataset = "Composite")
+
+means_all <- bind_rows(means_SP, means_COMP) %>%
+  mutate(variable = recode(variable, !!!soil_var_labels),
+         variable = factor(variable, levels = soil_var_labels))
+
+# ── Scale uncertainty as % of mean ────────────────────────
+uncertainty_scaled <- uncertainty_option_c2 %>%
+  left_join(means_all,
+            by = c("variable", "dataset")) %>%
+  mutate(
+    uncertainty_pct = round(
+      (median_unc / mean_val) * 100, 1)
+  )
+
+# ── Plot scaled version ───────────────────────────────────
+p_uncertainty_scaled <- uncertainty_scaled %>%
+  filter(!is.na(uncertainty_pct),
+         is.finite(uncertainty_pct)) %>%
+  ggplot(aes(x    = variable,
+             y    = uncertainty_pct,
+             fill = pred_method_label)) +
+  geom_col(position = position_dodge(0.8),
+           width     = 0.75) +
+  scale_fill_manual(
+    values = method_colors_c2,
+    name   = "Prediction method / uncertainty component",
+    labels = c(
+      "RF / RK trend (QRF PI)"   = "RF and RK trend (QRF 80% PI width)",
+      "OK (kriging SE)"          = "OK (kriging SE)",
+      "RK (residual kriging SE)" = "RK (residual kriging SE)"
+    )
+  ) +
+  facet_grid(metric_type ~ dataset, scales = "free_y") +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.x        = element_text(angle = 35, hjust = 1,
+                                       size = 8),
+    strip.background   = element_rect(fill = "grey92"),
+    strip.text         = element_text(face = "bold", size = 9),
+    strip.text.y       = element_text(size = 8),
+    legend.position    = "bottom",
+    legend.text        = element_text(size = 9),
+    legend.key.size    = unit(0.45, "cm"),
+    panel.grid.major.x = element_blank()
+  ) +
+  guides(fill = guide_legend(nrow = 1)) +
+  labs(
+    title    = "Spatial prediction uncertainty relative to property mean",
+    subtitle = paste0(
+      "Top row: QRF 80% PI width as % of mean — RF and RK trend uncertainty.\n",
+      "Bottom row: Kriging SE as % of mean — OK and RK residual.\n",
+      "Expressing uncertainty relative to the property mean allows ",
+      "comparison across soil properties on different measurement scales.\n",
+      "Note: rows are not directly comparable across uncertainty types. ",
+      "Missing bars = no convergent variogram model."
+    ),
+    x = NULL,
+    y = "Uncertainty as % of property mean"
+  )
+
+print(p_uncertainty_scaled)
+
+ggsave("../outputs/fig_uncertainty_scaled.png",
+       p_uncertainty_scaled,
+       width  = 13,
+       height = 8,
+       dpi    = 300)
+```
+
 
 # ============================================================
 # PHASE 6 — UMAP + HDBSCAN Management Zone Delineation
@@ -1882,6 +2764,164 @@ print(zone_membership_summary, n = 40)
 write_csv(zone_membership_summary,
           "../outputs/zone_membership_uncertainty.csv")
 ```
+```{r}
+# ── Print smoothed UMAP zone maps ─────────────────────────
+# Uses zone_rast_smooth regenerated from result_df_filled
+# avoids stale raster pointer issue
+
+purrr::iwalk(pp_named, function(pp, nm) {
+
+  if (is.null(pp$result_df_filled)) {
+    cat(nm, "— skipped (NULL)\n")
+    return(invisible(NULL))
+  }
+
+  tryCatch({
+
+    # Regenerate smoothed raster from result_df_filled
+    zone_raw <- pp$result_df_filled %>%
+      select(x, y, zone) %>%
+      filter(!is.na(zone)) %>%
+      rast(type = "xyz", crs = "EPSG:26917")
+
+    zone_smooth <- focal(zone_raw, w = 5,
+                         fun    = "modal",
+                         na.rm  = TRUE)
+
+    zone_df_smooth <- as.data.frame(
+      zone_smooth,
+      xy = TRUE, na.rm = TRUE
+    ) %>%
+      rename(zone = 3) %>%
+      filter(!is.na(zone))
+
+    # Number of zones for title
+    n_zones <- n_distinct(zone_df_smooth$zone)
+
+    p_smooth <- ggplot(zone_df_smooth,
+                       aes(x = x, y = y,
+                           fill = factor(zone))) +
+      geom_raster() +
+      coord_equal() +
+      scale_fill_brewer(palette = "Set2",
+                        name    = "Zone") +
+      theme_bw(base_size = 9) +
+      theme(
+        axis.text       = element_text(size = 6),
+        legend.position = "right",
+        plot.title      = element_text(size = 9,
+                                        face = "bold")
+      ) +
+      labs(
+        title    = paste0("UMAP + HDBSCAN (k = ",
+                          n_zones, ") — ", nm),
+        subtitle = "Post-processed: noise fill + 5×5 majority filter",
+        x        = "Easting",
+        y        = "Northing"
+      )
+
+    print(p_smooth)
+
+  }, error = function(e) {
+    cat(nm, "— error:", conditionMessage(e), "\n")
+  })
+})
+```
+```{r}
+# ── Check UMAP embedding structure for 2-zone configs ─────
+two_zone_configs <- c("COMP_RF_nolags", 
+                       "COMP_RK_nolags",
+                       "COMP_RK_lags",
+                       "COMP_OK_nolags")
+
+purrr::walk(two_zone_configs, function(nm) {
+  
+  emb_df <- mz_named_tuned[[nm]]$result_df %>%
+    select(UMAP1, UMAP2, zone)
+  
+  p <- ggplot(emb_df,
+              aes(x     = UMAP1,
+                  y     = UMAP2,
+                  color = factor(zone))) +
+    geom_point(size = 0.3, alpha = 0.3) +
+    scale_color_brewer(palette = "Set2",
+                       name    = "Zone",
+                       na.value = "grey70") +
+    theme_bw(base_size = 9) +
+    labs(
+      title    = paste0("UMAP embedding — ", nm),
+      subtitle = paste0(
+        "n zones = ",
+        mz_named_tuned[[nm]]$n_zones,
+        " | noise = ",
+        round(mz_named_tuned[[nm]]$pct_noise, 1), "%"
+      ),
+      x = "UMAP1", y = "UMAP2"
+    )
+  
+  print(p)
+})
+
+# ── Compare against a well-structured config ──────────────
+p_good <- mz_named_tuned[["COMP_RF_lags"]]$result_df %>%
+  select(UMAP1, UMAP2, zone) %>%
+  ggplot(aes(x     = UMAP1,
+             y     = UMAP2,
+             color = factor(zone))) +
+  geom_point(size = 0.3, alpha = 0.3) +
+  scale_color_brewer(palette = "Set2",
+                     name    = "Zone",
+                     na.value = "grey70") +
+  theme_bw(base_size = 9) +
+  labs(
+    title    = "UMAP embedding — COMP_RF_lags (reference)",
+    subtitle = paste0(
+      "n zones = ",
+      mz_named_tuned[["COMP_RF_lags"]]$n_zones,
+      " | noise = ",
+      round(mz_named_tuned[["COMP_RF_lags"]]$pct_noise, 1),
+      "%"
+    ),
+    x = "UMAP1", y = "UMAP2"
+  )
+
+print(p_good)
+
+# Plot all 4 problematic configs side by side
+purrr::walk(two_zone_configs, function(nm) {
+  p <- mz_named_tuned[[nm]]$result_df %>%
+    select(UMAP1, UMAP2, zone) %>%
+    ggplot(aes(x     = UMAP1,
+               y     = UMAP2,
+               color = factor(zone))) +
+    geom_point(size = 0.3, alpha = 0.3) +
+    scale_color_brewer(palette = "Set2",
+                       name     = "Zone",
+                       na.value = "grey70") +
+    theme_bw(base_size = 9) +
+    labs(
+      title    = paste0("UMAP embedding — ", nm),
+      subtitle = paste0(
+        "n zones = ", mz_named_tuned[[nm]]$n_zones,
+        " | noise = ",
+        round(mz_named_tuned[[nm]]$pct_noise, 1), "%"
+      ),
+      x = "UMAP1", y = "UMAP2"
+    )
+  print(p)
+})
+
+# Test lower minPts for COMP_RK_lags specifically
+purrr::walk(c(50, 75, 100, 150), function(mp) {
+  r <- retune_hdbscan(
+    mz_named_source[["COMP_RK_lags"]], 
+    mp, 
+    label = paste0("COMP_RK_lags_mp", mp))
+  cat("minPts =", mp, 
+      "| zones:", r$n_zones,
+      "| noise:", round(r$pct_noise, 1), "%\n")
+})
+```
 
 # ============================================================
 # PHASE 7 — Baseline Comparison: PCA + k-means
@@ -1973,6 +3013,130 @@ bind_rows(
   theme_minimal() +
   labs(title = "PCA+k-means silhouette profiles",
        x = "k", y = "Mean silhouette")
+
+
+
+#elbow plots:
+# ── Elbow plot — within-cluster SS ────────────────────────
+wcss_list <- list(
+  SP_RF          = baseline_SP_RF,
+  SP_RK          = baseline_SP_RK,
+  SP_OK          = baseline_SP_OK,
+  COMP_RF        = baseline_COMP_RF,
+  COMP_RK        = baseline_COMP_RK,
+  COMP_OK        = baseline_COMP_OK,
+  SP_RF_lags     = baseline_SP_RF_lags,
+  SP_RK_lags     = baseline_SP_RK_lags,
+  COMP_RF_lags   = baseline_COMP_RF_lags,
+  COMP_RK_lags   = baseline_COMP_RK_lags
+)
+
+# Recompute WCSS for each config across k range
+wcss_results <- purrr::imap_dfr(wcss_list, function(b, nm) {
+  
+  # Get the same PCA scores used for clustering
+  cum_var    <- cumsum(b$pca$sdev^2) / sum(b$pca$sdev^2)
+  n_comp     <- which(cum_var >= 0.95)[1]
+  pca_scores <- b$pca$x[, seq_len(n_comp), drop = FALSE]
+  
+  set.seed(20260401)
+  sil_idx <- sample(nrow(pca_scores),
+                    min(5000, nrow(pca_scores)))
+  pca_sub <- pca_scores[sil_idx, ]
+  
+  purrr::map_dfr(2:15, function(k) {
+    set.seed(20260401)
+    km <- kmeans(pca_sub, centers = k,
+                 nstart = 25, iter.max = 100)
+    tibble(
+      config = nm,
+      k      = k,
+      wcss   = km$tot.withinss
+    )
+  })
+})
+
+# ── Plot — same style as silhouette ───────────────────────
+ggplot(wcss_results,
+       aes(x = k, y = wcss,
+           color = config)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.5) +
+  scale_color_brewer(palette = "Paired",
+                     name    = "Configuration") +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position  = "right",
+    legend.text      = element_text(size = 8),
+    legend.key.size  = unit(0.4, "cm")
+  ) +
+  labs(
+    title    = "Elbow method — PCA + k-means",
+    subtitle = paste0(
+      "Within-cluster sum of squares across k = 2:8. ",
+      "Look for elbow where rate of decrease flattens."
+    ),
+    x = "Number of zones (k)",
+    y = "Total within-cluster SS"
+  )
+
+#This actually strengthens the argument for UMAP+HDBSCAN over PCA+kmeans — HDBSCAN found 4-7 zones without requiring k to be specified, and those zone counts fall within the elbow-suggested range of 6-8 while being more agronomically interpretable than the silhouette-optimal k=2. The zone counts identified by HDBSCAN (k=2-7 depending on configuration) were broadly consistent with elbow analysis of PCA+k-means within-cluster variance, suggesting that HDBSCAN's data-driven zone count selection produced agronomically reasonable partitions without requiring a priori specification of k.
+
+
+library(inflection)
+
+# ── Automated elbow detection via kneedle ─────────────────
+elbow_k <- wcss_results %>%
+  group_by(config) %>%
+  summarise(
+    # finds index of maximum curvature
+    elbow_k = {
+      x <- k
+      y <- wcss
+      # second difference method — finds where
+      # rate of change decreases most rapidly
+      d1 <- diff(y) / diff(x)        # first derivative
+      d2 <- diff(d1) / diff(x[-1])   # second derivative
+      # elbow = where second derivative is maximized
+      # (most negative = sharpest bend)
+      x[-c(1,2)][which.min(d2)]
+    },
+    .groups = "drop"
+  )
+
+print(elbow_k, n = 10)
+
+# ── No package needed — maximum second difference ─────────
+elbow_k_simple <- wcss_results %>%
+  group_by(config) %>%
+  arrange(k) %>%
+  summarise(
+    elbow_k = {
+      y    <- wcss
+      x    <- k
+      # normalize to 0-1 to make comparable across configs
+      y_norm <- (y - min(y)) / (max(y) - min(y))
+      x_norm <- (x - min(x)) / (max(x) - min(x))
+      # distance from each point to the line
+      # connecting first and last point
+      # (standard kneedle approach)
+      n     <- length(x_norm)
+      x1    <- x_norm[1];   y1 <- y_norm[1]
+      x2    <- x_norm[n];   y2 <- y_norm[n]
+      # perpendicular distance to line
+      dist_to_line <- abs(
+        (y2 - y1) * x_norm -
+        (x2 - x1) * y_norm +
+        x2 * y1 - y2 * x1
+      ) / sqrt((y2 - y1)^2 + (x2 - x1)^2)
+      # elbow = point furthest from the line
+      x[which.max(dist_to_line)]
+    },
+    .groups = "drop"
+  ) %>%
+  arrange(config)
+
+print(elbow_k_simple, n = 10)
 ```
 
 ```{r pca-kmeans-postprocess}
@@ -2015,6 +3179,764 @@ purrr::iwalk(pp_baseline, function(pp, nm) {
   cat("Saved:", nm, "\n")
 })
 ```
+
+```{r}
+# ── Simple spatial zone maps for all PCA+kmeans configs ───
+purrr::iwalk(pp_baseline, function(pp, nm) {
+  
+  # Extract zone values from result_df directly
+  # avoids the raster NULL issue
+  zone_df <- pp$result_df_filled %>%
+    select(x, y, zone) %>%
+    filter(!is.na(zone))
+  
+  p <- ggplot(zone_df,
+              aes(x = x, y = y,
+                  fill = factor(zone))) +
+    geom_raster() +
+    coord_equal() +
+    scale_fill_brewer(palette = "Set2",
+                      name    = "Zone") +
+    theme_bw(base_size = 10) +
+    theme(
+      axis.text        = element_text(size = 7),
+      legend.position  = "right",
+      strip.background = element_rect(fill = "grey92")
+    ) +
+    labs(
+      title = paste0("PCA + k-means zones — ", nm),
+      x     = "Easting",
+      y     = "Northing"
+    )
+  
+  print(p)
+})
+
+# ── PCA biplot overlay for best config ────────────────────
+# Shows PCA vectors + zone assignments together
+# Standard visualization in MZ papers
+
+best_nm  <- "COMP_RF_lags"
+best_b   <- baseline_COMP_RF_lags
+best_pp  <- pp_baseline[[best_nm]]
+
+# PCA scores + zone assignments
+pca_df <- as.data.frame(best_b$pca$x[, 1:2]) %>%
+  bind_cols(
+    tibble(zone = factor(best_b$result_df$zone_kmeans))
+  )
+
+# PCA loadings for biplot vectors
+loadings_df <- as.data.frame(
+  best_b$pca$rotation[, 1:2]
+) %>%
+  rownames_to_column("variable") %>%
+  mutate(
+    # Clean variable names
+    variable = str_remove(variable, "_RF|_RK|_OK"),
+    variable = recode(variable, !!!soil_var_labels)
+  ) %>%
+  # Scale vectors for visibility
+  mutate(
+    PC1 = PC1 * max(abs(pca_df$PC1)) * 0.8,
+    PC2 = PC2 * max(abs(pca_df$PC2)) * 0.8
+  )
+
+# ── Biplot ────────────────────────────────────────────────
+p_biplot <- ggplot() +
+  # Points colored by zone
+  geom_point(data = pca_df,
+             aes(x = PC1, y = PC2,
+                 color = zone),
+             size = 0.3, alpha = 0.3) +
+  # Loading vectors
+  geom_segment(data = loadings_df,
+               aes(x = 0, y = 0,
+                   xend = PC1, yend = PC2),
+               arrow     = arrow(length = unit(0.2, "cm"),
+                                  type   = "closed"),
+               color     = "grey20",
+               linewidth = 0.5) +
+  # Variable labels
+  ggrepel::geom_text_repel(
+    data        = loadings_df,
+    aes(x = PC1, y = PC2, label = variable),
+    size        = 2.8,
+    color       = "grey10",
+    fontface    = "bold",
+    box.padding = 0.3,
+    max.overlaps = 20
+  ) +
+  # Zone centroids
+  stat_summary(data = pca_df,
+               aes(x = PC1, y = PC2,
+                   color = zone,
+                   label = zone),
+               fun.x   = mean,
+               fun.y   = mean,
+               geom    = "text",
+               size    = 4,
+               fontface = "bold") +
+  scale_color_brewer(palette = "Set2",
+                     name    = "Zone") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "right") +
+  labs(
+    title    = paste0("PCA biplot — ", best_nm),
+    subtitle = paste0(
+      "Points = grid pixels colored by zone. ",
+      "Vectors = soil property loadings on PC1 and PC2."
+    ),
+    x = paste0("PC1 (",
+               round(summary(best_b$pca)$importance[2, 1] * 100, 1),
+               "% variance)"),
+    y = paste0("PC2 (",
+               round(summary(best_b$pca)$importance[2, 2] * 100, 1),
+               "% variance)")
+  )
+
+print(p_biplot)
+
+# ── Side by side: spatial map + biplot ────────────────────
+zone_df_best <- best_pp$result_df_filled %>%
+  select(x, y, zone) %>%
+  filter(!is.na(zone))
+
+p_spatial_best <- ggplot(zone_df_best,
+                          aes(x = x, y = y,
+                              fill = factor(zone))) +
+  geom_raster() +
+  coord_equal() +
+  scale_fill_brewer(palette = "Set2",
+                    name    = "Zone") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "right") +
+  labs(
+    title = "Spatial zone map — COMP RF + lags",
+    x     = "Easting",
+    y     = "Northing"
+  )
+
+p_pca_final <- p_spatial_best + p_biplot +
+  plot_layout(ncol = 2, guides = "collect") +
+  plot_annotation(
+    title    = "PCA + k-means management zone delineation",
+    subtitle = paste0(
+      "Left: spatial zone map. ",
+      "Right: PCA biplot showing zone separation ",
+      "and soil property loading vectors."
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 11),
+      plot.subtitle = element_text(size = 9, color = "grey30")
+    )
+  )
+
+print(p_pca_final)
+
+ggsave("../outputs/fig_pca_zones_biplot.png",
+       p_pca_final,
+       width  = 12,
+       height = 5,
+       dpi    = 300)
+
+
+#do for comp_OK as well
+# ── COMP_OK biplot + spatial ───────────────────────────────
+best_nm_ok  <- "COMP_OK"
+best_b_ok   <- baseline_COMP_OK
+best_pp_ok  <- pp_baseline[["COMP_OK"]]
+
+# PCA scores + zone assignments
+pca_df_ok <- as.data.frame(best_b_ok$pca$x[, 1:2]) %>%
+  bind_cols(
+    tibble(zone = factor(best_b_ok$result_df$zone_kmeans))
+  )
+
+# PCA loadings
+loadings_df_ok <- as.data.frame(
+  best_b_ok$pca$rotation[, 1:2]
+) %>%
+  rownames_to_column("variable") %>%
+  mutate(
+    variable = str_remove(variable, "_RF|_RK|_OK"),
+    variable = recode(variable, !!!soil_var_labels)
+  ) %>%
+  mutate(
+    PC1 = PC1 * max(abs(pca_df_ok$PC1)) * 0.8,
+    PC2 = PC2 * max(abs(pca_df_ok$PC2)) * 0.8
+  )
+
+# ── Biplot ────────────────────────────────────────────────
+p_biplot_ok <- ggplot() +
+  geom_point(data  = pca_df_ok,
+             aes(x = PC1, y = PC2,
+                 color = zone),
+             size  = 0.3, alpha = 0.3) +
+  geom_segment(data = loadings_df_ok,
+               aes(x = 0, y = 0,
+                   xend = PC1, yend = PC2),
+               arrow     = arrow(
+                 length = unit(0.2, "cm"),
+                 type   = "closed"),
+               color     = "grey20",
+               linewidth = 0.5) +
+  ggrepel::geom_text_repel(
+    data         = loadings_df_ok,
+    aes(x = PC1, y = PC2, label = variable),
+    size         = 2.8,
+    color        = "grey10",
+    fontface     = "bold",
+    box.padding  = 0.3,
+    max.overlaps = 20
+  ) +
+  scale_color_brewer(palette = "Set2",
+                     name    = "Zone") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "right") +
+  labs(
+    title    = "PCA biplot — COMP OK",
+    subtitle = paste0(
+      "Points = grid pixels colored by zone. ",
+      "Vectors = soil property loadings."
+    ),
+    x = paste0("PC1 (",
+               round(summary(best_b_ok$pca)$importance[2, 1] * 100, 1),
+               "% variance)"),
+    y = paste0("PC2 (",
+               round(summary(best_b_ok$pca)$importance[2, 2] * 100, 1),
+               "% variance)")
+  )
+
+# ── Spatial map ───────────────────────────────────────────
+zone_df_ok <- best_pp_ok$result_df_filled %>%
+  select(x, y, zone) %>%
+  filter(!is.na(zone))
+
+p_spatial_ok <- ggplot(zone_df_ok,
+                        aes(x = x, y = y,
+                            fill = factor(zone))) +
+  geom_raster() +
+  coord_equal() +
+  scale_fill_brewer(palette = "Set2",
+                    name    = "Zone") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "right") +
+  labs(
+    title = "Spatial zone map — COMP OK",
+    x     = "Easting",
+    y     = "Northing"
+  )
+
+# ── Combined ──────────────────────────────────────────────
+p_ok_final <- p_spatial_ok + p_biplot_ok +
+  plot_layout(ncol = 2, guides = "collect") +
+  plot_annotation(
+    title    = "PCA + k-means — COMP OK",
+    subtitle = paste0(
+      "k = ", best_b_ok$best_k, " zones. ",
+      "Left: spatial map. Right: PCA biplot."
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 11),
+      plot.subtitle = element_text(size = 9, color = "grey30")
+    )
+  )
+
+print(p_ok_final)
+
+ggsave("../outputs/fig_pca_zones_COMP_OK.png",
+       p_ok_final,
+       width  = 12,
+       height = 5,
+       dpi    = 300)
+
+```
+```{r}
+#non silhouette method:
+
+# ── Step 1: Compute WCSS and detect elbow k ───────────────
+# Run this first to get elbow_k values
+
+run_pca_kmeans_wcss <- function(pred_df, 
+                                 methods   = c("RF", "RK"),
+                                 soil_vars,
+                                 k_range   = 2:15,
+                                 label     = "dataset") {
+  col_names     <- as.vector(outer(soil_vars, methods,
+                                    paste, sep = "_"))
+  col_names     <- col_names[col_names %in% names(pred_df)]
+  mat           <- pred_df %>%
+    select(all_of(col_names)) %>% as.matrix()
+  complete_rows <- complete.cases(mat)
+  xy_clean      <- pred_df %>%
+    select(x, y) %>% slice(which(complete_rows))
+
+  mat_scaled <- scale(mat[complete_rows, ])
+  col_ranges <- apply(mat_scaled, 2, function(x)
+    diff(range(x, na.rm = TRUE)))
+  const_cols <- !is.finite(mat_scaled[1, ]) |
+    col_ranges < 1e-10
+  if (any(const_cols)) {
+    mat_scaled <- mat_scaled[, !const_cols, drop = FALSE]
+  }
+  mat_scaled[!is.finite(mat_scaled)] <- 0
+
+  pca_out    <- prcomp(mat_scaled,
+                        center = FALSE, scale. = FALSE)
+  cum_var    <- cumsum(pca_out$sdev^2) /
+    sum(pca_out$sdev^2)
+  n_comp     <- which(cum_var >= 0.95)[1]
+  pca_scores <- pca_out$x[, seq_len(n_comp), drop = FALSE]
+
+  set.seed(20260401)
+  sil_idx <- sample(nrow(pca_scores),
+                    min(5000, nrow(pca_scores)))
+  pca_sub <- pca_scores[sil_idx, ]
+
+  # ── Compute WCSS across k range ───────────────────────
+  wcss_vals <- purrr::map_dbl(k_range, function(k) {
+    set.seed(20260401)
+    km <- kmeans(pca_sub, centers = k,
+                 nstart = 25, iter.max = 100)
+    km$tot.withinss
+  })
+
+  # ── Kneedle algorithm ─────────────────────────────────
+  x      <- k_range
+  y      <- wcss_vals
+  x_norm <- (x - min(x)) / (max(x) - min(x))
+  y_norm <- (y - min(y)) / (max(y) - min(y))
+  n      <- length(x_norm)
+  x1 <- x_norm[1]; y1 <- y_norm[1]
+  x2 <- x_norm[n]; y2 <- y_norm[n]
+  dist_to_line <- abs(
+    (y2 - y1) * x_norm -
+      (x2 - x1) * y_norm +
+      x2 * y1 - y2 * x1
+  ) / sqrt((y2 - y1)^2 + (x2 - x1)^2)
+  best_k <- x[which.max(dist_to_line)]
+
+  cat(label, "— elbow k:", best_k, "\n")
+
+  # ── Fit final kmeans with elbow k ─────────────────────
+  set.seed(20260401)
+  km_best <- kmeans(pca_scores,
+                    centers  = best_k,
+                    nstart   = 25,
+                    iter.max = 100)
+
+  result_df <- bind_cols(
+    xy_clean,
+    tibble(zone_kmeans = km_best$cluster)
+  ) %>% mutate(dataset = label, method = "PCA_kmeans")
+
+  list(
+    result_df    = result_df,
+    pca          = pca_out,
+    km           = km_best,
+    wcss_profile = tibble(k = k_range,
+                           wcss = wcss_vals),
+    best_k       = best_k,
+    elbow_k      = best_k
+  )
+}
+
+# ── Step 2: Rerun all 10 configurations ───────────────────
+cat("Rerunning PCA+kmeans with elbow-detected k...\n")
+
+baseline_SP_RF_elbow   <- run_pca_kmeans_wcss(
+  pred_stack_SP,   "RF", soil_vars,
+  label = "SP_RF")
+
+baseline_SP_RK_elbow   <- run_pca_kmeans_wcss(
+  pred_stack_SP,   "RK", soil_vars,
+  label = "SP_RK")
+
+baseline_SP_OK_elbow   <- run_pca_kmeans_wcss(
+  pred_stack_SP,   "OK", soil_vars,
+  label = "SP_OK")
+
+baseline_COMP_RF_elbow <- run_pca_kmeans_wcss(
+  pred_stack_COMP, "RF", soil_vars,
+  label = "COMP_RF")
+
+baseline_COMP_RK_elbow <- run_pca_kmeans_wcss(
+  pred_stack_COMP, "RK", soil_vars,
+  label = "COMP_RK")
+
+baseline_COMP_OK_elbow <- run_pca_kmeans_wcss(
+  pred_stack_COMP, "OK", soil_vars,
+  label = "COMP_OK")
+
+baseline_SP_RF_lags_elbow   <- run_pca_kmeans_wcss(
+  pred_stack_SP_lag,   "RF", soil_vars,
+  label = "SP_RF_lags_kmeans")
+
+baseline_SP_RK_lags_elbow   <- run_pca_kmeans_wcss(
+  pred_stack_SP_lag,   "RK", soil_vars,
+  label = "SP_RK_lags_kmeans")
+
+baseline_COMP_RF_lags_elbow <- run_pca_kmeans_wcss(
+  pred_stack_COMP_lag, "RF", soil_vars,
+  label = "COMP_RF_lags_kmeans")
+
+baseline_COMP_RK_lags_elbow <- run_pca_kmeans_wcss(
+  pred_stack_COMP_lag, "RK", soil_vars,
+  label = "COMP_RK_lags_kmeans")
+
+beep("coin")
+
+# ── Step 3: Print elbow k summary ─────────────────────────
+elbow_summary <- tibble(
+  config  = c("SP_RF", "SP_RK", "SP_OK",
+              "COMP_RF", "COMP_RK", "COMP_OK",
+              "SP_RF_lags", "SP_RK_lags",
+              "COMP_RF_lags", "COMP_RK_lags"),
+  elbow_k = c(
+    baseline_SP_RF_elbow$best_k,
+    baseline_SP_RK_elbow$best_k,
+    baseline_SP_OK_elbow$best_k,
+    baseline_COMP_RF_elbow$best_k,
+    baseline_COMP_RK_elbow$best_k,
+    baseline_COMP_OK_elbow$best_k,
+    baseline_SP_RF_lags_elbow$best_k,
+    baseline_SP_RK_lags_elbow$best_k,
+    baseline_COMP_RF_lags_elbow$best_k,
+    baseline_COMP_RK_lags_elbow$best_k
+  )
+)
+
+print(elbow_summary)
+
+# ── Step 4: Post-process elbow zones ──────────────────────
+pp_baseline_elbow <- list(
+  SP_RF        = post_process_kmeans(
+    baseline_SP_RF_elbow$result_df),
+  SP_RK        = post_process_kmeans(
+    baseline_SP_RK_elbow$result_df),
+  SP_OK        = post_process_kmeans(
+    baseline_SP_OK_elbow$result_df),
+  COMP_RF      = post_process_kmeans(
+    baseline_COMP_RF_elbow$result_df),
+  COMP_RK      = post_process_kmeans(
+    baseline_COMP_RK_elbow$result_df),
+  COMP_OK      = post_process_kmeans(
+    baseline_COMP_OK_elbow$result_df),
+  SP_RF_lags   = post_process_kmeans(
+    baseline_SP_RF_lags_elbow$result_df),
+  SP_RK_lags   = post_process_kmeans(
+    baseline_SP_RK_lags_elbow$result_df),
+  COMP_RF_lags = post_process_kmeans(
+    baseline_COMP_RF_lags_elbow$result_df),
+  COMP_RK_lags = post_process_kmeans(
+    baseline_COMP_RK_lags_elbow$result_df)
+)
+
+# ── Step 5: Save rasters ───────────────────────────────────
+purrr::iwalk(pp_baseline_elbow, function(pp, nm) {
+  writeRaster(
+    pp$zone_rast_smooth,
+    paste0("../outputs/zones_", nm,
+           "_kmeans_elbow_smooth.tif"),
+    overwrite = TRUE)
+  cat("Saved:", nm, "\n")
+})
+
+# ── Step 6: Quick zone maps ────────────────────────────────
+purrr::iwalk(pp_baseline_elbow, function(pp, nm) {
+  zone_df <- pp$result_df_filled %>%
+    select(x, y, zone) %>%
+    filter(!is.na(zone))
+
+  p <- ggplot(zone_df,
+              aes(x = x, y = y,
+                  fill = factor(zone))) +
+    geom_raster() +
+    coord_equal() +
+    scale_fill_brewer(palette = "Set2",
+                      name    = "Zone") +
+    theme_bw(base_size = 10) +
+    theme(
+      axis.text       = element_text(size = 7),
+      legend.position = "right"
+    ) +
+    labs(
+      title = paste0("PCA + k-means (elbow k) — ", nm),
+      x     = "Easting",
+      y     = "Northing"
+    )
+
+  print(p)
+})
+
+# ── Step 7: WCSS elbow plots ───────────────────────────────
+bind_rows(
+  baseline_SP_RF_elbow$wcss_profile        %>%
+    mutate(config = "SP_RF"),
+  baseline_SP_RK_elbow$wcss_profile        %>%
+    mutate(config = "SP_RK"),
+  baseline_SP_OK_elbow$wcss_profile        %>%
+    mutate(config = "SP_OK"),
+  baseline_COMP_RF_elbow$wcss_profile      %>%
+    mutate(config = "COMP_RF"),
+  baseline_COMP_RK_elbow$wcss_profile      %>%
+    mutate(config = "COMP_RK"),
+  baseline_COMP_OK_elbow$wcss_profile      %>%
+    mutate(config = "COMP_OK"),
+  baseline_SP_RF_lags_elbow$wcss_profile   %>%
+    mutate(config = "SP_RF_lags"),
+  baseline_SP_RK_lags_elbow$wcss_profile   %>%
+    mutate(config = "SP_RK_lags"),
+  baseline_COMP_RF_lags_elbow$wcss_profile %>%
+    mutate(config = "COMP_RF_lags"),
+  baseline_COMP_RK_lags_elbow$wcss_profile %>%
+    mutate(config = "COMP_RK_lags")
+) %>%
+  left_join(elbow_summary, by = "config") %>%
+  ggplot(aes(x = k, y = wcss, color = config)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.5) +
+  geom_vline(data = elbow_summary,
+             aes(xintercept = elbow_k,
+                 color      = config),
+             linetype  = "dashed",
+             linewidth = 0.4,
+             alpha     = 0.7) +
+  scale_color_brewer(palette = "Paired",
+                     name    = "Configuration") +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position = "right",
+    legend.text     = element_text(size = 8),
+    legend.key.size = unit(0.4, "cm")
+  ) +
+  labs(
+    title    = "Elbow method — PCA + k-means (kneedle detection)",
+    subtitle = paste0(
+      "Dashed vertical lines = automatically detected elbow k ",
+      "per configuration (Satopaa et al., 2011)."
+    ),
+    x = "Number of zones (k)",
+    y = "Total within-cluster SS"
+  )
+
+ggsave("../outputs/fig_elbow_wcss.png",
+       width = 10, height = 6, dpi = 300)
+
+save.image("../outputs/workspace_pca_elbow.RData")
+beep("complete")
+
+
+# ── Plot POST-PROCESSED smoothed zones ────────────────────
+# Uses zone_rast_smooth — after majority filter
+# Equivalent to what UMAP plots show
+
+purrr::iwalk(pp_baseline_elbow, function(pp, nm) {
+
+  # Convert smoothed raster to data frame for plotting
+  zone_df_smooth <- as.data.frame(
+    pp$zone_rast_smooth,
+    xy = TRUE, na.rm = TRUE
+  ) %>%
+    rename(zone = 3)
+
+  # Raw (pre-filter) from result_df
+  zone_df_raw <- pp$result_df_filled %>%
+    select(x, y, zone) %>%
+    filter(!is.na(zone))
+
+  # ── Raw zones ───────────────────────────────────────────
+  p_raw <- ggplot(zone_df_raw,
+                  aes(x = x, y = y,
+                      fill = factor(zone))) +
+    geom_raster() +
+    coord_equal() +
+    scale_fill_brewer(palette = "Set2",
+                      name    = "Zone") +
+    theme_bw(base_size = 9) +
+    theme(
+      axis.text       = element_text(size = 6),
+      legend.position = "right",
+      plot.title      = element_text(size = 9,
+                                      face = "bold")
+    ) +
+    labs(
+      title = paste0("Raw — ", nm),
+      x     = "Easting",
+      y     = "Northing"
+    )
+
+  # ── Smoothed zones ──────────────────────────────────────
+  p_smooth <- ggplot(zone_df_smooth,
+                     aes(x = x, y = y,
+                         fill = factor(zone))) +
+    geom_raster() +
+    coord_equal() +
+    scale_fill_brewer(palette = "Set2",
+                      name    = "Zone") +
+    theme_bw(base_size = 9) +
+    theme(
+      axis.text       = element_text(size = 6),
+      legend.position = "right",
+      plot.title      = element_text(size = 9,
+                                      face = "bold")
+    ) +
+    labs(
+      title = paste0("Smoothed (5×5 modal) — ", nm),
+      x     = "Easting",
+      y     = "Northing"
+    )
+
+  # ── Side by side ────────────────────────────────────────
+  p_combined <- p_raw + p_smooth +
+    plot_layout(ncol = 2, guides = "collect") +
+    plot_annotation(
+      title    = paste0("PCA + k-means post-processing — ",
+                        nm),
+      subtitle = paste0(
+        "Left: raw k-means zones. ",
+        "Right: after 5×5 majority filter. ",
+        "k = ", pp$result_df_filled %>%
+          pull(zone) %>% n_distinct(), " zones."
+      ),
+      theme = theme(
+        plot.title    = element_text(face = "bold",
+                                      size = 10),
+        plot.subtitle = element_text(size = 8,
+                                      color = "grey30")
+      )
+    )
+
+  print(p_combined)
+
+  # Save each config
+  ggsave(
+    paste0("../outputs/fig_pca_elbow_postprocess_",
+           nm, ".png"),
+    p_combined,
+    width  = 10,
+    height = 4.5,
+    dpi    = 300
+  )
+
+  cat("Plotted:", nm, "\n")
+})
+
+# ── Best config side by side with UMAP ────────────────────
+# Most useful thesis figure — direct visual comparison
+# after post-processing for both methods
+
+# COMP RF lags — best configuration
+comp_rf_lags_smooth <- as.data.frame(
+  pp_baseline_elbow[["COMP_RF_lags"]]$zone_rast_smooth,
+  xy = TRUE, na.rm = TRUE
+) %>% rename(zone = 3)
+
+umap_comp_rf_lags <- pp_named[["COMP_RF_lags"]]$result_df_filled %>%
+  select(x, y, zone) %>%
+  filter(!is.na(zone))
+
+p_pca_best <- ggplot(comp_rf_lags_smooth,
+                      aes(x = x, y = y,
+                          fill = factor(zone))) +
+  geom_raster() +
+  coord_equal() +
+  scale_fill_brewer(palette = "Set2", name = "Zone") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "right") +
+  labs(
+    title    = paste0("PCA + k-means (elbow k = ",
+                      pp_baseline_elbow[["COMP_RF_lags"]]$result_df_filled %>%
+                        pull(zone) %>% n_distinct(),
+                      ") — COMP RF + lags"),
+    subtitle = "After 5×5 majority filter",
+    x = "Easting", y = "Northing"
+  )
+
+p_umap_best <- ggplot(umap_comp_rf_lags,
+                       aes(x = x, y = y,
+                           fill = factor(zone))) +
+  geom_raster() +
+  coord_equal() +
+  scale_fill_brewer(palette = "Set2", name = "Zone") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "right") +
+  labs(
+    title    = paste0("UMAP + HDBSCAN (k = ",
+                      umap_comp_rf_lags %>%
+                        pull(zone) %>%
+                        n_distinct(),
+                      ") — COMP RF + lags"),
+    subtitle = "After noise fill + 5×5 majority filter",
+    x = "Easting", y = "Northing"
+  )
+
+p_method_comparison <- p_pca_best + p_umap_best +
+  plot_layout(ncol = 2, guides = "collect") +
+  plot_annotation(
+    title    = "Zone map comparison after post-processing",
+    subtitle = paste0(
+      "Best configuration: COMP RF + spatial lags. ",
+      "Left: PCA + k-means (elbow k). ",
+      "Right: UMAP + HDBSCAN."
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 11),
+      plot.subtitle = element_text(size = 9,
+                                    color = "grey30")
+    )
+  )
+
+print(p_method_comparison)
+#plot just all of the smoothed ones:
+
+
+ggsave("../outputs/fig_method_comparison_postprocess.png",
+       p_method_comparison,
+       width  = 10,
+       height = 5,
+       dpi    = 300)
+
+
+
+# ── Print smoothed zones only ─────────────────────────────
+purrr::iwalk(pp_baseline_elbow, function(pp, nm) {
+
+  zone_df_smooth <- as.data.frame(
+    pp$zone_rast_smooth,
+    xy = TRUE, na.rm = TRUE
+  ) %>%
+    rename(zone = 3) %>%
+  filter(!is.na(zone)) 
+
+  p_smooth <- ggplot(zone_df_smooth,
+                     aes(x = x, y = y,
+                         fill = factor(zone))) +
+    geom_raster() +
+    coord_equal() +
+    scale_fill_brewer(palette = "Set2",
+                      name    = "Zone") +
+    theme_bw(base_size = 9) +
+    theme(
+      axis.text       = element_text(size = 6),
+      legend.position = "right",
+      plot.title      = element_text(size = 9,
+                                      face = "bold")
+    ) +
+    labs(
+      title    = paste0("PCA + k-means (elbow k = ",
+                        n_distinct(zone_df_smooth$zone),
+                        ") — ", nm),
+      subtitle = "Post-processed: 5×5 majority filter applied",
+      x        = "Easting",
+      y        = "Northing"
+    )
+
+  print(p_smooth)
+})
+```
+
 
 # ============================================================
 # PHASE 8 — Zone Validation Metrics
@@ -2716,6 +4638,9 @@ beep("complete")
 # Lag augmentation loses its benefit — COMP_RF_lags was your Chapter 1 winner but drops to 0 sig vars here. The spatial lag features may have been capturing structure in the dropped variables (lbc_1, mn, zn) more than in the agronomic subset
 # SP configurations become more competitive — SP_RF_nolags and SP_RK_nolags now match or beat COMP configs on n_sig, suggesting composite sampling's advantage diminishes when the variable set is reduced
 # The best agronomic config is SP_RF_nolags or SP_RK_nolags with 3 significant variables each
+
+
+
 ```
 
 # ============================================================
