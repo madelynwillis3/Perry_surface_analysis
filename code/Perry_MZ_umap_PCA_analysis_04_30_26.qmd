@@ -4103,6 +4103,1025 @@ save.image("../outputs/workspace_final.RData")
 beep("complete")
 ```
 
+```{r}
+# ── Composite score summary figure ────────────────────────
+score_plot_data <- final_summary %>%
+  left_join(final_ranked, by = "configuration") %>%
+  mutate(
+    # X axis grouping
+    x_group = case_when(
+      clustering == "PCA+kmeans" & !spatial_lags  ~ "PCA\nNo lags",
+      clustering == "PCA+kmeans" &  spatial_lags  ~ "PCA\nWith lags",
+      clustering == "UMAP+HDBSCAN" & !spatial_lags ~ "UMAP\nNo lags",
+      clustering == "UMAP+HDBSCAN" &  spatial_lags ~ "UMAP\nWith lags"
+    ),
+    x_group = factor(x_group,
+                     levels = c("PCA\nNo lags",
+                                "PCA\nWith lags",
+                                "UMAP\nNo lags",
+                                "UMAP\nWith lags")),
+    # Line type by sampling design
+    line_type = if_else(sampling_design == "Single-point",
+                        "SP", "COMP"),
+    # Color by prediction method
+    pred_method = factor(pred_method,
+                         levels = c("RF", "RK", "OK"))
+  )
+
+method_colors <- c(
+  "RF" = "#27ae60",   # green
+  "RK" = "#8e44ad",    # purple
+  "OK" = "#2980b9"   # blue
+)
+
+p_score_summary <- score_plot_data %>%
+  ggplot(aes(x     = x_group,
+             y     = Score,
+             color = pred_method,
+             linetype = line_type,
+             group = interaction(pred_method,
+                                 line_type,
+                                 clustering))) +
+  geom_line(linewidth = 0.9, alpha = 0.85) +
+  geom_point(aes(shape = line_type),
+             size = 3.5, alpha = 0.9) +
+  # Reference line at median score
+  geom_hline(yintercept = median(score_plot_data$Score,
+                                  na.rm = TRUE),
+             linetype   = "dotted",
+             color      = "grey50",
+             linewidth  = 0.5) +
+  # Vertical separator between PCA and UMAP
+  geom_vline(xintercept = 2.5,
+             linetype   = "solid",
+             color      = "grey80",
+             linewidth  = 0.4) +
+  scale_color_manual(
+    values = method_colors,
+    name   = "Prediction method"
+  ) +
+  scale_linetype_manual(
+    values = c("SP"   = "dashed",
+               "COMP" = "solid"),
+    name   = "Sampling design",
+    labels = c("SP"   = "Single-point",
+               "COMP" = "Composite")
+  ) +
+  scale_shape_manual(
+    values = c("SP"   = 17,   # triangle
+               "COMP" = 16),  # circle
+    name   = "Sampling design",
+    labels = c("SP"   = "Single-point",
+               "COMP" = "Composite")
+  ) +
+  # Annotate method panels
+  annotate("text", x = 1.5, y = max(score_plot_data$Score,
+                                     na.rm = TRUE) + 0.02,
+           label = "PCA + k-means",
+           size = 3.5, color = "grey30", fontface = "bold") +
+  annotate("text", x = 3.5, y = max(score_plot_data$Score,
+                                     na.rm = TRUE) + 0.02,
+           label = "UMAP + HDBSCAN",
+           size = 3.5, color = "grey30", fontface = "bold") +
+  scale_y_continuous(limits = c(0.25, 0.80),
+                     breaks = seq(0.3, 0.8, 0.1)) +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position    = "bottom",
+    legend.box         = "horizontal",
+    legend.title       = element_text(size = 9,
+                                       face = "bold"),
+    legend.text        = element_text(size = 9),
+    legend.key.width   = unit(1.2, "cm"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    axis.text.x        = element_text(size = 10),
+    plot.title         = element_text(face = "bold",
+                                       size = 12)
+  ) +
+  guides(
+    color    = guide_legend(order = 1,
+                             override.aes = list(
+                               linetype = "solid",
+                               shape    = 16)),
+    linetype = guide_legend(order = 2),
+    shape    = guide_legend(order = 2)
+  ) +
+  labs(
+    title    = "Composite zone quality score by clustering approach and configuration",
+    subtitle = paste0(
+      "Score = normalized composite index (0–1, higher = better) ",
+      "across seven zone quality metrics.\n",
+      "Dotted line = median score across all configurations."
+    ),
+    x = NULL,
+    y = "Composite score"
+  )
+
+print(p_score_summary)
+
+ggsave("../outputs/fig_composite_score_summary.png",
+       p_score_summary,
+       width  = 9,
+       height = 6,
+       dpi    = 300)
+
+# ── Score vs VR_obs scatter with all dimensions ───────────
+score_vr_data <- final_summary %>%
+  left_join(final_ranked, by = "configuration") %>%
+  mutate(
+    pred_method  = factor(pred_method,
+                          levels = c("RF", "RK", "OK")),
+    clustering_f = factor(clustering,
+                          levels = c("PCA+kmeans",
+                                     "UMAP+HDBSCAN")),
+    sampling_f   = factor(sampling_design,
+                          levels = c("Single-point",
+                                     "Composite")),
+    lag_label    = if_else(spatial_lags,
+                           "With lags", "No lags"),
+    lag_label    = factor(lag_label,
+                          levels = c("No lags",
+                                     "With lags"))
+  )
+
+method_colors <- c(
+  "RF" = "#27ae60",   # green
+  "RK" = "#8e44ad",    # purple
+  "OK" = "#2980b9"   # blue
+)
+
+p_score_vr <- score_vr_data %>%
+  filter(!is.na(observed_VR_med), !is.na(Score)) %>%
+  ggplot(aes(x     = observed_VR_med,
+             y     = Score,
+             color = pred_method,
+             shape = clustering_f)) +
+  # Draw lines connecting lag to no-lag for same config family
+  geom_line(
+    data = score_vr_data %>%
+      filter(!is.na(observed_VR_med), !is.na(Score)) %>%
+      mutate(
+        # Group key: same method + sampling + clustering
+        line_group = paste(pred_method, sampling_design,
+                           clustering, sep = "_")
+      ),
+    aes(group = line_group),
+    color     = "grey70",
+    linewidth = 0.4,
+    alpha     = 0.7
+  ) +
+  # Points — size by number of zones
+  geom_point(aes(size = n_zones, alpha = lag_label)) +
+  scale_alpha_manual(
+    values = c("No lags"   = 0.55,
+               "With lags" = 1.0),
+    name   = "Spatial lags"
+  ) +
+  scale_color_manual(
+    values = method_colors,
+    name   = "Prediction method"
+  ) +
+  scale_shape_manual(
+    values = c("PCA+kmeans"   = 15,   # square
+               "UMAP+HDBSCAN" = 16),  # circle
+    name   = "Clustering approach"
+  ) +
+  scale_size_continuous(
+    name   = "Zone count (k)",
+    range  = c(2, 6),
+    breaks = c(2, 4, 6, 7)
+  ) +
+  # Reference lines
+  geom_hline(yintercept = 0.5,
+             linetype   = "dashed",
+             color      = "grey60",
+             linewidth  = 0.4) +
+  geom_vline(xintercept = 0,
+             linetype   = "dashed",
+             color      = "grey60",
+             linewidth  = 0.4) +
+  # Quadrant labels
+  annotate("text", x = -0.85, y = 0.74,
+           label    = "High score\nnegative VR_obs",
+           size     = 2.8, color = "grey45",
+           fontface = "italic", hjust = 0) +
+  annotate("text", x = 0.05, y = 0.74,
+           label    = "High score\npositive VR_obs",
+           size     = 2.8, color = "grey45",
+           fontface = "italic", hjust = 0) +
+  annotate("text", x = -0.85, y = 0.27,
+           label    = "Low score\nnegative VR_obs",
+           size     = 2.8, color = "grey45",
+           fontface = "italic", hjust = 0) +
+  annotate("text", x = 0.05, y = 0.27,
+           label    = "Low score\npositive VR_obs",
+           size     = 2.8, color = "grey45",
+           fontface = "italic", hjust = 0) +
+  # Facet by sampling design
+  facet_wrap(~ sampling_f, ncol = 2) +
+  theme_bw(base_size = 10) +
+  theme(
+    legend.position    = "bottom",
+    legend.box         = "vertical",
+    legend.title       = element_text(size = 9,
+                                       face = "bold"),
+    legend.text        = element_text(size = 8),
+    strip.background   = element_rect(fill = "grey92"),
+    strip.text         = element_text(face = "bold",
+                                       size = 10),
+    panel.grid.minor   = element_blank()
+  ) +
+  guides(
+    color = guide_legend(order = 1,
+                          override.aes = list(size = 3,
+                                               alpha = 1)),
+    shape = guide_legend(order = 2,
+                          override.aes = list(size = 3,
+                                               alpha = 1)),
+    alpha = guide_legend(order = 3,
+                          override.aes = list(size = 3,
+                                               shape = 16)),
+    size  = guide_legend(order = 4)
+  ) +
+  labs(
+    title    = "Composite score vs observed variance reduction",
+    subtitle = paste0(
+      "Grey lines connect no-lag to with-lag versions ",
+      "of the same configuration.\n",
+      "Point opacity: faded = no lags, solid = with lags. ",
+      "Point size = zone count (k).\n",
+      "Dashed lines = Score = 0.5 and VR_obs = 0 thresholds."
+    ),
+    x = expression("VR"[obs]*" (median, held-out validation)"),
+    y = "Composite score"
+  )
+
+print(p_score_vr)
+
+ggsave("../outputs/fig_score_vs_vrobs.png",
+       p_score_vr,
+       width  = 10,
+       height = 6,
+       dpi    = 300)
+```
+```{r}
+# ── Figure 1: VIP predictors across RF and RK final models ─
+
+# ── Extract RK RF importance from final models ─────────────
+# RK uses an RF for the trend component — extract from that
+importance_rk_SP <- purrr::map_dfr(soil_vars, function(v) {
+  rf_trend <- final_models_SP[[v]]$rk$rf_fit
+  imp <- importance(rf_trend, type = 1)
+  tibble(
+    covariate   = rownames(imp),
+    pct_inc_mse = imp[, 1],
+    variable    = v,
+    dataset     = "SP",
+    method      = "RK"
+  )
+})
+
+importance_rk_COMP <- purrr::map_dfr(soil_vars, function(v) {
+  rf_trend <- final_models_COMP[[v]]$rk$rf_fit
+  imp <- importance(rf_trend, type = 1)
+  tibble(
+    covariate   = rownames(imp),
+    pct_inc_mse = imp[, 1],
+    variable    = v,
+    dataset     = "COMP",
+    method      = "RK"
+  )
+})
+
+# Combine RF and RK importance
+importance_rf_rk <- bind_rows(
+  importance_SP   %>% mutate(method = "RF"),
+  importance_COMP %>% mutate(method = "RF"),
+  importance_rk_SP,
+  importance_rk_COMP
+)
+
+# ── Top 15 covariates per method × dataset ────────────────
+top_covariates <- importance_rf_rk %>%
+  group_by(method, dataset, covariate) %>%
+  summarise(
+    mean_imp = mean(pct_inc_mse, na.rm = TRUE),
+    .groups  = "drop"
+  ) %>%
+  group_by(method, dataset) %>%
+  slice_max(mean_imp, n = 15) %>%
+  ungroup()
+
+# Get consistent covariate ordering by overall mean importance
+covariate_order <- importance_rf_rk %>%
+  group_by(covariate) %>%
+  summarise(overall_mean = mean(pct_inc_mse, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(overall_mean)) %>%
+  pull(covariate)
+
+p_vip <- top_covariates %>%
+  mutate(
+    covariate = factor(covariate,
+                       levels = rev(covariate_order)),
+    dataset   = factor(dataset,
+                       levels = c("SP", "COMP"),
+                       labels = c("Single-Point",
+                                  "Composite")),
+    method    = factor(method, levels = c("RF", "RK"))
+  ) %>%
+  ggplot(aes(x    = covariate,
+             y    = mean_imp,
+             fill = method)) +
+  geom_col(position = position_dodge(0.8),
+           width     = 0.7) +
+  scale_fill_manual(
+    values = c("RF" = "#2980b9",
+               "RK" = "#27ae60"),
+    name   = "Model"
+  ) +
+  facet_wrap(~ dataset, ncol = 2) +
+  coord_flip() +
+  theme_bw(base_size = 10) +
+  theme(
+    strip.background   = element_rect(fill = "grey92"),
+    strip.text         = element_text(face = "bold", size = 10),
+    legend.position    = "bottom",
+    panel.grid.major.y = element_blank()
+  ) +
+  labs(
+    title    = "Top 15 VIP covariates — RF and RK final models",
+    subtitle = paste0(
+      "Mean %IncMSE across all 9 soil variables. ",
+      "RK importance derived from RF trend component."
+    ),
+    x = NULL,
+    y = "Mean %IncMSE"
+  )
+
+print(p_vip)
+ggsave("../outputs/fig_vip_rf_rk.png",
+       p_vip, width = 12, height = 7, dpi = 300)
+
+# ── Figure 2: VIP weighted by model performance ───────────
+# Weight each covariate's importance by the composite Score
+# of the configuration it came from
+# Higher-scoring configurations contribute more to the
+# weighted importance
+
+# Get scores for RF and RK configurations
+config_scores <- final_summary %>%
+  left_join(final_ranked, by = "configuration") %>%
+  filter(pred_method %in% c("RF", "RK")) %>%
+  select(sampling_design, pred_method, Score) %>%
+  mutate(
+    dataset = if_else(sampling_design == "Single-point",
+                      "SP", "COMP"),
+    method  = pred_method
+  ) %>%
+  group_by(dataset, method) %>%
+  summarise(mean_score = mean(Score, na.rm = TRUE),
+            .groups    = "drop")
+
+cat("Configuration scores used for weighting:\n")
+print(config_scores)
+
+# Join scores to importance and compute weighted importance
+importance_weighted <- importance_rf_rk %>%
+  left_join(config_scores,
+            by = c("dataset", "method")) %>%
+  mutate(
+    weighted_imp = pct_inc_mse * mean_score
+  ) %>%
+  group_by(dataset, method, covariate) %>%
+  summarise(
+    mean_imp          = mean(pct_inc_mse,   na.rm = TRUE),
+    mean_weighted_imp = mean(weighted_imp,  na.rm = TRUE),
+    mean_score        = first(mean_score),
+    .groups           = "drop"
+  )
+
+# Top 15 by weighted importance
+top_weighted <- importance_weighted %>%
+  group_by(dataset, method) %>%
+  slice_max(mean_weighted_imp, n = 15) %>%
+  ungroup()
+
+# Ordering by overall weighted importance
+weighted_order <- importance_weighted %>%
+  group_by(covariate) %>%
+  summarise(
+    overall_weighted = mean(mean_weighted_imp, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(overall_weighted)) %>%
+  pull(covariate)
+
+p_vip_weighted <- top_weighted %>%
+  mutate(
+    covariate = factor(covariate,
+                       levels = rev(weighted_order)),
+    dataset   = factor(dataset,
+                       levels = c("SP", "COMP"),
+                       labels = c("Single-Point",
+                                  "Composite")),
+    method    = factor(method, levels = c("RF", "RK"))
+  ) %>%
+  ggplot(aes(x    = covariate,
+             y    = mean_weighted_imp,
+             fill = method)) +
+  geom_col(position = position_dodge(0.8),
+           width     = 0.7) +
+  # Overlay unweighted importance as points for comparison
+  geom_point(aes(y     = mean_imp,
+                 color = method),
+             position = position_dodge(0.8),
+             size     = 1.5,
+             shape    = 18,
+             alpha    = 0.7) +
+  scale_fill_manual(
+    values = c("RF" = "#2980b9",
+               "RK" = "#27ae60"),
+    name   = "Model (bars = weighted)"
+  ) +
+  scale_color_manual(
+    values = c("RF" = "#1a5276",
+               "RK" = "#1e8449"),
+    name   = "Model (diamonds = unweighted)"
+  ) +
+  facet_wrap(~ dataset, ncol = 2) +
+  coord_flip() +
+  theme_bw(base_size = 10) +
+  theme(
+    strip.background   = element_rect(fill = "grey92"),
+    strip.text         = element_text(face = "bold",
+                                       size = 10),
+    legend.position    = "bottom",
+    legend.box         = "vertical",
+    panel.grid.major.y = element_blank()
+  ) +
+  labs(
+    title    = "Performance-weighted VIP covariates — RF and RK",
+    subtitle = paste0(
+      "Bars = %IncMSE × mean composite score of configuration. ",
+      "Diamonds = unweighted %IncMSE.\n",
+      "Higher-scoring configurations contribute more to ",
+      "weighted importance. ",
+      "Top 15 covariates by weighted importance shown."
+    ),
+    x = NULL,
+    y = "Weighted importance (% IncMSE × Score)"
+  )
+
+print(p_vip_weighted)
+ggsave("../outputs/fig_vip_weighted_by_score.png",
+       p_vip_weighted,
+       width = 12, height = 7, dpi = 300)
+
+#without single bands:
+# Single bands to exclude — raw spectral channels
+single_bands <- c("coastal_blue", "blue", "green_i", "green",
+                  "yellow", "red", "rededge", "nir")
+
+# ── Figure 1: VIP — no single bands ───────────────────────
+top_covariates_filtered <- importance_rf_rk %>%
+  filter(!covariate %in% single_bands) %>%
+  group_by(method, dataset, covariate) %>%
+  summarise(
+    mean_imp = mean(pct_inc_mse, na.rm = TRUE),
+    .groups  = "drop"
+  ) %>%
+  group_by(method, dataset) %>%
+  slice_max(mean_imp, n = 15) %>%
+  ungroup()
+
+covariate_order_filtered <- importance_rf_rk %>%
+  filter(!covariate %in% single_bands) %>%
+  group_by(covariate) %>%
+  summarise(overall_mean = mean(pct_inc_mse, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(overall_mean)) %>%
+  pull(covariate)
+
+p_vip_filtered <- top_covariates_filtered %>%
+  mutate(
+    covariate = factor(covariate,
+                       levels = rev(covariate_order_filtered)),
+    dataset   = factor(dataset,
+                       levels = c("SP", "COMP"),
+                       labels = c("Single-Point", "Composite")),
+    method    = factor(method, levels = c("RF", "RK"))
+  ) %>%
+  ggplot(aes(x = covariate, y = mean_imp, fill = method)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  scale_fill_manual(
+    values = c("RF" = "#2980b9", "RK" = "#27ae60"),
+    name   = "Model"
+  ) +
+  facet_wrap(~ dataset, ncol = 2) +
+  coord_flip() +
+  theme_bw(base_size = 10) +
+  theme(
+    strip.background   = element_rect(fill = "grey92"),
+    strip.text         = element_text(face = "bold", size = 10),
+    legend.position    = "bottom",
+    panel.grid.major.y = element_blank()
+  ) +
+  labs(
+    title    = "Top 15 VIP covariates — RF and RK final models",
+    subtitle = paste0(
+      "Mean %IncMSE across all 9 soil variables. ",
+      "Single spectral bands excluded. ",
+      "RK importance from RF trend component."
+    ),
+    x = NULL,
+    y = "Mean %IncMSE"
+  )
+
+print(p_vip_filtered)
+ggsave("../outputs/fig_vip_rf_rk_filtered.png",
+       p_vip_filtered, width = 12, height = 7, dpi = 300)
+
+# ── Figure 2: Weighted VIP — no single bands ──────────────
+top_weighted_filtered <- importance_weighted %>%
+  filter(!covariate %in% single_bands) %>%
+  group_by(dataset, method) %>%
+  slice_max(mean_weighted_imp, n = 15) %>%
+  ungroup()
+
+weighted_order_filtered <- importance_weighted %>%
+  filter(!covariate %in% single_bands) %>%
+  group_by(covariate) %>%
+  summarise(
+    overall_weighted = mean(mean_weighted_imp, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(overall_weighted)) %>%
+  pull(covariate)
+
+p_vip_weighted_filtered <- top_weighted_filtered %>%
+  mutate(
+    covariate = factor(covariate,
+                       levels = rev(weighted_order_filtered)),
+    dataset   = factor(dataset,
+                       levels = c("SP", "COMP"),
+                       labels = c("Single-Point", "Composite")),
+    method    = factor(method, levels = c("RF", "RK"))
+  ) %>%
+  ggplot(aes(x = covariate, y = mean_weighted_imp,
+             fill = method)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_point(aes(y = mean_imp, color = method),
+             position = position_dodge(0.8),
+             size = 1.5, shape = 18, alpha = 0.7) +
+  scale_fill_manual(
+    values = c("RF" = "#2980b9", "RK" = "#27ae60"),
+    name   = "Model (bars = weighted)"
+  ) +
+  scale_color_manual(
+    values = c("RF" = "#1a5276", "RK" = "#1e8449"),
+    name   = "Model (diamonds = unweighted)"
+  ) +
+  facet_wrap(~ dataset, ncol = 2) +
+  coord_flip() +
+  theme_bw(base_size = 10) +
+  theme(
+    strip.background   = element_rect(fill = "grey92"),
+    strip.text         = element_text(face = "bold", size = 10),
+    legend.position    = "bottom",
+    legend.box         = "vertical",
+    panel.grid.major.y = element_blank()
+  ) +
+  labs(
+    title    = "Performance-weighted VIP covariates — RF and RK",
+    subtitle = paste0(
+      "Bars = %IncMSE × mean composite score. ",
+      "Diamonds = unweighted %IncMSE. ",
+      "Single spectral bands excluded.\n",
+      "Top 15 covariates by weighted importance shown."
+    ),
+    x = NULL,
+    y = "Weighted importance (%IncMSE × Score)"
+  )
+
+print(p_vip_weighted_filtered)
+ggsave("../outputs/fig_vip_weighted_filtered.png",
+       p_vip_weighted_filtered,
+       width = 12, height = 7, dpi = 300)
+
+```
+```{r}
+# ── Figure 1: PCA biplot + spatial map — COMP RF lags ─────
+# Best PCA configuration
+
+best_pca_nm  <- "COMP_RF_lags"
+best_pca_b   <- baseline_COMP_RF_lags_elbow
+best_pca_pp  <- pp_baseline[[best_pca_nm]]
+
+# PCA scores + zone assignments
+pca_df_best <- as.data.frame(best_pca_b$pca$x[, 1:2]) %>%
+  bind_cols(
+    tibble(zone = factor(best_pca_b$result_df$zone_kmeans))
+  )
+
+# PCA loadings — fixed
+loadings_df_best <- as.data.frame(
+  best_pca_b$pca$rotation[, 1:2]
+) %>%
+  rownames_to_column("variable") %>%
+  mutate(
+    # Strip method and lag suffixes to get soil var name
+    variable = str_remove(variable, "_lag$"),
+    variable = str_remove(variable, "_(RF|RK|OK)$"),
+    variable = recode(variable, !!!soil_var_labels)
+  ) %>%
+  # Average PC1/PC2 across duplicate variable names
+  # (lag and non-lag columns of same variable)
+  group_by(variable) %>%
+  summarise(
+    PC1 = mean(PC1, na.rm = TRUE),
+    PC2 = mean(PC2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Scale vectors for visibility
+  mutate(
+    PC1 = PC1 * max(abs(pca_df_best$PC1)) * 0.8,
+    PC2 = PC2 * max(abs(pca_df_best$PC2)) * 0.8
+  )
+
+# Biplot
+p_pca_biplot <- ggplot() +
+  geom_point(data  = pca_df_best,
+             aes(x = PC1, y = PC2, color = zone),
+             size  = 0.3, alpha = 0.25) +
+  geom_segment(data = loadings_df_best,
+               aes(x = 0, y = 0,
+                   xend = PC1, yend = PC2),
+               arrow     = arrow(length = unit(0.2, "cm"),
+                                  type   = "closed"),
+               color     = "grey20",
+               linewidth = 0.5) +
+  ggrepel::geom_text_repel(
+    data         = loadings_df_best,
+    aes(x = PC1, y = PC2, label = variable),
+    size         = 2.8, color = "grey10",
+    fontface     = "bold", box.padding = 0.3,
+    max.overlaps = 20
+  ) +
+  scale_color_brewer(palette = "Set2", name = "Zone") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "right") +
+  labs(
+    title = paste0("A). PCA score space — COMP RF + lags (k = ",
+                   best_pca_b$best_k, ")"),
+    subtitle = "Points = grid pixels. Vectors = soil property loadings.",
+    x = paste0("PC1 (",
+               round(summary(best_pca_b$pca)$importance[2, 1] * 100, 1),
+               "% variance)"),
+    y = paste0("PC2 (",
+               round(summary(best_pca_b$pca)$importance[2, 2] * 100, 1),
+               "% variance)")
+  )
+
+# Spatial zone map
+zone_df_pca <- as.data.frame(
+  best_pca_pp$zone_rast_smooth,
+  xy = TRUE, na.rm = TRUE
+) %>%
+  rename(zone = 3) %>%
+  filter(!is.na(zone))
+
+p_pca_spatial <- ggplot(zone_df_pca,
+                         aes(x = x, y = y,
+                             fill = factor(zone))) +
+  geom_raster() +
+  coord_equal() +
+  scale_fill_brewer(palette = "Set2", name = "Zone") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "right") +
+  labs(
+    title    = paste0("B). Spatial zone map — COMP RF + lags (k = ",
+                      n_distinct(zone_df_pca$zone), ")"),
+    subtitle = "After 5×5 majority filter",
+    x = "Easting", y = "Northing"
+  )
+
+# Combined PCA figure
+p_pca_combined <- p_pca_biplot + p_pca_spatial +
+  plot_layout(ncol = 2, guides = "collect") +
+  plot_annotation(
+    title    = "PCA + k-means management zone delineation — COMP RF + lags",
+    subtitle = paste0(
+      "Left: PCA score space with soil property loading vectors. ",
+      "Right: spatial zone map after post-processing.\n",
+      "k = ", best_pca_b$best_k,
+      " zones selected via kneedle elbow detection (Satopaa et al., 2011)."
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 11),
+      plot.subtitle = element_text(size = 9, color = "grey30")
+    )
+  )
+
+print(p_pca_combined)
+ggsave("../outputs/fig_pca_biplot_spatial_COMP_RF_lags.png",
+       p_pca_combined,
+       width = 12, height = 5, dpi = 300)
+
+# ── Figure 2: UMAP embedding + spatial map ────────────────
+# Best UMAP configuration — COMP RF nolags
+
+best_umap_nm  <- "COMP_RF_nolags"
+best_umap_mz  <- mz_named_tuned[[best_umap_nm]]
+best_umap_pp  <- pp_named[[best_umap_nm]]
+
+# UMAP embedding colored by zone
+umap_emb_df <- best_umap_mz$result_df %>%
+  select(UMAP1, UMAP2, zone, membership_prob) %>%
+  mutate(zone = factor(zone))
+
+p_umap_embedding <- ggplot(umap_emb_df,
+                            aes(x     = UMAP1,
+                                y     = UMAP2,
+                                color = zone,
+                                alpha = membership_prob)) +
+  geom_point(size = 0.35) +
+  scale_alpha_continuous(range = c(0.15, 1.0),
+                          name  = "Membership\nconfidence") +
+  scale_color_brewer(palette  = "Set2",
+                     name     = "Zone",
+                     na.value = "grey70") +
+  guides(
+    color = guide_legend(
+      override.aes = list(size = 3, alpha = 1)),
+    alpha = guide_legend(
+      override.aes = list(size = 3))
+  ) +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "right") +
+  labs(
+    title    = paste0("A). UMAP embedding — COMP RF no lags (k = ",
+                      best_umap_mz$n_zones, ")"),
+    subtitle = paste0(
+      "Points = grid pixels in 2D UMAP space. ",
+      "Opacity = HDBSCAN membership confidence.\n",
+      "Grey = noise pixels (assigned by NN fill). ",
+      "noise pre-fill = ",
+      round(best_umap_mz$pct_noise, 1), "%."
+    ),
+    x = "UMAP1", y = "UMAP2"
+  )
+
+# Spatial zone map — regenerate fresh
+tryCatch({
+  zone_raw_umap <- best_umap_pp$result_df_filled %>%
+    select(x, y, zone) %>%
+    filter(!is.na(zone)) %>%
+    rast(type = "xyz", crs = "EPSG:26917")
+  zone_smooth_umap <- focal(zone_raw_umap, w = 5,
+                             fun = "modal", na.rm = TRUE)
+  zone_df_umap <- as.data.frame(
+    zone_smooth_umap, xy = TRUE, na.rm = TRUE
+  ) %>%
+    rename(zone = 3) %>%
+    filter(!is.na(zone))
+}, error = function(e) {
+  zone_df_umap <<- best_umap_pp$result_df_filled %>%
+    select(x, y, zone) %>%
+    filter(!is.na(zone))
+})
+
+p_umap_spatial <- ggplot(zone_df_umap,
+                          aes(x = x, y = y,
+                              fill = factor(zone))) +
+  geom_raster() +
+  coord_equal() +
+  scale_fill_brewer(palette = "Set2", name = "Zone") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "right") +
+  labs(
+    title    = paste0("B). Spatial zone map — COMP RF no lags (k = ",
+                      n_distinct(zone_df_umap$zone), ")"),
+    subtitle = "After noise fill + 5×5 majority filter",
+    x = "Easting", y = "Northing"
+  )
+
+# Combined UMAP figure
+p_umap_combined <- p_umap_embedding + p_umap_spatial +
+  plot_layout(ncol = 2, guides = "collect") +
+  plot_annotation(
+    title    = "UMAP + HDBSCAN management zone delineation — COMP RF no lags",
+    subtitle = paste0(
+      "Left: UMAP embedding space with HDBSCAN cluster assignments. ",
+      "Right: spatial zone map after post-processing.\n",
+      "minPts = ", minpts_final[["COMP_RF_nolags"]],
+      ". k = ", best_umap_mz$n_zones,
+      " zones identified from density structure of UMAP embedding."
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 11),
+      plot.subtitle = element_text(size = 9, color = "grey30")
+    )
+  )
+
+print(p_umap_combined)
+ggsave("../outputs/fig_umap_embedding_spatial_COMP_RF_nolags.png",
+       p_umap_combined,
+       width = 12, height = 5, dpi = 300)
+```
+```{r}
+#two worst models:
+# ── Figure 3: Worst configs — SP RK nolags PCA + COMP OK UMAP
+# SP RK nolags PCA: Score=0.348, VR_obs=−0.182 (worst PCA)
+# COMP OK nolags UMAP: Score=0.306, VR_obs=−0.413 (worst UMAP)
+
+# ── Panel A: SP RK nolags PCA biplot ──────────────────────
+worst_pca_nm <- "SP_RK"
+worst_pca_b  <- baseline_SP_RK_elbow
+worst_pca_pp <- pp_baseline[[worst_pca_nm]]
+
+pca_df_worst <- as.data.frame(worst_pca_b$pca$x[, 1:2]) %>%
+  bind_cols(
+    tibble(zone = factor(worst_pca_b$result_df$zone_kmeans))
+  )
+
+loadings_df_worst <- as.data.frame(
+  worst_pca_b$pca$rotation[, 1:2]
+) %>%
+  rownames_to_column("variable") %>%
+  mutate(
+    variable = str_remove(variable, "_lag$"),
+    variable = str_remove(variable, "_(RF|RK|OK)$"),
+    variable = recode(variable, !!!soil_var_labels)
+  ) %>%
+  group_by(variable) %>%
+  summarise(
+    PC1 = mean(PC1, na.rm = TRUE),
+    PC2 = mean(PC2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    PC1 = PC1 * max(abs(pca_df_worst$PC1)) * 0.8,
+    PC2 = PC2 * max(abs(pca_df_worst$PC2)) * 0.8
+  )
+
+p_worst_pca_biplot <- ggplot() +
+  geom_point(data  = pca_df_worst,
+             aes(x = PC1, y = PC2, color = zone),
+             size  = 0.3, alpha = 0.25) +
+  geom_segment(data = loadings_df_worst,
+               aes(x = 0, y = 0,
+                   xend = PC1, yend = PC2),
+               arrow     = arrow(length = unit(0.2, "cm"),
+                                  type   = "closed"),
+               color     = "grey20",
+               linewidth = 0.5) +
+  ggrepel::geom_text_repel(
+    data         = loadings_df_worst,
+    aes(x = PC1, y = PC2, label = variable),
+    size         = 2.8, color = "grey10",
+    fontface     = "bold", box.padding = 0.3,
+    max.overlaps = 20
+  ) +
+  scale_color_brewer(palette = "Set2", name = "Zone") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "right") +
+  labs(
+    title    = paste0("A). PCA score space — SP RK no lags (k = ",
+                      worst_pca_b$best_k, ")"),
+    subtitle = "Score = 0.348 | VR_obs = −0.182 | N_pos = 2",
+    x = paste0("PC1 (",
+               round(summary(worst_pca_b$pca)$importance[2, 1] * 100, 1),
+               "% variance)"),
+    y = paste0("PC2 (",
+               round(summary(worst_pca_b$pca)$importance[2, 2] * 100, 1),
+               "% variance)")
+  )
+
+# Spatial zone map
+zone_df_worst_pca <- as.data.frame(
+  worst_pca_pp$zone_rast_smooth,
+  xy = TRUE, na.rm = TRUE
+) %>%
+  rename(zone = 3) %>%
+  filter(!is.na(zone))
+
+p_worst_pca_spatial <- ggplot(zone_df_worst_pca,
+                               aes(x = x, y = y,
+                                   fill = factor(zone))) +
+  geom_raster() +
+  coord_equal() +
+  scale_fill_brewer(palette = "Set2", name = "Zone") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "right") +
+  labs(
+    title    = paste0("B). Spatial zone map — SP RK no lags (k = ",
+                      n_distinct(zone_df_worst_pca$zone), ")"),
+    subtitle = "After 5×5 majority filter",
+    x = "Easting", y = "Northing"
+  )
+
+# ── Panel C: COMP OK nolags UMAP embedding ────────────────
+worst_umap_nm <- "COMP_OK_nolags"
+worst_umap_mz <- mz_named_tuned[[worst_umap_nm]]
+worst_umap_pp <- pp_named[[worst_umap_nm]]
+
+umap_emb_worst <- worst_umap_mz$result_df %>%
+  select(UMAP1, UMAP2, zone, membership_prob) %>%
+  mutate(zone = factor(zone))
+
+p_worst_umap_embedding <- ggplot(umap_emb_worst,
+                                  aes(x     = UMAP1,
+                                      y     = UMAP2,
+                                      color = zone,
+                                      alpha = membership_prob)) +
+  geom_point(size = 0.35) +
+  scale_alpha_continuous(range = c(0.15, 1.0),
+                          name  = "Membership\nconfidence") +
+  scale_color_brewer(palette  = "Set2",
+                     name     = "Zone",
+                     na.value = "grey70") +
+  guides(
+    color = guide_legend(
+      override.aes = list(size = 3, alpha = 1)),
+    alpha = guide_legend(
+      override.aes = list(size = 3))
+  ) +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "right") +
+  labs(
+    title    = paste0("C). UMAP embedding — COMP OK no lags (k = ",
+                      worst_umap_mz$n_zones, ")"),
+    subtitle = paste0(
+      "Score = 0.306 | VR_obs = −0.413 | N_pos = 3 | ",
+      "noise pre-fill = ",
+      round(worst_umap_mz$pct_noise, 1), "%"
+    ),
+    x = "UMAP1", y = "UMAP2"
+  )
+
+# Spatial zone map
+tryCatch({
+  zone_raw_worst <- worst_umap_pp$result_df_filled %>%
+    select(x, y, zone) %>%
+    filter(!is.na(zone)) %>%
+    rast(type = "xyz", crs = "EPSG:26917")
+  zone_smooth_worst <- focal(zone_raw_worst, w = 5,
+                              fun = "modal", na.rm = TRUE)
+  zone_df_worst_umap <- as.data.frame(
+    zone_smooth_worst, xy = TRUE, na.rm = TRUE
+  ) %>%
+    rename(zone = 3) %>%
+    filter(!is.na(zone))
+}, error = function(e) {
+  zone_df_worst_umap <<- worst_umap_pp$result_df_filled %>%
+    select(x, y, zone) %>%
+    filter(!is.na(zone))
+})
+
+p_worst_umap_spatial <- ggplot(zone_df_worst_umap,
+                                aes(x = x, y = y,
+                                    fill = factor(zone))) +
+  geom_raster() +
+  coord_equal() +
+  scale_fill_brewer(palette = "Set2", name = "Zone") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "right") +
+  labs(
+    title    = paste0("D). Spatial zone map — COMP OK no lags (k = ",
+                      n_distinct(zone_df_worst_umap$zone), ")"),
+    subtitle = "After noise fill + 5×5 majority filter",
+    x = "Easting", y = "Northing"
+  )
+
+# ── Combined worst configs figure ─────────────────────────
+p_worst_combined <- (p_worst_pca_biplot + p_worst_pca_spatial) /
+                    (p_worst_umap_embedding + p_worst_umap_spatial) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title    = "Worst-performing configurations — PCA+k-means and UMAP+HDBSCAN",
+    subtitle = paste0(
+      "Top row: SP RK no lags PCA+k-means ",
+      "(Score = 0.348, VR_obs = −0.182). ",
+      "Bottom row: COMP OK no lags UMAP+HDBSCAN ",
+      "(Score = 0.306, VR_obs = −0.413).\n",
+      "Negative VR_obs indicates zone boundaries ",
+      "increase within-zone variance in independent observations."
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 11),
+      plot.subtitle = element_text(size = 9, color = "grey30")
+    )
+  )
+
+print(p_worst_combined)
+ggsave("../outputs/fig_worst_configs.png",
+       p_worst_combined,
+       width  = 12,
+       height = 10,
+       dpi    = 300)
+```
 
 
 <!-- The three key changes from the original are: -->
