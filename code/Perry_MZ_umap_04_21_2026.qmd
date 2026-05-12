@@ -1979,7 +1979,31 @@ plot_all_pca_zone_rasters <- function(pp_list, ncol_plot = 3) {
 
 plot_all_pca_zone_rasters(pp_baseline)
 
+pca_zone_files <- list.files(
+  "../outputs",
+  pattern = "^zones_.*_kmeans_smooth\\.tif$",
+  full.names = TRUE
+)
 
+pca_zone_rasters <- setNames(
+  lapply(pca_zone_files, terra::rast),
+  tools::file_path_sans_ext(basename(pca_zone_files))
+)
+
+plot_all_pca_zone_rasters_disk <- function(rast_list, ncol_plot = 3) {
+  n_maps <- length(rast_list)
+  nrow_plot <- ceiling(n_maps / ncol_plot)
+  
+  op <- par(mfrow = c(nrow_plot, ncol_plot), mar = c(2, 2, 3, 5))
+  
+  for (nm in names(rast_list)) {
+    plot(rast_list[[nm]], main = nm, type = "classes")
+  }
+  
+  par(op)
+}
+
+plot_all_pca_zone_rasters_disk(pca_zone_rasters)
 
 
 
