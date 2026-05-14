@@ -1660,25 +1660,21 @@ retune_hdbscan <- function(mz_obj, minPts_new,
                             cluster_eps = 0,
                             hdbscan_n   = 10000,
                             label       = NULL) {
-
   emb_df       <- mz_obj$result_df %>% select(UMAP1, UMAP2)
   xy_clean     <- mz_obj$result_df %>% select(x, y)
   spatial_lags <- mz_obj$result_df$spatial_lags[1]
   lbl          <- if (!is.null(label)) label else
                     mz_obj$result_df$dataset[1]
-
   set.seed(20260401)
   sample_idx <- sort(sample(nrow(emb_df),
                              min(hdbscan_n, nrow(emb_df))))
   emb_sample <- emb_df[sample_idx, ]
-
   cat("Retuning:", lbl, "| minPts =", minPts_new, "...\n")
   hdb_fit <- dbscan::hdbscan(
     as.matrix(emb_sample),
     minPts                    = minPts_new,
     cluster_selection_epsilon = cluster_eps
   )
-
   nn_assign     <- FNN::get.knnx(
     data  = as.matrix(emb_sample),
     query = as.matrix(emb_df),
@@ -1686,7 +1682,6 @@ retune_hdbscan <- function(mz_obj, minPts_new,
   )
   full_clusters <- hdb_fit$cluster[nn_assign$nn.index[, 1]]
   full_memb     <- hdb_fit$membership_prob[nn_assign$nn.index[, 1]]
-
   result_df <- bind_cols(
     xy_clean, emb_df,
     tibble(cluster_hard = full_clusters,
@@ -1697,53 +1692,136 @@ retune_hdbscan <- function(mz_obj, minPts_new,
            zone         = if_else(cluster_hard == 0L,
                                   NA_integer_,
                                   as.integer(cluster_hard)))
-
   list(result_df   = result_df,
        hdbscan_fit = hdb_fit,
        n_zones     = length(unique(full_clusters[full_clusters != 0])),
        pct_noise   = mean(full_clusters == 0) * 100)
 }
 
-# ── Sensitivity scan ──────────────────────────────────────
+# ── Snapshot the source list before any tuning ─────────────
+mz_named_source <- mz_named_tuned
+
+# ── Map each configuration to its pred_df + method ────────
+config_pred_map <- list(
+  SP_RF_nolags   = list(pred_df = pred_stack_SP,        method = "RF"),
+  SP_RF_lags     = list(pred_df = pred_stack_SP_lag,    method = "RF"),
+  SP_RK_nolags   = list(pred_df = pred_stack_SP,        method = "RK"),
+  SP_RK_lags     = list(pred_df = pred_stack_SP_lag,    method = "RK"),
+  SP_OK_nolags   = list(pred_df = pred_stack_SP,        method = "OK"),
+  COMP_RF_nolags = list(pred_df = pred_stack_COMP,      method = "RF"),
+  COMP_RF_lags   = list(pred_df = pred_stack_COMP_lag,  method = "RF"),
+  COMP_RK_nolags = list(pred_df = pred_stack_COMP,      method = "RK"),
+  COMP_RK_lags   = list(pred_df = pred_stack_COMP_lag,  method = "RK"),
+  COMP_OK_nolags = list(pred_df = pred_stack_COMP,      method = "OK")
+)
+
 minpts_candidates <- c(50, 100, 200, 400, 600, 800, 1000)
 
+# ── Sensitivity scan with VR_pred per configuration ───────
+# For each (config, minPts) pair, retune HDBSCAN and compute
+# the resulting variance reduction on the prediction grid.
+cat("\n=== Sensitivity scan: computing n_zones, noise %, and VR per minPts ===\n\n")
+
 sensitivity_results <- purrr::map_dfr(minpts_candidates, function(mp) {
-  purrr::map_dfr(names(mz_named_tuned), function(nm) {
-    r <- retune_hdbscan(mz_named_tuned[[nm]], mp, label = nm)
-    tibble(label = nm, minPts = mp,
-           n_zones = r$n_zones, pct_noise = round(r$pct_noise, 1))
+  purrr::imap_dfr(config_pred_map, function(cfg, nm) {
+    r <- retune_hdbscan(mz_named_source[[nm]], mp, label = nm)
+    vr <- tryCatch(
+      calc_variance_reduction(cfg$pred_df, r$result_df$zone,
+                              soil_vars, cfg$method),
+      error = function(e) NA_real_
+    )
+    tibble(label     = nm,
+           minPts    = mp,
+           n_zones   = r$n_zones,
+           pct_noise = round(r$pct_noise, 1),
+           VR        = round(vr, 3))
   })
 })
 
+# ── Display the cluster count and VR by config ────────────
+cat("\n=== Cluster counts by minPts and configuration ===\n")
 sensitivity_results %>%
   select(label, minPts, n_zones) %>%
   pivot_wider(names_from = label, values_from = n_zones) %>%
   arrange(minPts) %>%
   print(width = Inf)
 
-# Set minPts after reviewing sensitivity table
-minpts_final <- list(
-  SP_RF_nolags   = 200,
-  SP_RF_lags     = 200,
-  SP_RK_nolags   = 200,
-  SP_RK_lags     = 200,
-  SP_OK_nolags   = 200,
-  COMP_RF_nolags = 200,
-  COMP_RF_lags   = 200,
-  COMP_RK_nolags = 200,
-  COMP_RK_lags   = 200,
-  COMP_OK_nolags = 200
-)
+cat("\n=== VR by minPts and configuration ===\n")
+sensitivity_results %>%
+  select(label, minPts, VR) %>%
+  pivot_wider(names_from = label, values_from = VR) %>%
+  arrange(minPts) %>%
+  print(width = Inf)
 
-mz_named_source <- mz_named_tuned  # snapshot before overwriting
+write_csv(sensitivity_results,
+          "../outputs/hdbscan_minpts_tuning.csv")
 
+# ── Per-configuration selection rule ───────────────────────
+# 1. Prefer minPts producing 3–8 zones (agronomically interpretable)
+# 2. Among those, maximize VR
+# 3. If no candidate falls in 3–8 zones, fall back to the option
+#    with the most zones > 1 (avoid pure-noise collapse)
+select_best_minpts <- function(config_tuning,
+                                min_zones = 3,
+                                max_zones = 8,
+                                hard_max_zones = 12) {
+  
+  # Tier 1: prefer minPts producing the agronomic sweet spot (3–8 zones)
+  valid <- config_tuning %>%
+    filter(n_zones >= min_zones, n_zones <= max_zones,
+           !is.na(VR))
+  
+  if (nrow(valid) > 0) {
+    return(valid %>% slice_max(VR, n = 1, with_ties = FALSE) %>%
+                     pull(minPts))
+  }
+  
+  # Tier 2: accept slightly wider range (up to hard_max_zones)
+  # but cap at 12 — anything above that is unusable for management
+  loose <- config_tuning %>%
+    filter(n_zones >= 2, n_zones <= hard_max_zones,
+           !is.na(VR))
+  
+  if (nrow(loose) > 0) {
+    return(loose %>% slice_max(VR, n = 1, with_ties = FALSE) %>%
+                     pull(minPts))
+  }
+  
+  # Tier 3: fallback — best VR among configs with 2+ zones,
+  # but explicitly NOT picking solutions with > hard_max_zones
+  fallback <- config_tuning %>%
+    filter(n_zones >= 2, n_zones <= hard_max_zones)
+  
+  if (nrow(fallback) > 0) {
+    return(fallback %>% slice_max(n_zones, n = 1, with_ties = FALSE) %>%
+                       pull(minPts))
+  }
+  
+  200  # safe default
+}
+
+minpts_final <- sensitivity_results %>%
+  split(.$label) %>%
+  purrr::map(~ select_best_minpts(.x))
+
+cat("\n=== Selected minPts per configuration ===\n")
+purrr::iwalk(minpts_final, function(mp, nm) {
+  selected_row <- sensitivity_results %>%
+    filter(label == nm, minPts == mp)
+  cat(sprintf("  %-20s minPts = %4d  →  zones = %d, noise = %.1f%%, VR = %.3f\n",
+              nm, mp, selected_row$n_zones,
+              selected_row$pct_noise, selected_row$VR))
+})
+
+# ── Apply selected minPts to retune all configurations ────
 mz_named_tuned <- purrr::imap(minpts_final, function(mp, nm) {
   retune_hdbscan(mz_named_source[[nm]], mp, label = nm)
 })
 
-purrr::imap(mz_named_tuned, function(x, nm) {
-  cat(nm, "| zones:", x$n_zones,
-      "| noise:", round(x$pct_noise, 1), "%\n")
+cat("\n=== Final tuned configurations ===\n")
+purrr::iwalk(mz_named_tuned, function(x, nm) {
+  cat(sprintf("  %-20s | zones: %d | noise: %.1f%% | minPts: %d\n",
+              nm, x$n_zones, x$pct_noise, minpts_final[[nm]]))
 })
 
 save.image("../outputs/workspace_phase6c_retuned.RData")
@@ -1989,23 +2067,56 @@ baseline_COMP_RK_lags <- run_pca_kmeans(pred_stack_COMP_lag, "RK", soil_vars,
                                         include_lags = TRUE, label = "COMP_RK_lags_kmeans")
 
 # Silhouette profiles
-bind_rows(
-  baseline_SP_RF$elbow_profile        %>% mutate(config = "SP_RF"),
-  baseline_SP_RK$elbow_profile        %>% mutate(config = "SP_RK"),
-  baseline_SP_OK$elbow_profile        %>% mutate(config = "SP_OK"),
-  baseline_COMP_RF$elbow_profile      %>% mutate(config = "COMP_RF"),
-  baseline_COMP_RK$elbow_profile      %>% mutate(config = "COMP_RK"),
-  baseline_COMP_OK$elbow_profile      %>% mutate(config = "COMP_OK"),
-  baseline_SP_RF_lags$elbow_profile   %>% mutate(config = "SP_RF_lags"),
-  baseline_SP_RK_lags$elbow_profile   %>% mutate(config = "SP_RK_lags"),
-  baseline_COMP_RF_lags$elbow_profile %>% mutate(config = "COMP_RF_lags"),
-  baseline_COMP_RK_lags$elbow_profile %>% mutate(config = "COMP_RK_lags")
+# ── PCA+k-means elbow profiles with best-k indicated in legend ──
+elbow_combined <- bind_rows(
+  baseline_SP_RF$elbow_profile        %>% mutate(config = "SP_RF",
+                                                 best_k = baseline_SP_RF$best_k),
+  baseline_SP_RK$elbow_profile        %>% mutate(config = "SP_RK",
+                                                 best_k = baseline_SP_RK$best_k),
+  baseline_SP_OK$elbow_profile        %>% mutate(config = "SP_OK",
+                                                 best_k = baseline_SP_OK$best_k),
+  baseline_COMP_RF$elbow_profile      %>% mutate(config = "COMP_RF",
+                                                 best_k = baseline_COMP_RF$best_k),
+  baseline_COMP_RK$elbow_profile      %>% mutate(config = "COMP_RK",
+                                                 best_k = baseline_COMP_RK$best_k),
+  baseline_COMP_OK$elbow_profile      %>% mutate(config = "COMP_OK",
+                                                 best_k = baseline_COMP_OK$best_k),
+  baseline_SP_RF_lags$elbow_profile   %>% mutate(config = "SP_RF_lags",
+                                                 best_k = baseline_SP_RF_lags$best_k),
+  baseline_SP_RK_lags$elbow_profile   %>% mutate(config = "SP_RK_lags",
+                                                 best_k = baseline_SP_RK_lags$best_k),
+  baseline_COMP_RF_lags$elbow_profile %>% mutate(config = "COMP_RF_lags",
+                                                 best_k = baseline_COMP_RF_lags$best_k),
+  baseline_COMP_RK_lags$elbow_profile %>% mutate(config = "COMP_RK_lags",
+                                                 best_k = baseline_COMP_RK_lags$best_k)
 ) %>%
-  ggplot(aes(x = k, y = wss, color = config)) +
-  geom_line() +
-  geom_point() +
-  theme_minimal() +
-  labs(title = "PCA+k-means elbow profiles", y = "Total within-cluster SS")
+  # Build a display label that shows the selected k alongside the config name
+  mutate(config_label = paste0(config, " (k = ", best_k, ")"))
+
+# Filter to just the best-k rows for the marker overlay
+best_k_points <- elbow_combined %>%
+  filter(k == best_k)
+
+p_elbow <- elbow_combined %>%
+  ggplot(aes(x = k, y = wss, color = config_label, group = config_label)) +
+  geom_line(linewidth = 0.5) +
+  geom_point(size = 1.8) +
+
+  scale_x_continuous(breaks = 2:8) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position  = "right",
+        legend.text      = element_text(size = 9),
+        panel.grid.minor = element_blank()) +
+  labs(title    = "PCA+k-means elbow profiles",
+       subtitle = "Black stars mark the selected k (second-derivative elbow rule)",
+       x        = "Number of clusters (k)",
+       y        = "Total within-cluster sum of squares",
+       color    = "Configuration (selected k)")
+
+print(p_elbow)
+
+ggsave("../outputs/fig_pca_elbow_profiles.png",
+       p_elbow, width = 9.5, height = 6, dpi = 300)
 ```
 
 ```{r pca-kmeans-postprocess}
@@ -3013,5 +3124,340 @@ print(umap_contributions)
 print(loo_results)
 print(loadings)
 # pH and K are the primary drivers of zone structure (UMAP1), while the broad fertility variables (Ca, Mg, P, lb_ceq) collectively define UMAP2. Zn and Ca may be candidates for exclusion in future work as they appear to add noise rather than structure — but removing the full agronomic subset simultaneously collapsed both axes, explaining the Chapter 2 performance drop.
+```
+
+```{r}
+#final figure plot
+# ============================================================
+# Final zone map figures — two separate panels (UMAP, PCA)
+# Layout: rows = sampling (SP, COMP), columns = method (OK, RF, RK)
+# Lag variants distinguished within RF and RK columns
+# ============================================================
+
+# ── Helper: load and convert a zone raster from disk ──────
+make_zone_df_from_disk <- function(file_path, nm, approach) {
+  if (!file.exists(file_path)) {
+    cat("Skipping", nm, "— file not found\n")
+    return(NULL)
+  }
+  r <- terra::rast(file_path)
+  df <- as.data.frame(r, xy = TRUE)
+  names(df) <- c("x", "y", "zone")
+  df %>%
+    filter(!is.na(zone)) %>%
+    mutate(configuration = nm, approach = approach)
+}
+
+# ── Build file path lookups ───────────────────────────────
+umap_configs <- names(pp_named)
+pca_configs  <- names(pp_baseline)
+
+umap_files <- setNames(
+  paste0("../outputs/zones_", umap_configs, "_smooth.tif"),
+  umap_configs)
+
+pca_files <- setNames(
+  paste0("../outputs/zones_", pca_configs, "_kmeans_smooth.tif"),
+  pca_configs)
+
+# ── Pull all rasters into tidy data frames ────────────────
+zone_maps_umap <- purrr::imap_dfr(umap_files, function(fp, nm) {
+  make_zone_df_from_disk(fp, nm, "UMAP+HDBSCAN")
+})
+
+zone_maps_pca <- purrr::imap_dfr(pca_files, function(fp, nm) {
+  make_zone_df_from_disk(fp, nm, "PCA+kmeans")
+})
+
+# ── Parse configuration into Sampling / Method / Lags ─────
+parse_config <- function(df) {
+  df %>%
+    mutate(
+      clean    = configuration %>% 
+                 str_remove("_kmeans$") %>%
+                 str_remove("_nolags$"),
+      has_lags = str_detect(clean, "_lags$"),
+      clean    = str_remove(clean, "_lags$"),
+      sampling = str_extract(clean, "^(SP|COMP)"),
+      method   = str_extract(clean, "(OK|RF|RK)"),
+      # Column header — combine method with lag variant
+      method_label = case_when(
+        method == "OK"          ~ "OK",
+        method == "RF" & !has_lags ~ "RF (no lags)",
+        method == "RF" &  has_lags ~ "RF (+ lags)",
+        method == "RK" & !has_lags ~ "RK (no lags)",
+        method == "RK" &  has_lags ~ "RK (+ lags)"
+      ),
+      method_label = factor(method_label, levels = c(
+        "OK", "RF (no lags)", "RF (+ lags)", "RK (no lags)", "RK (+ lags)"
+      )),
+      sampling = factor(sampling, levels = c("SP", "COMP"))
+    ) %>%
+    select(-clean)
+}
+
+zone_maps_umap <- parse_config(zone_maps_umap)
+zone_maps_pca  <- parse_config(zone_maps_pca)
+
+# ── Colorblind-friendly palette (Okabe-Ito) ───────────────
+okabe_ito <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442",
+               "#0072B2", "#D55E00", "#CC79A7", "#999999",
+               "#000000")
+
+all_zones <- sort(unique(c(
+  as.character(zone_maps_umap$zone),
+  as.character(zone_maps_pca$zone)
+)))
+
+zone_palette <- setNames(okabe_ito[seq_along(all_zones)], all_zones)
+
+# ── Plotting function — shared layout for both figures ────
+make_zone_figure <- function(df, title_text) {
+  df %>%
+    mutate(zone = factor(zone, levels = all_zones)) %>%
+    ggplot(aes(x = x, y = y, fill = zone)) +
+    geom_raster() +
+    # Use fixed coordinate ratio without coord_equal so free scales work
+    facet_grid(sampling ~ method_label, scales = "free", switch = "y") +
+    scale_fill_manual(values  = zone_palette,
+                      name    = "Zone",
+                      na.value = "grey90",
+                      drop    = FALSE) +
+    theme_minimal(base_size = 9) +
+    theme(
+      strip.background.x = element_rect(fill = "grey92", color = NA),
+      strip.background.y = element_rect(fill = "grey85", color = NA),
+      strip.text.x       = element_text(face = "bold", size = 9),
+      strip.text.y       = element_text(face = "bold", size = 10),
+      strip.placement    = "outside",
+      axis.text          = element_text(size = 6),
+      axis.title         = element_text(size = 9),
+      panel.spacing      = unit(0.7, "lines"),
+      legend.position    = "bottom",
+      legend.key.size    = unit(0.4, "cm"),
+      panel.grid.minor   = element_blank(),
+      plot.title         = element_text(face = "bold", size = 11)
+    ) +
+    labs(
+      title = title_text,
+      x = "Easting (m)", y = "Northing (m)"
+    )
+}
+
+# ── UMAP figure ───────────────────────────────────────────
+p_umap <- make_zone_figure(
+  zone_maps_umap,
+  "UMAP+HDBSCAN management zones — all configurations"
+)
+
+print(p_umap)
+ggsave("../outputs/fig_zone_maps_umap.png",
+       p_umap, width = 12, height = 6, dpi = 300)
+
+# ── PCA figure ────────────────────────────────────────────
+p_pca <- make_zone_figure(
+  zone_maps_pca,
+  "PCA+kmeans management zones — all configurations"
+)
+
+print(p_pca)
+ggsave("../outputs/fig_zone_maps_pca.png",
+       p_pca, width = 12, height = 6, dpi = 300)
+
+cat("Both figures saved.\n")
+
+# ============================================================
+# UMAP feature-space figure — all configurations
+# Same grid layout as the zone maps
+# ============================================================
+
+# ── Pull UMAP embedding + zone assignment for all configs ─
+# mz_named_tuned contains result_df with UMAP1, UMAP2, zone
+make_umap_df <- function(mz_obj, nm) {
+  if (is.null(mz_obj$result_df)) return(NULL)
+  mz_obj$result_df %>%
+    select(UMAP1, UMAP2, zone, membership_prob) %>%
+    mutate(configuration = nm)
+}
+
+umap_space_df <- purrr::imap_dfr(mz_named_tuned, make_umap_df) %>%
+  parse_config()  # reuses the parse_config function from the zone map chunk
+
+# ── UMAP feature-space figure ─────────────────────────────
+p_umap_space <- umap_space_df %>%
+  mutate(zone = factor(zone, levels = all_zones)) %>%
+  ggplot(aes(x = UMAP1, y = UMAP2)) +
+  # Noise/unassigned points first, so they sit behind the colored ones
+  geom_point(data = . %>% filter(is.na(zone)),
+             color = "grey75",
+             size  = 0.25,#more translucent
+             alpha = 0.25) +
+  # Assigned-zone points on top
+  geom_point(data = . %>% filter(!is.na(zone)),
+             aes(color = zone, alpha = membership_prob),
+             size = 0.3) +
+  facet_grid(sampling ~ method_label, scales = "free", switch = "y") +
+  scale_color_manual(values  = zone_palette,
+                     name    = "Zone",
+                     na.value = "grey75",
+                     drop    = FALSE) +
+  scale_alpha_continuous(range = c(0.2, 1),
+                         name  = "Membership\nconfidence",
+                         guide = guide_legend(override.aes = list(size = 2))) +
+  guides(color = guide_legend(override.aes = list(size = 2.5, alpha = 1))) +
+  theme_minimal(base_size = 9) +
+  theme(
+    strip.background.x = element_rect(fill = "grey92", color = NA),
+    strip.background.y = element_rect(fill = "grey85", color = NA),
+    strip.text.x       = element_text(face = "bold", size = 9),
+    strip.text.y       = element_text(face = "bold", size = 10),
+    strip.placement    = "outside",
+    axis.text          = element_text(size = 6),
+    axis.title         = element_text(size = 9),
+    panel.spacing      = unit(0.7, "lines"),
+    legend.position    = "bottom",
+    legend.box         = "horizontal",
+    legend.key.size    = unit(0.4, "cm"),
+    panel.grid.minor   = element_blank(),
+    plot.title         = element_text(face = "bold", size = 11)
+  ) +
+  labs(
+    title    = "UMAP feature space — all configurations",
+    subtitle = "Colored points = HDBSCAN cluster assignment (zone). Grey = noise (unclustered). Transparency = membership confidence.",
+    x = "UMAP1", y = "UMAP2"
+  )
+
+print(p_umap_space)
+ggsave("../outputs/fig_umap_feature_space2.png",
+       p_umap_space, width = 12, height = 6, dpi = 300)
+cat("Saved UMAP feature space figure.\n")
+# ============================================================
+# PCA projection figure with eigenvectors — all configurations
+# Same grid layout, colored by zone assignment
+# ============================================================
+
+# ── Helper: build PCA projection + loadings for one config ─
+make_pca_projection_df <- function(baseline_obj, nm) {
+  if (is.null(baseline_obj$pca) || is.null(baseline_obj$result_df)) {
+    return(list(scores = NULL, loadings = NULL))
+  }
+  
+  # Scores (PC coordinates per pixel)
+  scores <- as.data.frame(baseline_obj$pca$x[, 1:2])
+  names(scores) <- c("PC1", "PC2")
+  scores$zone <- baseline_obj$result_df$zone_kmeans
+  scores$configuration <- nm
+  
+  # Loadings (variable contributions to PC1, PC2)
+  loadings <- as.data.frame(baseline_obj$pca$rotation[, 1:2]) %>%
+    rownames_to_column("variable") %>%
+    mutate(
+      configuration = nm,
+      # Clean variable names — strip method suffix and lag suffix
+      variable = variable %>%
+                 str_remove("_RF$|_RK$|_OK$") %>%
+                 str_replace("_lag$", " (lag)"),
+      # Magnitude for arrow filtering
+      magnitude = sqrt(PC1^2 + PC2^2)
+    )
+  
+  list(scores = scores, loadings = loadings)
+}
+
+pca_projections <- purrr::imap(baseline_list, make_pca_projection_df)
+
+# Combine scores
+pca_scores_df <- purrr::map_dfr(pca_projections, ~ .x$scores) %>%
+  parse_config()
+
+# Combine loadings
+pca_loadings_df <- purrr::map_dfr(pca_projections, ~ .x$loadings) %>%
+  parse_config()
+
+# ── Scale loadings to fit on the score plot ───────────────
+# Use ~80% of the score range as the arrow scale, per facet
+loading_scale <- pca_scores_df %>%
+  group_by(configuration) %>%
+  summarise(
+    pc1_range = max(PC1, na.rm = TRUE) - min(PC1, na.rm = TRUE),
+    pc2_range = max(PC2, na.rm = TRUE) - min(PC2, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  mutate(arrow_scale = 0.4 * pmin(pc1_range, pc2_range))
+
+# Per-config loading max-magnitude for normalizing arrow lengths
+loading_max <- pca_loadings_df %>%
+  group_by(configuration) %>%
+  summarise(max_mag = max(magnitude, na.rm = TRUE), .groups = "drop")
+
+pca_loadings_scaled <- pca_loadings_df %>%
+  left_join(loading_scale, by = "configuration") %>%
+  left_join(loading_max,   by = "configuration") %>%
+  mutate(
+    PC1_scaled = (PC1 / max_mag) * arrow_scale,
+    PC2_scaled = (PC2 / max_mag) * arrow_scale
+  ) %>%
+  # Keep only the top 5 loadings per configuration to avoid clutter
+  group_by(configuration) %>%
+  slice_max(magnitude, n = 5) %>%
+  ungroup()
+
+# ── PCA projection figure ─────────────────────────────────
+p_pca_space <- pca_scores_df %>%
+  mutate(zone = factor(zone, levels = all_zones)) %>%
+  ggplot(aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = zone),
+             size = 0.3, alpha = 0.7) +
+  # Eigenvector arrows
+  geom_segment(data = pca_loadings_scaled,
+               aes(x = 0, y = 0,
+                   xend = PC1_scaled, yend = PC2_scaled),
+               arrow    = arrow(length = unit(0.15, "cm"),
+                                type = "closed"),
+               color    = "black",
+               linewidth = 0.4) +
+  # Variable labels at arrow tips
+  geom_text_repel(data = pca_loadings_scaled,
+                  aes(x = PC1_scaled, y = PC2_scaled,
+                      label = variable),
+                  size = 2.2,
+                  color = "black",
+                  fontface = "bold",
+                  segment.color = "grey60",
+                  segment.size  = 0.2,
+                  min.segment.length = 0.1,
+                  max.overlaps  = 20,
+                  box.padding   = 0.3) +
+  facet_grid(sampling ~ method_label, scales = "free", switch = "y") +
+  scale_color_manual(values  = zone_palette,
+                     name    = "Zone",
+                     na.value = "grey80",
+                     drop    = FALSE) +
+  guides(color = guide_legend(override.aes = list(size = 2.5, alpha = 1))) +
+  theme_minimal(base_size = 9) +
+  theme(
+    strip.background.x = element_rect(fill = "grey92", color = NA),
+    strip.background.y = element_rect(fill = "grey85", color = NA),
+    strip.text.x       = element_text(face = "bold", size = 9),
+    strip.text.y       = element_text(face = "bold", size = 10),
+    strip.placement    = "outside",
+    axis.text          = element_text(size = 6),
+    axis.title         = element_text(size = 9),
+    panel.spacing      = unit(0.7, "lines"),
+    legend.position    = "bottom",
+    legend.key.size    = unit(0.4, "cm"),
+    panel.grid.minor   = element_blank(),
+    plot.title         = element_text(face = "bold", size = 11)
+  ) +
+  labs(
+    title    = "PCA projection space with variable loadings — all configurations",
+    subtitle = "Points colored by zone assignment; arrows = top-5 variable eigenvectors",
+    x = "PC1", y = "PC2"
+  )
+
+print(p_pca_space)
+ggsave("../outputs/fig_pca_projection_space.png",
+       p_pca_space, width = 14, height = 7, dpi = 300)
+cat("Saved PCA projection figure.\n")
 ```
 
