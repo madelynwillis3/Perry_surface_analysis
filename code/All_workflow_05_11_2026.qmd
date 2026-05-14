@@ -2154,7 +2154,7 @@ pp_baseline <- list(
 
 purrr::iwalk(pp_baseline, function(pp, nm) {
   writeRaster(pp$zone_rast_smooth,
-              paste0("../outputs/zones_", nm, "_kmeans_smooth.tif"),
+              paste0("../outputs/zones_", nm, "_smooth.tif"),
               overwrite = TRUE)
   cat("Saved:", nm, "\n")
 })
