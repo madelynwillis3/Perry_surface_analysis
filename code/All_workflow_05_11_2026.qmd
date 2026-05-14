@@ -38,6 +38,7 @@ library(cowplot)
 library(cluster)
 library(scales)
 library(tidytext)
+library(ggh4x)
 ```
 
 # ============================================================
@@ -1466,6 +1467,209 @@ bind_rows(
 #RF is not highly-sensitive to particular variables, and is producing stable predictions (based on QRF ratios) RK has high uncertainty due to it being hybrid. 
 #OK predicted constantly across each map for SE, except for SP Mg, which had a great variogram fit and strong autocorrelation. 
 ```
+
+```{r}
+# ============================================================
+# Combined uncertainty figures — with per-variable scaling
+# Each variable's uncertainty is normalized to 0–1 so the
+# spatial patterns are visible regardless of absolute magnitude
+# ============================================================
+
+# ── Helper: convert wide uncertainty df → long tidy form ──
+make_unc_long <- function(unc_df, dataset_label, method_label,
+                           suffix, soil_vars) {
+  cols <- paste0(soil_vars, suffix)
+  cols <- cols[cols %in% names(unc_df)]
+  
+  unc_df %>%
+    select(x, y, all_of(cols)) %>%
+    pivot_longer(-c(x, y),
+                 names_to  = "variable",
+                 values_to = "uncertainty") %>%
+    mutate(
+      variable = str_remove(variable, suffix),
+      dataset  = dataset_label,
+      method   = method_label
+    )
+}
+
+# ── Soil variable display names ───────────────────────────
+soil_var_labels <- c(
+  "lbc_1"  = "LBC",
+  "lb_ceq" = "LBC eq.",
+  "p_h_2"  = "pH",
+  "ca"     = "Ca",
+  "k"      = "K",
+  "mg"     = "Mg",
+  "mn"     = "Mn",
+  "p"      = "P",
+  "zn"     = "Zn"
+)
+
+# ── Per-variable scaling helper ───────────────────────────
+# Scale uncertainty values within each variable to a 0–1 range
+# so that spatial patterns are visible for low-magnitude variables
+# without being washed out by high-magnitude variables.
+scale_per_variable <- function(df) {
+  df %>%
+    group_by(variable) %>%
+    mutate(
+      var_min = min(uncertainty, na.rm = TRUE),
+      var_max = max(uncertainty, na.rm = TRUE),
+      uncertainty_scaled = ifelse(
+        is.finite(var_max - var_min) & (var_max - var_min) > 0,
+        (uncertainty - var_min) / (var_max - var_min),
+        NA_real_
+      )
+    ) %>%
+    ungroup()
+}
+
+# ── Build strip labels showing the actual uncertainty range ─
+# This preserves absolute magnitude information in the figure
+# even though the colors are normalized per variable.
+build_variable_label <- function(df) {
+  df %>%
+    group_by(variable) %>%
+    summarise(
+      var_max = max(uncertainty, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      var_label = paste0(variable, "\n(max: ", 
+                         signif(var_max, 2), ")")
+    )
+}
+
+# ── Shared theme ──────────────────────────────────────────
+clean_facet_theme <- theme_minimal(base_size = 9) +
+  theme(
+    strip.background.x = element_rect(fill = "grey92", color = NA),
+    strip.background.y = element_rect(fill = "grey85", color = NA),
+    strip.text.x       = element_text(face = "bold", size = 9),
+    strip.text.y       = element_text(face = "bold", size = 8),
+    strip.placement    = "outside",
+    axis.text.x        = element_blank(),
+    axis.text.y        = element_blank(),
+    axis.ticks         = element_blank(),
+    axis.title.x       = element_text(size = 9),
+    axis.title.y       = element_text(size = 9),
+    panel.spacing      = unit(0.4, "lines"),
+    legend.position    = "right",
+    legend.key.size    = unit(0.4, "cm"),
+    panel.grid         = element_blank(),
+    plot.title         = element_text(face = "bold", size = 11)
+  )
+
+# ── Figure A: RF-based uncertainty (QRF + Bootstrap) ──────
+rf_unc_data <- bind_rows(
+  make_unc_long(qrf_uncertainty_SP,   "SP",   "QRF 80% PI",
+                "_pi_width", soil_vars),
+  make_unc_long(qrf_uncertainty_COMP, "COMP", "QRF 80% PI",
+                "_pi_width", soil_vars),
+  make_unc_long(boot_uncertainty_SP,   "SP",   "Bootstrap SD",
+                "_boot_sd",  soil_vars),
+  make_unc_long(boot_uncertainty_COMP, "COMP", "Bootstrap SD",
+                "_boot_sd",  soil_vars)
+) %>%
+  mutate(
+    variable = factor(recode(variable, !!!soil_var_labels),
+                      levels = soil_var_labels),
+    dataset  = factor(dataset, levels = c("SP", "COMP")),
+    method   = factor(method,  levels = c("Bootstrap SD", "QRF 80% PI")),
+    panel    = paste0(method, " — ", dataset),
+    panel    = factor(panel, levels = c(
+      "Bootstrap SD — SP",  "Bootstrap SD — COMP",
+      "QRF 80% PI — SP",    "QRF 80% PI — COMP"
+    ))
+  ) %>%
+  scale_per_variable()
+
+# Get per-variable max values for the strip labels
+rf_var_labels <- build_variable_label(rf_unc_data)
+rf_label_lookup <- setNames(rf_var_labels$var_label,
+                            rf_var_labels$variable)
+
+p_rf_uncertainty <- rf_unc_data %>%
+  mutate(variable = factor(
+    rf_label_lookup[as.character(variable)],
+    levels = rf_label_lookup[levels(rf_unc_data$variable)]
+  )) %>%
+  ggplot(aes(x = x, y = y, fill = uncertainty_scaled)) +
+  geom_raster() +
+  scale_fill_viridis_c(option = "inferno", direction = -1,
+                       name   = "Relative\nuncertainty\n(per variable)",
+                       limits = c(0, 1),
+                       na.value = "grey80") +
+  facet_grid(variable ~ panel, scales = "free", switch = "y") +
+  labs(
+    title    = "RF-based prediction uncertainty across all configurations",
+    subtitle = "Each variable normalized to its own 0–1 range; row labels show absolute maximum per variable",
+    x = "Easting", y = "Northing"
+  ) +
+  clean_facet_theme
+
+print(p_rf_uncertainty)
+ggsave("../outputs/fig_rf_uncertainty_combined.png",
+       p_rf_uncertainty, width = 11, height = 14, dpi = 300)
+cat("Saved RF uncertainty figure.\n")
+
+# ── Figure B: Kriging-based uncertainty (OK + RK SE) ──────
+kriging_unc_data <- bind_rows(
+  make_unc_long(krig_var_SP,   "SP",   "OK kriging SE",
+                "_ok_krig_var", soil_vars),
+  make_unc_long(krig_var_COMP, "COMP", "OK kriging SE",
+                "_ok_krig_var", soil_vars),
+  make_unc_long(krig_var_SP,   "SP",   "RK kriging SE",
+                "_rk_krig_var", soil_vars),
+  make_unc_long(krig_var_COMP, "COMP", "RK kriging SE",
+                "_rk_krig_var", soil_vars)
+) %>%
+  mutate(
+    uncertainty = sqrt(uncertainty),   # variance → SE
+    variable    = factor(recode(variable, !!!soil_var_labels),
+                         levels = soil_var_labels),
+    dataset     = factor(dataset, levels = c("SP", "COMP")),
+    method      = factor(method,  levels = c("OK kriging SE",
+                                              "RK kriging SE")),
+    panel       = paste0(method, " — ", dataset),
+    panel       = factor(panel, levels = c(
+      "OK kriging SE — SP",  "OK kriging SE — COMP",
+      "RK kriging SE — SP",  "RK kriging SE — COMP"
+    ))
+  ) %>%
+  scale_per_variable()
+
+# Per-variable max for strip labels
+kriging_var_labels <- build_variable_label(kriging_unc_data)
+kriging_label_lookup <- setNames(kriging_var_labels$var_label,
+                                 kriging_var_labels$variable)
+
+p_kriging_uncertainty <- kriging_unc_data %>%
+  mutate(variable = factor(
+    kriging_label_lookup[as.character(variable)],
+    levels = kriging_label_lookup[levels(kriging_unc_data$variable)]
+  )) %>%
+  ggplot(aes(x = x, y = y, fill = uncertainty_scaled)) +
+  geom_raster() +
+  scale_fill_viridis_c(option = "magma", direction = -1,
+                       name   = "Relative\nKriging SE\n(per variable)",
+                       limits = c(0, 1),
+                       na.value = "grey80") +
+  facet_grid(variable ~ panel, scales = "free", switch = "y") +
+  labs(
+    title    = "Kriging-based uncertainty across all configurations",
+    subtitle = "Each variable normalized to its own 0–1 range; row labels show absolute maximum per variable. Grey = variogram fit failed.",
+    x = "Easting", y = "Northing"
+  ) +
+  clean_facet_theme
+
+print(p_kriging_uncertainty)
+ggsave("../outputs/fig_kriging_uncertainty_combined.png",
+       p_kriging_uncertainty, width = 11, height = 14, dpi = 300)
+cat("Saved kriging uncertainty figure.\n")
+```
+
 
 # ============================================================
 # PHASE 6 — UMAP + HDBSCAN Management Zone Delineation
