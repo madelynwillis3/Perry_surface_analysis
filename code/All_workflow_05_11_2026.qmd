@@ -661,12 +661,12 @@ val_results_all %>% arrange(variable, dataset, desc(R2))
 # Top-20 covariates shown per variable × dataset.
 
 extract_importance <- function(rf_model, variable, dataset) {
-  imp <- importance(rf_model, type = 1) # type=1 = %IncMSE
+  imp <- randomForest::importance(rf_model, type = 1)  # ← explicit namespace
   tibble(
-    covariate = rownames(imp),
+    covariate   = rownames(imp),
     pct_inc_mse = imp[, 1],
-    variable  = variable,
-    dataset   = dataset
+    variable    = variable,
+    dataset     = dataset
   ) %>%
     arrange(desc(pct_inc_mse))
 }
@@ -936,6 +936,178 @@ write_csv(cor_mat, "../outputs/soil_covariate_correlations.csv")
 # P SP has unusually high mean importance (2.79%) relative to its top value — suggesting many covariates contribute modestly rather than one dominating
 # COMP generally has higher top values than SP — composite sampling smooths local noise, making covariate-soil relationships cleaner and easier for RF to detect
 ```
+```{r}
+#redo plots:
+# ============================================================
+# RF Variable Importance — single bands excluded
+# ============================================================
+
+# Define single bands to exclude from importance plots
+single_bands <- c("coastal_blue", "blue", "green_i", "green",
+                  "yellow", "red", "rededge", "nir")
+
+# Soil variable display names (defined once, used everywhere)
+soil_var_labels <- c(
+  "lbc_1"  = "Lime Buffer Capacity",
+  "lb_ceq" = "LBC Equilibrium",
+  "p_h_2"  = "pH",
+  "ca"     = "Calcium",
+  "k"      = "Potassium",
+  "mg"     = "Magnesium",
+  "mn"     = "Manganese",
+  "p"      = "Phosphorus",
+  "zn"     = "Zinc"
+)
+
+# ── Extract importance from final RF models ────────────────
+extract_importance <- function(rf_model, variable, dataset) {
+  imp <- importance(rf_model, type = 1)  # %IncMSE
+  tibble(
+    covariate   = rownames(imp),
+    pct_inc_mse = imp[, 1],
+    variable    = variable,
+    dataset     = dataset
+  ) %>%
+    arrange(desc(pct_inc_mse))
+}
+
+importance_SP <- purrr::map_dfr(soil_vars, function(v) {
+  extract_importance(final_models_SP[[v]]$rf, v, "SP")
+})
+
+importance_COMP <- purrr::map_dfr(soil_vars, function(v) {
+  extract_importance(final_models_COMP[[v]]$rf, v, "COMP")
+})
+
+importance_all <- bind_rows(importance_SP, importance_COMP) %>%
+  filter(!covariate %in% single_bands)  # ← single bands removed here
+
+# ── Per-variable importance plots (top 20 covariates) ─────
+plot_importance_per_var <- function(imp_df, dataset_label) {
+  imp_df %>%
+    filter(dataset == dataset_label) %>%
+    group_by(variable) %>%
+    slice_max(order_by = pct_inc_mse, n = 20) %>%
+    ungroup() %>%
+    mutate(
+      variable  = recode(variable, !!!soil_var_labels),
+      variable  = factor(variable, levels = soil_var_labels),
+      covariate = tidytext::reorder_within(
+        covariate, pct_inc_mse, variable)
+    ) %>%
+    ggplot(aes(x = covariate, y = pct_inc_mse,
+               fill = pct_inc_mse)) +
+    geom_col(show.legend = FALSE) +
+    tidytext::scale_x_reordered() +
+    scale_fill_viridis_c(option = "plasma", direction = -1) +
+    coord_flip() +
+    facet_wrap(~ variable, scales = "free") +
+    theme_bw(base_size = 9) +
+    labs(
+      title    = paste0("RF Variable Importance — ",
+                        dataset_label, " dataset"),
+      subtitle = "Top 20 covariates by %IncMSE (single bands excluded)",
+      x        = NULL,
+      y        = "% Increase in MSE"
+    )
+}
+
+p_imp_SP   <- plot_importance_per_var(importance_all, "SP")
+p_imp_COMP <- plot_importance_per_var(importance_all, "COMP")
+
+print(p_imp_SP)
+print(p_imp_COMP)
+
+ggsave("../outputs/fig_rf_importance_per_var_SP.png",
+       p_imp_SP, width = 12, height = 8, dpi = 300)
+ggsave("../outputs/fig_rf_importance_per_var_COMP.png",
+       p_imp_COMP, width = 12, height = 8, dpi = 300)
+
+# ── Aggregate importance: mean %IncMSE across all soil vars ─
+agg_importance <- importance_all %>%
+  group_by(covariate, dataset) %>%
+  summarise(
+    mean_pct_inc_mse   = mean(pct_inc_mse, na.rm = TRUE),
+    median_pct_inc_mse = median(pct_inc_mse, na.rm = TRUE),
+    n_vars_top20 = sum(rank(desc(pct_inc_mse)) <= 20, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(dataset, desc(mean_pct_inc_mse))
+
+# Top-30 aggregate importance
+p_agg_imp <- agg_importance %>%
+  group_by(dataset) %>%
+  slice_max(mean_pct_inc_mse, n = 30) %>%
+  ungroup() %>%
+  mutate(
+    covariate = tidytext::reorder_within(
+      covariate, mean_pct_inc_mse, dataset)
+  ) %>%
+  ggplot(aes(x = covariate, y = mean_pct_inc_mse,
+             fill = dataset)) +
+  geom_col(show.legend = FALSE) +
+  tidytext::scale_x_reordered() +
+  scale_fill_manual(values = c("SP"   = "#2980b9",
+                                "COMP" = "#e74c3c")) +
+  coord_flip() +
+  facet_wrap(~ dataset, scales = "free") +
+  theme_bw(base_size = 9) +
+  labs(
+    title    = "Aggregate RF Variable Importance (single bands excluded)",
+    subtitle = paste0("Mean %IncMSE across all ",
+                      length(soil_vars),
+                      " agronomic soil variables"),
+    x        = NULL,
+    y        = "Mean % Increase in MSE"
+  )
+
+print(p_agg_imp)
+ggsave("../outputs/fig_rf_importance_aggregate.png",
+       p_agg_imp, width = 10, height = 8, dpi = 300)
+
+# ── Covariate overlap heatmap (single bands excluded) ─────
+top15_per_var <- importance_all %>%
+  group_by(dataset, variable) %>%
+  slice_max(pct_inc_mse, n = 15) %>%
+  ungroup() %>%
+  mutate(in_top15 = TRUE)
+
+overlap_counts <- top15_per_var %>%
+  group_by(covariate, dataset) %>%
+  summarise(n_vars_in_top15 = n(), .groups = "drop") %>%
+  filter(n_vars_in_top15 >= 2)
+
+p_overlap <- top15_per_var %>%
+  filter(covariate %in% overlap_counts$covariate) %>%
+  mutate(
+    variable = recode(variable, !!!soil_var_labels),
+    variable = factor(variable, levels = soil_var_labels)
+  ) %>%
+  ggplot(aes(x = variable, y = covariate,
+             fill = pct_inc_mse)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "magma", direction = -1,
+                       name = "%IncMSE") +
+  facet_wrap(~ dataset) +
+  theme_bw(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title    = "Covariate importance overlap across soil variables",
+    subtitle = "Covariates appearing in top-15 for ≥2 variables (single bands excluded)",
+    x = "Soil variable", y = "Covariate"
+  )
+
+print(p_overlap)
+ggsave("../outputs/fig_rf_variable_importance_overlap.png",
+       p_overlap, width = 10, height = 6, dpi = 300)
+
+# ── Save CSVs ─────────────────────────────────────────────
+write_csv(importance_all,
+          "../outputs/rf_importance_per_variable.csv")
+write_csv(agg_importance,
+          "../outputs/rf_importance_aggregate.csv")
+```
+
 
 # ============================================================
 # PHASE 5 — Full-Grid Spatial Prediction
